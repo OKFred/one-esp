@@ -3,6 +3,7 @@
 #@description: 扫描 I2C 设备地址
 #@author: Fred Zhang Qi
 #@datetime: 2024-05-23
+
 def i2c_scan(i2c):
   devices = i2c.scan()
   if devices:
