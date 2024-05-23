@@ -10,6 +10,7 @@ import time
 
 # wifi连接
 def wifi_connector(ssid, password):
+    wifiObj = {}
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     if not wlan.isconnected():
@@ -21,4 +22,8 @@ def wifi_connector(ssid, password):
     print('wifi info--无线信息：')
     labels = ['IP Address', 'Subnet Mask', 'Gateway', 'DNS']
     for label, value in zip(labels, wlan.ifconfig()):
-        print(f'{label}: {value}')
+        wifiObj[label] = value
+    print(f'{wifiObj}')
+    return wifiObj
+        
+    
