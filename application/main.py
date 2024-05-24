@@ -1,6 +1,5 @@
 import sys
 import time
-from components.time_sync import time_sync, get_formatted_time
 
 # 添加父文件夹到系统路径
 sys.path.append('..')
@@ -9,7 +8,7 @@ from components.env_reader import env_reader
 from components.wifi_connector import wifi_connector
 from components.screen_display import screen_display
 from components.socket_test import socket_test
-from components.time_sync import time_sync
+from components.time_sync import time_sync, get_formatted_time
 
 has_timer = False
 
