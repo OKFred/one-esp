@@ -46,30 +46,35 @@ def screen_display(text):
         print("OLED display not initialized--显示屏未初始化")
         return False
     oled.fill(0)  # 清空显示屏
-    
-    lines = text.split('\n')
-    processed_lines = []
-    
-    for line in lines:
-        current_line = ""
-        words = line.split(' ')
-        
-        for word in words:
-            potential_line = current_line + ' ' + word if current_line else word
-            if get_text_width(potential_line) > max_width:
-                processed_lines.append(current_line)
-                current_line = word
-            else:
-                current_line = potential_line
-        
-        processed_lines.append(current_line)
-    
-    if len(processed_lines) * 16 > max_height:
-        print("Text too long to display--文本过长")
-        return False
-    
-    for i, line in enumerate(processed_lines):
-        oled.text(line, 0, i * 16)
+    lines = text.split('\n')  # 根据换行符"\n"分割文本
 
-    oled.show()
+    for i, line in enumerate(lines):
+        if get_text_width(line) > max_width:
+            # 如果一行的宽度超过了最大宽度，则需要进行换行处理
+            current_line = ""
+            words = line.split(' ')
+            for word in words:
+                potential_line = current_line + ' ' + word if current_line else word
+                if get_text_width(potential_line) > max_width:
+                    oled.text(current_line, 0, i * 16)
+                    i += 1
+                    current_line = word
+                else:
+                    current_line = potential_line
+            oled.text(current_line, 0, i * 16)
+        else:
+            oled.text(line, 0, i * 16)
+
+    if len(lines) > 4 and get_text_width(lines[-1]) > max_width:
+        # 如果显示内容大于4行，并且最后一行溢出，则截断溢出内容并用"..."表示
+        truncated_width = max_width - get_text_width("...")
+        truncated_text = ""
+        for char in lines[-1]:
+            if get_text_width(truncated_text + char) <= truncated_width:
+                truncated_text += char
+            else:
+                break
+        oled.text(truncated_text + "...", 0, (max_height // 16 - 1) * 16)
+        
+    oled.show() 
     return True

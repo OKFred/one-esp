@@ -4,7 +4,7 @@
 #import webrepl
 #webrepl.start()
 
-print('hello world from boot.py of MicroPython! 欢迎使用')
+print('hello world from boot.py of MicroPython! 日志已启用')
 print('\n-----------------⚠️-----------------\n')
 
 from application.main import main
