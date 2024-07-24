@@ -78,3 +78,7 @@ def screen_display(text):
         
     oled.show() 
     return True
+
+def screen_clear():
+    # print('清理显示内容')
+    oled.fill(0x00)
