@@ -93,5 +93,5 @@ def modbus_talker(data, display_text):
         screen_display(new_text)
     receive_count =receive_count +1
     print(this_time+": 汇总",receive_count, correct_count, error_count)
-    time.sleep(1)
+    time.sleep(0.5)
     
