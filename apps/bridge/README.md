@@ -45,6 +45,12 @@ and disconnects slow WebSocket viewers rather than growing an unbounded queue.
 Passwords and credential-shaped fields are redacted from state and device logs;
 command payloads are never logged.
 
+Malformed protocol frames and oversized serial lines remain visible as warnings.
+The bridge coalesces these errors into a read-only snapshot request after a
+2-second cooldown, up to three recovery requests per USB open. Recovery timers
+are cancelled on disconnect, port loss, or source changes. Configuration writes
+and restart commands are never automatically repeated.
+
 USB commands are serialized as complete frames and sent in UTF-8 byte chunks of
 at most 64 bytes, with 60 ms between chunks and queued commands. This gives
 MicroPython's small UART0 receive ring time to drain while synchronous OLED

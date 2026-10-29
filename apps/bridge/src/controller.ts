@@ -72,6 +72,7 @@ export class BridgeController {
   private transport: DeviceTransport | null = null;
   private replay: ReplaySession | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private snapshotRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   private generation = 0;
   private attempt = 0;
   private failures = 0;
@@ -158,6 +159,11 @@ export class BridgeController {
     return result;
   }
 
+  private cancelSnapshotRecovery(): void {
+    if (this.snapshotRecoveryTimer) clearTimeout(this.snapshotRecoveryTimer);
+    this.snapshotRecoveryTimer = undefined;
+  }
+
   private async release(): Promise<void> {
     this.generation += 1;
     this.attempt += 1;
@@ -165,6 +171,7 @@ export class BridgeController {
     this.failures = 0;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+    this.cancelSnapshotRecovery();
     this.replay?.stop();
     this.replay = null;
     const transport = this.transport;
@@ -203,6 +210,7 @@ export class BridgeController {
 
   private async openUsb(path: string, generation: number): Promise<void> {
     if (generation !== this.generation || this.desiredPort !== path) return;
+    this.cancelSnapshotRecovery();
     const attempt = ++this.attempt;
     let transport: DeviceTransport;
     try {
@@ -214,6 +222,36 @@ export class BridgeController {
       throw new BridgeError(message, 503);
     }
     this.transport = transport;
+    let recoveryRequests = 0;
+    const isCurrentSession = () =>
+      attempt === this.attempt &&
+      generation === this.generation &&
+      this.transport === transport &&
+      this.desiredPort === path;
+    const recoverSnapshot = () => {
+      if (!isCurrentSession() || this.snapshotRecoveryTimer || recoveryRequests >= 3) return;
+      const timer = setTimeout(() => {
+        if (this.snapshotRecoveryTimer !== timer) return;
+        this.snapshotRecoveryTimer = undefined;
+        if (!isCurrentSession()) return;
+        recoveryRequests += 1;
+        this.note('warn', `串口消息损坏，正在重新获取只读快照（${recoveryRequests}/3）。`);
+        void transport
+          .write(
+            encodeCommand({
+              v: 1,
+              id: `bridge-recovery-${randomUUID()}`,
+              command: 'snapshot.get',
+              args: {},
+            }),
+          )
+          .catch(() => {
+            if (isCurrentSession()) this.note('warn', '恢复快照请求发送失败，请检查串口连接。');
+          });
+      }, 2000);
+      this.snapshotRecoveryTimer = timer;
+      timer.unref();
+    };
     const parser = new BoundedLineParser(
       (line) => {
         if (attempt !== this.attempt || generation !== this.generation) return;
@@ -224,13 +262,19 @@ export class BridgeController {
           else this.note('info', line);
         } catch {
           this.note('warn', '已忽略格式错误的设备遥测消息。');
+          recoverSnapshot();
         }
       },
-      () => this.note('warn', '已丢弃超过 8 KiB 的串口行；等待下一行恢复。'),
+      () => {
+        if (!isCurrentSession()) return;
+        this.note('warn', '已丢弃超过 8 KiB 的串口行；等待下一行恢复。');
+        recoverSnapshot();
+      },
     );
     const lost = (message: string) => {
       if (attempt !== this.attempt || generation !== this.generation) return;
       this.attempt += 1;
+      this.cancelSnapshotRecovery();
       this.transport = null;
       this.connection(false, 'usb', path, safeMessage(message));
       void transport.close().catch(() => {});

@@ -171,6 +171,98 @@ describe('bridge controller without hardware', () => {
     expect(controller.getState().hello?.deviceId).toBe('test-device');
   });
 
+  it('recovers a damaged pin snapshot by requesting a read-only snapshot after two seconds', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    const transport = transports[0]!;
+    const pins = [
+      ...Array.from({ length: 20 }, (_, gpio) => gpio),
+      21,
+      22,
+      23,
+      25,
+      26,
+      27,
+      ...Array.from({ length: 8 }, (_, index) => index + 32),
+    ].map((gpio) => ({
+      gpio,
+      label: `GPIO${gpio}`,
+      mode: 'unknown',
+      owner: null,
+      value: null,
+      source: 'unavailable',
+      writable: false,
+    }));
+    transport.receive(eventLine());
+    transport.receive(eventLine('pins', { pins: pins.slice(0, 28), partial: false }));
+    transport.receive(WIRE_PREFIX + '{damaged-pin-chunk}\n');
+    expect(controller.getState().logs.at(-1)?.data.message).toContain('格式错误');
+    expect(controller.getState().pins?.data.pins).toHaveLength(28);
+    vi.spyOn(transport, 'write').mockImplementation(async (data) => {
+      transport.writes.push(data);
+      transport.receive(eventLine('pins', { pins, partial: false }));
+    });
+
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(transport.writes).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(transport.writes).toHaveLength(2);
+    const recovery = JSON.parse(transport.writes[1]!.slice(WIRE_PREFIX.length));
+    expect(recovery).toEqual({
+      v: 1,
+      id: expect.stringMatching(/^bridge-recovery-/),
+      command: 'snapshot.get',
+      args: {},
+    });
+    expect(controller.getState().pins?.data.pins).toHaveLength(34);
+    expect(
+      controller.getState().logs.some((event) => String(event.data.message).includes('格式错误')),
+    ).toBe(true);
+  });
+
+  it('coalesces malformed and oversized frames and limits automatic recovery to three requests per open', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    const transport = transports[0]!;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      transport.receive(WIRE_PREFIX + '{broken}\n');
+      transport.receive('x'.repeat(9000) + '\n');
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(transport.writes).toHaveLength(1 + Math.min(attempt, 3));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(transport.writes).toHaveLength(1 + Math.min(attempt + 1, 3));
+    }
+    const commands = transport.writes.map(
+      (line) => JSON.parse(line.slice(WIRE_PREFIX.length)) as DeviceCommand,
+    );
+    expect(new Set(commands.map((command) => command.id)).size).toBe(4);
+    expect(commands.every((command) => command.command === 'snapshot.get')).toBe(true);
+    expect(commands.every((command) => command.bootId === undefined)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(
+      controller.getState().logs.some((event) => String(event.data.message).includes('8 KiB')),
+    ).toBe(true);
+  });
+
+  it('cancels recovery on release and prevents old callbacks from requesting a new session snapshot', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-old');
+    const old = transports[0]!;
+    old.receive(WIRE_PREFIX + '{broken}\n');
+    expect(vi.getTimerCount()).toBe(1);
+    await controller.connect('COM-new');
+    expect(vi.getTimerCount()).toBe(0);
+    old.receive(WIRE_PREFIX + '{still-broken}\n');
+    old.receive('x'.repeat(9000) + '\n');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(old.writes).toHaveLength(1);
+    expect(transports[1]!.writes).toHaveLength(1);
+    expect(controller.getState().connection.port).toBe('COM-new');
+  });
+
   it('redacts credentials from startup logs and device event payloads', async () => {
     const { controller, transports } = setup();
     await controller.connect('COM-test');
@@ -373,6 +465,7 @@ describe('bridge controller without hardware', () => {
     const initialSnapshot = JSON.parse(transports[0]!.writes[0]!.slice(WIRE_PREFIX.length));
     expect(initialSnapshot.command).toBe('snapshot.get');
     expect(initialSnapshot.bootId).toBeUndefined();
+    transports[0]!.receive(WIRE_PREFIX + '{broken-before-loss}\n');
     transports[0]!.listeners?.close();
     await vi.advanceTimersByTimeAsync(1000);
     expect(transports).toHaveLength(2);
@@ -382,6 +475,9 @@ describe('bridge controller without hardware', () => {
     expect(reconnectSnapshot.command).toBe('snapshot.get');
     expect(reconnectSnapshot.bootId).toBeUndefined();
     expect(reconnectSnapshot.id).not.toBe(initialSnapshot.id);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(transports[0]!.writes).toHaveLength(1);
+    expect(transports[1]!.writes).toHaveLength(1);
     transports[1]!.listeners?.close();
     await controller.disconnect();
     await vi.advanceTimersByTimeAsync(10_000);
