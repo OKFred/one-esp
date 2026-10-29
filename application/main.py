@@ -34,8 +34,11 @@ def main():
     time.sleep(0.1)
     screen_display(text)
     # 连接WiFi
+    screen_display('Connecting WiFi\nPlease wait...')
     wifiObj=wifi_connector(ssid, password)
-      
+    if not wifiObj['ok']:
+        screen_display('WiFi failed\n' + wifiObj['message'] + '\nEdit .env\nRestart to retry')
+        return
 
     # 要显示的文本
     text = f"WiFi Connected!\n {wifiObj['IP Address']}"
@@ -67,4 +70,4 @@ def main():
       modbus_talker('AUTO',display_text)
       print('sleep 600s...')
       time.sleep(600)
-      
+
