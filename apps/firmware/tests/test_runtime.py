@@ -98,6 +98,7 @@ class RuntimeTests(unittest.TestCase):
     def command(self, name, args=None, identifier='test'):
         self.runtime.service.handle({'v': 1, 'id': identifier, 'command': name,
                                      'bootId': self.runtime.service.boot_id, 'args': args or {}})
+        self.runtime.service.tick()
 
     def test_initialization_never_claims_sensor_or_uart_pins(self):
         self.assertEqual([call.args for call in self.machine.Pin.call_args_list], [(36,), (39,)])
@@ -123,6 +124,7 @@ class RuntimeTests(unittest.TestCase):
         self.clock.value = 60001
         self.runtime.network_tick()
         self.runtime.network_tick()
+        self.runtime.service.tick()
         self.assertIsNone(self.config.pending)
         self.assertEqual(self.config.values['SSID'], 'Original')
         self.assertEqual(self.wlan.connects[-1], ('Original', 'original-private'))

@@ -79,6 +79,11 @@ class DebugServiceTests(unittest.TestCase):
         return [event for event in events if kind is None or event['type'] == kind]
 
     def ack(self):
+        for _ in range(200):
+            if not self.service._pending_acks:
+                break
+            self.service.tick()
+            self.clock.advance(10)
         return self.events('ack')[-1]['data']
 
     def enable(self, **values):
@@ -154,6 +159,7 @@ class DebugServiceTests(unittest.TestCase):
         self.assertEqual(len(self.events('ack')), count)
         self.assertEqual(self.service._line, '')
         self.service.feed(WIRE_PREFIX + json.dumps(self.command('config.get')) + '\n')
+        self.ack()
         self.assertEqual(len(self.events('ack')), count + 1)
 
     def test_secrets_never_appear_in_config_responses_or_buffered_logs(self):
@@ -164,7 +170,8 @@ class DebugServiceTests(unittest.TestCase):
         self.enable()
         self.drain_snapshot()
         self.clock.advance(1000)
-        self.service.tick()
+        for _ in range(5):
+            self.service.tick()
         self.assertNotIn('secret-test-value', ''.join(self.frames))
         self.assertIn('[redacted]', ''.join(self.frames))
 
@@ -176,7 +183,7 @@ class DebugServiceTests(unittest.TestCase):
         self.enable(profile='lite', ttlSeconds=9999, oledFps=100, gpioHz=100)
         self.assertEqual(self.service.oled_fps, 1)
         self.assertEqual(self.service.gpio_hz, 1)
-        self.assertEqual(self.service.debug_state()['expiresInMs'], 1800000)
+        self.assertEqual(self.ack()['result']['expiresInMs'], 1800000)
 
     def test_sampling_emits_only_changed_rows_as_partial_pins(self):
         self.enable()
@@ -193,6 +200,34 @@ class DebugServiceTests(unittest.TestCase):
         self.assertEqual([row['gpio'] for row in event['data']['pins']], [36])
         self.assertEqual(event['data']['pins'][0]['source'], 'sampled')
 
+    def test_static_pins_are_sampled_at_most_ten_times_per_second(self):
+        self.enable()
+        self.drain_snapshot()
+        with patch.object(self.pins, 'snapshot', wraps=self.pins.snapshot) as sample:
+            for _ in range(100):
+                self.clock.advance(10)
+                self.service.tick()
+        self.assertGreater(sample.call_count, 0)
+        self.assertLessEqual(sample.call_count, 10)
+
+    def test_failed_pin_transmission_retries_changed_value_on_next_sample(self):
+        self.enable()
+        self.drain_snapshot()
+        self.frames.clear()
+        self.pins.inputs[36].current = 1
+        self.clock.advance(200)
+        self.service._last_status = self.service.now()
+        self.service._last_debug = self.service.now()
+        self.service._budget_started = self.service.now()
+        self.service._budget_bytes = NORMAL_BYTES_PER_SECOND
+        self.service.tick()
+        self.assertEqual(self.events('pins'), [])
+        self.assertEqual(self.service._last_pin_rows[36]['value'], 0)
+        self.clock.advance(1000)
+        self.service.tick()
+        self.service.tick()
+        self.assertEqual(self.events('pins')[-1]['data']['pins'][0]['value'], 1)
+
     def test_oled_is_latest_only_and_sent_when_changed(self):
         self.enable()
         self.drain_snapshot()
@@ -200,7 +235,8 @@ class DebugServiceTests(unittest.TestCase):
         self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': 'first'})
         self.service.capture_oled({'available': True, 'buffer': b'\x01' + bytes(1023), 'text': 'latest'})
         self.clock.advance(1000)
-        self.service.tick()
+        for _ in range(5):
+            self.service.tick()
         self.assertEqual(len(self.events('oled')), 1)
         self.assertEqual(self.events('oled')[0]['data']['text'], 'latest')
         self.clock.advance(1000)
@@ -287,7 +323,8 @@ class DebugServiceTests(unittest.TestCase):
             self.assertLessEqual(len(normal), 1)
             for frame in normal:
                 event = json.loads(frame[len(WIRE_PREFIX):])
-                self.assertNotEqual(event['type'], 'ack')
+                if event['type'] == 'ack':
+                    continue
                 bucket = event['ts'] // 1000
                 byte_buckets[bucket] = byte_buckets.get(bucket, 0) + len(frame.encode())
                 self.assertLess(len(frame.encode()), 2000)
@@ -300,6 +337,7 @@ class DebugServiceTests(unittest.TestCase):
         for index in range(8):
             self.service.handle(self.command('config.get', identifier='get-' + str(index)))
         self.assertGreater(len(self.service._pending_acks), 0)
+        self.assertEqual(self.frames, [])
         self.assertLessEqual(sum(len(frame.encode()) for frame in self.frames), 2048)
         self.assertLessEqual(len(self.service._pending_acks), 16)
         for _ in range(9):
@@ -307,6 +345,52 @@ class DebugServiceTests(unittest.TestCase):
             self.service.tick()
         self.assertEqual(len(self.events('ack')), 8)
         self.assertEqual(self.service._pending_acks, [])
+
+    def test_busy_debug_tick_emits_at_most_one_frame_with_logs_and_commands(self):
+        self.enable()
+        self.drain_snapshot()
+        self.frames.clear()
+        seen = set()
+        for index in range(240):
+            self.clock.advance(50)
+            # Avoid a 100-ms signal period aliasing the 10-Hz sampler.
+            self.pins.inputs[36].current = (index // 3) % 2
+            self.service.capture_oled({'available': True,
+                                      'buffer': bytes([index % 256]) * 1024,
+                                      'text': str(index)})
+            self.service.log('warn', 'queued log ' + str(index))
+            previous = len(self.frames)
+            if index % 20 == 0:
+                self.service.handle(self.command('config.get', identifier='load-' + str(index)))
+                self.assertEqual(len(self.frames), previous, 'Command handling must only enqueue ACKs')
+            self.service.tick()
+            emitted = self.frames[previous:]
+            self.assertLessEqual(len(emitted), 1, 'One tick must never write consecutive frames')
+            for line in emitted:
+                seen.add(json.loads(line[len(WIRE_PREFIX):])['type'])
+        self.assertTrue({'ack', 'status', 'debug', 'pins', 'oled', 'log'} <= seen)
+
+    def test_ttl_safety_update_precedes_a_queued_ack_without_emitting_two_frames(self):
+        output = Pin()
+        self.pins.outputs[25] = {'pin': output, 'safeValue': 0}
+        self.enable(ttlSeconds=1)
+        self.service.handle(self.command('gpio.write', {'gpio': 25, 'value': 1}))
+        self.assertEqual(output.current, 1)
+        self.clock.advance(1001)
+        previous = len(self.frames)
+        self.service.tick()
+        self.assertFalse(self.service.enabled)
+        self.assertEqual(output.current, 0)
+        self.assertEqual(len(self.frames) - previous, 1)
+        self.assertEqual(self.events()[-1]['type'], 'ack')
+
+    def test_host_validation_uses_ascii_dns_names_and_ip_addresses(self):
+        values = self.config.validate({'NTP_SERVER': 'ntp-1.example.com',
+                                       'NETWORK_TEST_HOST': '192.0.2.8'})
+        self.assertEqual(values['NETWORK_TEST_HOST'], '192.0.2.8')
+        for host in ('host:443', 'bad host', '\u4e2d\u6587.example'):
+            with self.assertRaises(ValueError):
+                self.config.validate({'NTP_SERVER': host})
 
     def test_credential_spaces_survive_save_and_reload(self):
         expected = {'SSID': ' My AP ', 'PASSWORD': '  private = value  '}

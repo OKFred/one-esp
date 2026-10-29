@@ -55,7 +55,8 @@ def _encode(values):
 
 def _host(value):
     return bool(value) and len(value) <= 253 and all(
-        char.isalnum() or char in '.-_' for char in value)
+        ('a' <= char <= 'z') or ('A' <= char <= 'Z') or
+        ('0' <= char <= '9') or char in '.-_' for char in value)
 
 
 class ConfigStore:

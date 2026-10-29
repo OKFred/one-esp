@@ -51,6 +51,7 @@ class DebugService:
         self._last_pins = -1000
         self._last_oled = -1000
         self._last_debug = -1000
+        self._debug_pending = False
         self._last_pin_rows = {}
         self._oled = {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
                       'buffer': '', 'available': False, 'text': ''}
@@ -202,6 +203,7 @@ class DebugService:
         return True
 
     def stop(self):
+        self._debug_pending = self._debug_pending or self.enabled
         self.enabled = False
         self.expires_at = 0
         self.pins.restore_safe_values()
@@ -220,14 +222,18 @@ class DebugService:
             del self._acks[evicted]
             if evicted in self._pending_acks:
                 self._pending_acks.remove(evicted)
-        self._send_ack(command_id)
+        self._queue_ack(command_id)
+
+    def _queue_ack(self, command_id):
+        if command_id not in self._pending_acks:
+            self._pending_acks.append(command_id)
 
     def _send_ack(self, command_id):
         if self.emit('ack', self._acks[command_id], True):
             if command_id in self._pending_acks:
                 self._pending_acks.remove(command_id)
-        elif command_id not in self._pending_acks:
-            self._pending_acks.append(command_id)
+            return True
+        return False
 
     def _number(self, value, name, minimum, maximum):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
@@ -241,7 +247,7 @@ class DebugService:
         if not isinstance(command_id, str) or not 1 <= len(command_id) <= 128:
             return
         if command_id in self._acks:
-            self._send_ack(command_id)
+            self._queue_ack(command_id)
             return
         try:
             if command.get('v') != 1:
@@ -276,7 +282,6 @@ class DebugService:
                 else:
                     self.stop()
                     self.acknowledge(command_id, True, self.debug_state())
-                    self.emit('debug', self.debug_state(), True)
             elif name == 'snapshot.get':
                 self.snapshot()
                 self.acknowledge(command_id, True, {'stage': 'queued'})
@@ -329,37 +334,48 @@ class DebugService:
 
     def tick(self):
         now = self.now()
-        if self._pending_acks:
-            self._send_ack(self._pending_acks[0])
+        # Safety expiry precedes all transmission, including a queued ACK.
         if self.enabled and now >= self.expires_at:
             self.stop()
-            self.emit('debug', self.debug_state(), True)
+        if self._pending_acks and self._send_ack(self._pending_acks[0]):
+            return
+        if self._debug_pending and self.emit('debug', self.debug_state()):
+            self._debug_pending = False
+            self._last_debug = now
+            return
         if self._snapshot_tick(now):
             return
         if not self.enabled:
             return
         status_interval = 1000 if self.profile == 'full' else 5000
         if now - self._last_status >= status_interval:
-            self.emit('status', self.status_provider())
-            self._last_status = now
+            if self.emit('status', self.status_provider()):
+                self._last_status = now
+                return
         if now - self._last_debug >= 5000:
-            self.emit('debug', self.debug_state())
-            self._last_debug = now
+            if self.emit('debug', self.debug_state()):
+                self._last_debug = now
+                return
         if now - self._last_pins >= 1000 / self.gpio_hz:
             rows = self.pins.snapshot()
+            # Sampling cadence is independent of successful transmission.
+            # Retain the last sent rows on failure so the next sample retries.
+            self._last_pins = now
             changed = [row for row in rows if self._last_pin_rows.get(row['gpio']) != row]
             if changed and self.emit('pins', {'pins': changed, 'partial': True}):
                 self._last_pin_rows = {row['gpio']: row for row in rows}
-            self._last_pins = now
+                return
         if self._oled_revision != self._sent_oled_revision and now - self._last_oled >= 1000 / self.oled_fps:
             if self.emit('oled', self._oled):
                 self._sent_oled_revision = self._oled_revision
                 self._last_oled = now
+                return
         for _ in range(min(2, len(self.logs))):
             entry = self.logs[0]
             if self.profile == 'lite' and entry['level'] not in ('warn', 'error'):
                 self._pop_log()
             elif self.emit('log', entry):
                 self._pop_log()
+                return
             else:
                 break
