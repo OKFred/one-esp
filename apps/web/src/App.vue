@@ -30,6 +30,7 @@ import type { DeviceEvent } from '@one-esp/protocol';
 import BoardView from './components/BoardView.vue';
 import OledScreen from './components/OledScreen.vue';
 import { useDevice } from './composables/useDevice';
+import { configValuesForSave, createConfigForm, readConfigValues } from './config';
 import type { PinData } from './types';
 
 const {
@@ -68,21 +69,14 @@ const hiddenLogs = shallowRef(new Set<string>());
 const logStream = ref<HTMLElement>();
 const configOpen = ref(false);
 const configLoading = ref(false);
+const configLoaded = ref(false);
 const configSaving = ref(false);
 const configConfirm = ref(false);
 const restartOpen = ref(false);
 const gpioConfirm = ref<{ gpio: number; value: 0 | 1 }>();
 const passwordConfigured = ref(false);
 const configRevision = ref(0);
-const form = reactive({
-  SSID: '',
-  PASSWORD: '',
-  NTP_SERVER: 'ntp.aliyun.com',
-  TIMEZONE_HOURS: 8,
-  NETWORK_TEST_HOST: 'baidu.com',
-  NETWORK_TEST_PORT: 443,
-  POLL_INTERVAL_MS: 500,
-});
+const form = reactive(createConfigForm());
 const configError = ref('');
 const clientReady = computed(() => channelConnected.value && state.value.connection.connected);
 const canMutate = computed(
@@ -234,6 +228,7 @@ async function setDebug(enabled: boolean | string | number) {
 async function openConfig() {
   configOpen.value = true;
   configLoading.value = true;
+  configLoaded.value = false;
   configError.value = '';
   form.PASSWORD = '';
   try {
@@ -243,10 +238,8 @@ async function openConfig() {
     const secretFlags = result.secrets as Record<string, unknown> | undefined;
     passwordConfigured.value = Boolean(result.passwordConfigured ?? secretFlags?.PASSWORD);
     const values = (result.values as Record<string, unknown>) || {};
-    for (const key of Object.keys(form) as Array<keyof typeof form>) {
-      if (key !== 'PASSWORD' && values[key] !== undefined)
-        (form as Record<string, unknown>)[key] = values[key];
-    }
+    Object.assign(form, readConfigValues(values));
+    configLoaded.value = true;
   } catch (cause) {
     configError.value = cause instanceof Error ? cause.message : '读取配置失败';
   } finally {
@@ -256,26 +249,18 @@ async function openConfig() {
 
 function reviewConfig() {
   configError.value = '';
-  if (!form.SSID.trim()) {
-    configError.value = 'Wi-Fi 名称不能为空';
-    return;
+  try {
+    configValuesForSave(form);
+    configConfirm.value = true;
+  } catch (cause) {
+    configError.value = cause instanceof Error ? cause.message : '配置格式无效';
   }
-  if (!form.NTP_SERVER.trim() || !form.NETWORK_TEST_HOST.trim()) {
-    configError.value = '服务器地址不能为空';
-    return;
-  }
-  if (form.NETWORK_TEST_PORT < 1 || form.NETWORK_TEST_PORT > 65535) {
-    configError.value = '端口范围为 1–65535';
-    return;
-  }
-  configConfirm.value = true;
 }
 
 async function saveConfig() {
   configSaving.value = true;
   try {
-    const values: Record<string, unknown> = { ...form };
-    if (!form.PASSWORD) delete values.PASSWORD;
+    const values = configValuesForSave(form);
     await command('config.set', { revision: configRevision.value, values });
     form.PASSWORD = '';
     configConfirm.value = false;
@@ -804,7 +789,10 @@ function clearVisibleLogs() {
       <p v-if="!debug?.enabled" class="control-help">开启调试会话后才可保存配置。</p>
       <template #footer
         ><AButton :disabled="configSaving" @click="configOpen = false">关闭</AButton
-        ><AButton type="primary" :disabled="configLoading || !canMutate" @click="reviewConfig"
+        ><AButton
+          type="primary"
+          :disabled="configLoading || !configLoaded || !canMutate"
+          @click="reviewConfig"
           >检查并保存</AButton
         ></template
       >
