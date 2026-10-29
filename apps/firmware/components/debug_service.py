@@ -356,6 +356,13 @@ class DebugService:
             if self.emit('debug', self.debug_state()):
                 self._last_debug = now
                 return
+        # A noisy input can remain due on every slow UART loop. Keep the latest
+        # screen ahead of GPIO deltas so a running clock cannot be starved.
+        if self._oled_revision != self._sent_oled_revision and now - self._last_oled >= 1000 / self.oled_fps:
+            if self.emit('oled', self._oled):
+                self._sent_oled_revision = self._oled_revision
+                self._last_oled = now
+                return
         if now - self._last_pins >= 1000 / self.gpio_hz:
             rows = self.pins.snapshot()
             # Sampling cadence is independent of successful transmission.
@@ -364,11 +371,6 @@ class DebugService:
             changed = [row for row in rows if self._last_pin_rows.get(row['gpio']) != row]
             if changed and self.emit('pins', {'pins': changed, 'partial': True}):
                 self._last_pin_rows = {row['gpio']: row for row in rows}
-                return
-        if self._oled_revision != self._sent_oled_revision and now - self._last_oled >= 1000 / self.oled_fps:
-            if self.emit('oled', self._oled):
-                self._sent_oled_revision = self._oled_revision
-                self._last_oled = now
                 return
         for _ in range(min(2, len(self.logs))):
             entry = self.logs[0]

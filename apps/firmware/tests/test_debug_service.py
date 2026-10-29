@@ -243,6 +243,50 @@ class DebugServiceTests(unittest.TestCase):
         self.service.tick()
         self.assertEqual(len(self.events('oled')), 1)
 
+    def test_uart_cost_and_noisy_inputs_do_not_starve_the_one_hertz_screen(self):
+        class NoisyInput(Pin):
+            def value(self):
+                self.current ^= 1
+                return self.current
+
+        def uart_write(line):
+            self.frames.append(line)
+            # 115200 8N1 takes ten wire bits per byte. Unlike a zero-cost writer,
+            # this can leave the 10-Hz GPIO sampler due again on the next tick.
+            wire_ms = (len(line.encode()) * 10000 + 115199) // 115200
+            self.clock.advance(wire_ms)
+
+        self.service.writer = uart_write
+        self.pins.inputs = {36: NoisyInput(), 39: NoisyInput()}
+        self.enable()
+        self.drain_snapshot()
+        self.service.device_id = 'abcdef012345'
+        self.service.boot_id = '0123456789abcdef'
+        self.frames.clear()
+        last_second = -1
+        while self.clock.value < 12000:
+            previous = len(self.frames)
+            self.service.tick()
+            self.assertLessEqual(len(self.frames) - previous, 1)
+            second = self.clock.value // 1000
+            if second != last_second:
+                last_second = second
+                self.service.capture_oled({
+                    'available': True, 'buffer': bytes([second % 256]) * 1024,
+                    'text': 'WiFi Connected!\n192.0.2.100\n10-30 03:15:' +
+                            str(second).zfill(2) + '\nTCP: 42ms',
+                })
+                self.clock.advance(25)  # OLED I2C transfer.
+            self.clock.advance(60)  # Other loop work on the ESP32.
+
+        steady = [event for event in self.events() if event['ts'] >= 3000]
+        oled = [event for event in steady if event['type'] == 'oled']
+        self.assertGreaterEqual(len(oled), 9)
+        self.assertGreaterEqual(len({event['data']['text'] for event in oled}), 9)
+        self.assertLess(self.clock.value - oled[-1]['ts'], 1500)
+        self.assertGreaterEqual(len([event for event in steady if event['type'] == 'status']), 8)
+        self.assertGreaterEqual(len([event for event in steady if event['type'] == 'pins']), 30)
+
     def test_clock_wrap_does_not_extend_an_expired_session(self):
         self.clock.value = (1 << 30) - 500
         self.service._raw_tick = self.clock.ticks_ms()
