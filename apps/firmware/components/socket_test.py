@@ -8,26 +8,29 @@ import network
 import socket
 import time
 
-def socket_test(socketObj):
+def socket_test(socketObj, timeout=2):
+    s = None
     try:
         network.WLAN(network.STA_IF).active(True)
         response = network.WLAN(network.STA_IF).isconnected()
         if not response:
-            socketObj.update({"message":"Network not connected--网络未连接","ok": False})
+            socketObj.update({"message":"Network not connected--网络未连接","ok": False, "data": {}})
             return socketObj
 
         addr = socket.getaddrinfo(socketObj['host'], socketObj['port'])[0][-1]
         s = socket.socket()
-        s.settimeout(4)  # 设置超时时间
+        s.settimeout(timeout)  # DNS above is synchronous; connect has a timeout.
         start_time = time.ticks_ms()
         s.connect(addr)
         end_time = time.ticks_ms()
-        s.close()
         ping = time.ticks_diff(end_time, start_time)
         # print(f"Round trip time--往返时间: {ping} 毫秒")
-        socketObj.update({"data": {"ping": ping},  "ok": True})
+        socketObj.update({"data": {"ping": ping}, "message": "Connected", "ok": True})
         return socketObj
     except (OSError) as e:
         print(e)
-        socketObj.update({"message": "Network not connected--网络未连接", "ok": False})
+        socketObj.update({"message": "Network not connected--网络未连接", "ok": False, "data": {}})
         return socketObj
+    finally:
+        if s is not None:
+            s.close()

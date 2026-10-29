@@ -40,8 +40,24 @@ def get_text_width(text):
     return width
 
 oled = init_oled()
+_observer = None
+_last_text = ''
+
+
+def display_state():
+    return {'available': bool(oled), 'buffer': bytes(oled.buffer) if oled else b'',
+            'width': max_width, 'height': max_height, 'format': 'MONO_VLSB',
+            'text': _last_text}
+
+
+def set_observer(observer):
+    global _observer
+    _observer = observer
+    if _observer:
+        _observer(display_state())
 
 def screen_display(text):
+    global _last_text
     if not oled:
         print("OLED display not initialized--显示屏未初始化")
         return False
@@ -76,7 +92,10 @@ def screen_display(text):
                 break
         oled.text(truncated_text + "...", 0, (max_height // 16 - 1) * 16)
         
-    oled.show() 
+    oled.show()
+    _last_text = text
+    if _observer:
+        _observer(display_state())
     return True
 
 def screen_clear():

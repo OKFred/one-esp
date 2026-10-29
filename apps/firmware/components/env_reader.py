@@ -8,6 +8,13 @@ def env_reader(filename):
     env = {}
     with open(filename, 'r') as file:
         for line in file:
-            key, value = line.strip().split('=')
-            env[key] = value
+            # Spaces after '=' are credentials, not formatting. Strip only
+            # physical line endings so SSIDs/passwords round-trip exactly.
+            line = line.rstrip('\r\n')
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            if '=' not in line:
+                raise ValueError('Invalid environment configuration line')
+            key, value = line.split('=', 1)
+            env[key.strip()] = value
     return env

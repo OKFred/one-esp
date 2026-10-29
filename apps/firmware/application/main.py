@@ -67,7 +67,8 @@ def main():
       # 打印当前时间
       print("当前时间",get_local_time())
       screen_display(newText)
-      modbus_talker('AUTO',display_text)
+      # Sensor wiring is disconnected. Acquisition will be integrated in a
+      # later release; even the legacy entrypoint must not drive its UART pins.
       print('sleep 600s...')
       time.sleep(600)
 

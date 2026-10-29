@@ -2,9 +2,12 @@ import ntptime
 import utime
 import time
 
-def time_sync(server='time.apple.com'):
+def time_sync(server='time.apple.com', timeout=2):
     try:
         ntptime.host = server
+        # Socket operations are bounded. DNS resolution in ntptime is still
+        # synchronous, so callers must pause this maintenance while debugging.
+        ntptime.timeout = timeout
         ntptime.settime()
         print("Time synchronized successfully--时间同步成功")
         return True
@@ -22,7 +25,7 @@ def get_formatted_time():
 # 获取本地时间并应用时区偏移
 def get_local_time(offset_hours=8):
     utc_time = time.localtime()
-    local_time = time.mktime(utc_time) + offset_hours * 3600
+    local_time = int(time.mktime(utc_time) + offset_hours * 3600)
     datetime_tuple= time.localtime(local_time)
     # Extract the relevant parts
     year, month, day, hour, minute, second, weekday, yearday  = datetime_tuple
