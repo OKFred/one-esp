@@ -55,18 +55,25 @@ OLED 按 `128×64 MONO_VLSB` 原始 1024 字节绘制 Canvas，顶部黄 / 下�
 
 ## 备份与上传
 
+主机上的上传工具和固件回归测试统一由 **uv** 管理。`.python-version` 固定 **CPython 3.14.2**，`pyproject.toml` 声明依赖，`uv.lock` 锁定直接与传递依赖；依赖安装在根目录 `.venv/`，无需手动激活环境，也不向全局 Python 安装包。主机 CPython 用于工具和测试，ESP32 仍运行 **MicroPython 1.22.2**。尚未安装 uv 时，按 [官方安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装。
+
 工具先请求 bridge 释放串口，再备份完整设备到 Git 忽略的 `.device-backups/`，逐文件 SHA-256 校验后上传。备份含私有配置，仅保存在本机。
 
+在仓库根目录执行：
+
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r tools/requirements.txt
-.\.venv\Scripts\python.exe tools/device.py backup --port COM3
-.\.venv\Scripts\python.exe tools/device.py upload --port COM3
+uv sync --locked
+uv run --locked python tools/device.py backup --port COM3
+uv run --locked python tools/device.py upload --port COM3
 ```
 
-上传中断当前程序，先上传临时 `.py` 文件并编译校验，然后替换并重启。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。`pnpm device` 使用 PATH 上的 Python，推荐直接用虚拟环境命令。
+也可使用 `pnpm device backup --port COM3`、`pnpm device upload --port COM3`；这两个入口同样使用 `uv run --locked`，按锁文件同步项目环境后调用其中的 Python。
+
+上传中断当前程序，先上传临时 `.py` 文件并编译校验，然后替换并重启。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。
 
 ## 检查
+
+首次运行前先执行 `uv sync --locked`。`pnpm test:firmware` 通过 `uv run --locked` 使用同一项目环境运行主机回归测试。
 
 ```powershell
 pnpm typecheck

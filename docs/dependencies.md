@@ -1,6 +1,14 @@
 # 直接依赖清单
 
-版本与用途按工作区清单组织；全部传递依赖和完整性哈希见 `pnpm-lock.yaml`。运行时 Node.js 26.13.0 / pnpm 11.5.0；Python 上传工具 mpremote 1.28.0（其传递依赖由虚拟环境安装），固件使用 MicroPython 1.22.2 内置模块和仓库 SSD1306 驱动。
+版本与用途按工作区清单组织；Node.js 依赖的传递版本和完整性哈希见 `pnpm-lock.yaml`，主机 Python 依赖见 `uv.lock`。运行时 Node.js 26.13.0 / pnpm 11.5.0；主机 CPython 3.14.2 由 `.python-version` 固定，uv 按根目录 `pyproject.toml` 和锁文件管理项目 `.venv/`。固件使用 MicroPython 1.22.2 内置模块和仓库 SSD1306 驱动。
+
+## 主机 Python 工具
+
+| 包         | 固定版本 | 用途                       |
+| ---------- | -------- | -------------------------- |
+| `mpremote` | `1.28.0` | MicroPython 设备备份与上传 |
+
+Python 项目支持 `>=3.14,<3.15`，默认使用固定的 3.14.2；本次迁移使用 uv 0.9.28。`pyserial`、`platformdirs` 等传递依赖的版本与文件哈希由 `uv.lock` 固定。安装执行 `uv sync --locked`，工具和测试执行 `uv run --locked`；依赖保持在项目 `.venv/`，不安装到全局 Python。该环境只服务主机工具与测试，不上传到 ESP32。
 
 ## one-esp
 

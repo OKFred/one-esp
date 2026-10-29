@@ -24,8 +24,11 @@ The OLED clock uses integer epoch arithmetic, preserving second precision on ESP
 
 Configuration changes take effect after saving: timezone on the next clock refresh, an actual NTP server change schedules new synchronization, and an actual TCP host/port change clears the DNS cache and schedules a new probe. Saving identical values preserves the current probe/sync deadlines. Wi-Fi changes first pass the 60-second trial. `POLL_INTERVAL_MS` is stored but explicitly inactive while sensors remain disabled; `config.get` describes each field's application timing.
 
-Run host regression tests from the repository root:
+Host tooling and regression tests use CPython 3.14.2 pinned by the root `.python-version`; the ESP32 uses MicroPython 1.22.2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. Run from the repository root to synchronize the locked dependencies into the local `.venv` and execute the host tests:
 
 ```text
-python -B -m unittest discover -s apps/firmware/tests -v
+uv sync --locked
+uv run --locked python -B -m unittest discover -s apps/firmware/tests -v
 ```
+
+`pnpm test:firmware` wraps the same locked command. No environment activation or global Python dependency installation is required. For backup and upload, use `uv run --locked python tools/device.py backup --port COM3` or `uv run --locked python tools/device.py upload --port COM3`; see the root guide for the backup and credential-preservation behavior.

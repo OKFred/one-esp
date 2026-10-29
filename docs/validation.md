@@ -10,6 +10,14 @@
 - Playwright 在 390 / 768 / 1440 宽度共 3 项场景测试通过：正常 / Wi-Fi 错误 / 离线、OLED 实际亮像素与 2:1 比例、配置弹窗、debug 开关、默认 GPIO 禁写、无整体横向溢出、零 console / pageerror。
 - 浏览器截图生成于 Git 忽略的 `test-results/screenshots/`。回放截图属于模拟数据。
 
+## 主机 Python 依赖隔离
+
+- 根目录 `pyproject.toml`、`uv.lock`、`.python-version` 统一管理主机工具和测试；CPython 固定 3.14.2，使用 uv 0.9.28 完成迁移。
+- `uv sync --locked`、`uv lock --check` 通过。mpremote 1.28.0、platformdirs 4.14.0、pyserial 3.5 与迁移前一致。
+- `uv run --locked` 的 Python 和三项依赖均来自根目录 `.venv/`，用户 site-packages 关闭；系统 Python 的包清单与迁移前一致，未安装全局依赖。
+- `pnpm test:firmware` 通过新的锁定入口运行 87 项测试；`pnpm device --help`、`uv run --locked python -m mpremote --help` 和只读 `pnpm device status` 通过。此次只改变主机依赖管理，没有重新上传或重启固件。
+- CI 按 `.python-version` 安装 Python，固定 uv 版本并执行 `uv sync --locked` 后运行检查。
+
 ## 实机验证
 
 - 完整设备备份保存在 Git 忽略的 `.device-backups/`，包含设备私有配置；上传前逐文件 SHA-256 校验。原始 MicroPython 设备文件没有发布到仓库。

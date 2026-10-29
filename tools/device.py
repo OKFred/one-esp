@@ -31,7 +31,7 @@ def release_bridge(url):
 
 def mpremote(port, *arguments):
     if importlib.util.find_spec("mpremote") is None:
-        raise RuntimeError("Install tools/requirements.txt in a Python virtual environment first")
+        raise RuntimeError("Run uv sync --locked from the repository root first")
     subprocess.run([sys.executable, "-m", "mpremote", "connect", port, "resume", *arguments],
                    check=True, cwd=ROOT)
 
