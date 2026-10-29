@@ -45,6 +45,10 @@ OLED 按 `128×64 MONO_VLSB` 原始 1024 字节绘制 Canvas，顶部黄 / 下�
 
 仅保留最新屏幕帧、有界日志队列和引脚变化量；不通过反复中断 REPL 采集。RTC 以整数秒换算时区，屏幕跟随 RTC 秒边界刷新并优先于周期 GPIO。TCP 连通性每分钟测试一次；NTP 启动时同步、60 秒后复测漂移，再按估计误差预算每 30–300 秒校准，目标 500ms。两者均使用非阻塞轮询，debug 开启时继续。校时保留小数秒并补偿网络延迟；网页显示估计误差与校准时间，网络质量差或失联会显示精度待恢复。首次 DNS 解析仍可能暂时延迟 USB 响应，详见 [固件说明](apps/firmware/README.md)。
 
+网页的设备健康卡片通过独立 `metrics` 低频帧显示 CPU 主频、Python 内存、ESP-IDF 堆、Wi-Fi RSSI、文件系统容量和芯片温度。FULL 每 5 秒、LITE 每 15 秒采集常规指标；温度每 30 秒、文件系统每 60 秒刷新，物理 Flash 容量只读取一次。只有开启 debug 或显式请求只读快照时才采集；快照复用缓存，最短 5 秒，慢指标失败也不会被频繁重试。关闭 debug 后停止周期采集，不主动触发 GC、不写文件、不做下载测速；只保留最新指标帧，不塞进每秒 status。旧固件不提供 `metrics` 时仍可使用原有调试功能。
+
+CPU 主频不代表占用率；当前 MicroPython 没有整机 CPU 使用率或 Wi-Fi 流量速率接口，网络卡片以 RSSI 和已有 TCP 延迟辅助判断连接质量。Python 的空闲加已分配内存是动态分配预算，不是物理 RAM；它与 ESP-IDF 堆统计存在重叠，不能相加。文件系统分区容量和物理 Flash 总量分别显示。原版 ESP32 温度接口返回华氏度，转换后的摄氏度仅作芯片内部温度参考，不能代替环境温湿度传感器，见 [官方硬件说明](https://docs.micropython.org/en/v1.22.0/esp32/quickref.html#general-board-control) 与 [内存统计说明](https://docs.micropython.org/en/v1.22.0/library/esp32.html#esp32.idf_heap_info)。
+
 ## 配置
 
 设备 `.env` 放在设备根目录，参考 `apps/firmware/.env.example`。真实 `.env`、历史配置和设备备份均被 Git 忽略，不要把密码写进源码。
@@ -69,7 +73,7 @@ uv run --locked python tools/device.py upload --port COM3
 
 也可使用 `pnpm device backup --port COM3`、`pnpm device upload --port COM3`；这两个入口同样使用 `uv run --locked`，按锁文件同步项目环境后调用其中的 Python。
 
-上传中断当前程序，先上传临时 `.py` 文件并编译校验，然后替换并重启。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。
+上传中断当前程序，先上传临时 `.py` 文件，逐文件核对 SHA-256 并全部编译通过后再替换、重启。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。
 
 ## 检查
 
@@ -81,6 +85,7 @@ pnpm lint
 pnpm format:check
 pnpm test
 pnpm test:firmware
+pnpm test:tools
 pnpm build
 pnpm exec playwright install chromium
 pnpm test:e2e

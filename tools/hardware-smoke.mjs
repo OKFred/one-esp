@@ -9,11 +9,13 @@ const port = process.argv.find((arg) => arg.startsWith('--port='))?.slice(7) ?? 
 const rollback = process.argv.includes('--wifi-rollback');
 const minuteProbe = process.argv.includes('--minute-probe');
 const clockSync = process.argv.includes('--clock-sync');
+const metricsCheck = process.argv.includes('--metrics');
 const pending = new Map();
 const samples = [];
 const frames = [];
 const probeSamples = new Map();
 const clockSamples = new Map();
+const metricsSamples = new Map();
 const protocolErrors = [];
 let recoverableFrameWarnings = 0;
 let bootId;
@@ -38,6 +40,11 @@ socket.addEventListener('message', ({ data }) => {
       clockSamples.set(quality.samples, quality);
   }
   if (event.type === 'oled') frames.push(event.data);
+  if (event.type === 'metrics')
+    metricsSamples.set(`${event.data.intervalMs}:${event.data.sampledAtMs}`, {
+      ...event.data,
+      encodedBytes: Buffer.byteLength('@one-esp ' + JSON.stringify(event) + '\n'),
+    });
   if (event.type === 'log') {
     if (/格式错误|超过 8 KiB/.test(event.data.message)) recoverableFrameWarnings++;
     if (/Traceback|(?:Memory|Attribute|Type|Syntax)Error/.test(event.data.message))
@@ -106,6 +113,7 @@ try {
   bootId = state.hello.bootId;
   assert.equal(state.connection.mode, 'usb');
   assert.equal(state.status.data.sensorEnabled, false);
+  if (metricsCheck) assert(state.hello.data.capabilities.includes('metrics'));
   if (state.debug.data.enabled) {
     await command('debug.set', { enabled: false });
     await waitFor((value) => value.debug?.data.enabled === false, 'debug session reset');
@@ -186,7 +194,10 @@ try {
       );
     } else {
       if (minuteProbe) console.log('Observing clock motion and two minute-spaced TCP samples');
-      await new Promise((resolve) => setTimeout(resolve, minuteProbe ? 65_000 : 15_000));
+      if (metricsCheck) console.log('Observing low-frequency resource samples over one minute');
+      await new Promise((resolve) =>
+        setTimeout(resolve, minuteProbe || metricsCheck ? 65_000 : 15_000),
+      );
     }
   }
 
@@ -216,6 +227,41 @@ try {
     assert(second.withinTarget, 'reported precision must meet the target');
   }
   assert(samples.length >= 4);
+  if (metricsCheck) {
+    const full = [...metricsSamples.values()].filter((sample) => sample.intervalMs === 5000);
+    assert(full.length >= 10, 'FULL should provide repeated resource samples');
+    for (let index = 1; index < full.length; index++)
+      assert(full[index].sampledAtMs - full[index - 1].sampledAtMs >= 5000);
+    assert(new Set(full.map((sample) => sample.storage?.sampledAtMs)).size >= 2);
+    assert(new Set(full.map((sample) => sample.temperature?.sampledAtMs)).size >= 2);
+    for (const sample of full) {
+      assert(sample.cpuHz > 0);
+      assert(sample.memory.freeBytes > 0 && sample.memory.allocatedBytes > 0);
+      assert(sample.idfHeap.freeBytes > 0);
+      assert(sample.idfHeap.largestBlockBytes <= sample.idfHeap.freeBytes);
+      assert(sample.storage.freeBytes <= sample.storage.totalBytes);
+      assert(sample.flashBytes >= sample.storage.totalBytes);
+      assert(sample.temperature.celsius >= -40 && sample.temperature.celsius <= 150);
+      assert(sample.rssiDbm !== null && sample.rssiDbm < 0);
+      assert(sample.sampleDurationUs !== null && sample.sampleDurationUs < 500_000);
+      assert(sample.encodedBytes < 1200, 'Resource frames must remain small');
+    }
+    assert.equal(
+      (await command('debug.set', { enabled: true, profile: 'lite', ttlSeconds: 60 })).ok,
+      true,
+    );
+    await waitFor(
+      () =>
+        [...metricsSamples.values()].filter((sample) => sample.intervalMs === 15000).length >= 2,
+      'two LITE resource samples',
+      25_000,
+    );
+    const lite = [...metricsSamples.values()].filter((sample) => sample.intervalMs === 15000);
+    assert(lite[1].sampledAtMs - lite[0].sampledAtMs >= 15_000);
+    console.log(
+      'PASS FULL/LITE resources, slow storage/temperature sampling and bounded frame size',
+    );
+  }
   assert.equal(protocolErrors.length, 0);
   await waitFor(
     (value) => value.pins?.data.pins.length === 34,
@@ -223,6 +269,15 @@ try {
   );
   assert.equal((await command('debug.set', { enabled: false })).ok, true);
   state = await waitFor((value) => value.debug?.data.enabled === false, 'debug shutdown telemetry');
+  if (metricsCheck) {
+    const pausedSamples = metricsSamples.size;
+    await new Promise((resolve) => setTimeout(resolve, 5500));
+    assert.equal(
+      metricsSamples.size,
+      pausedSamples,
+      'Resource sampling must stop when debug is off',
+    );
+  }
   assert.equal(state.hello.bootId, bootId);
   console.log(
     JSON.stringify({
@@ -233,6 +288,18 @@ try {
       maxFreeHeapBytes: Math.max(...samples),
       recoverableFrameWarnings,
       distinctClockSeconds: clockSeconds.size,
+      ...(metricsCheck
+        ? {
+            resourceSamples: metricsSamples.size,
+            maximumResourceReadMs:
+              Math.max(...[...metricsSamples.values()].map((sample) => sample.sampleDurationUs)) /
+              1000,
+            maximumResourceEncodedBytes: Math.max(
+              ...[...metricsSamples.values()].map((sample) => sample.encodedBytes),
+            ),
+            latestResources: [...metricsSamples.values()].at(-1),
+          }
+        : {}),
       tcpProbeStartsMs: probeTimes,
       clockMeasurements: [...clockSamples.values()].map((quality) => ({
         samples: quality.samples,
