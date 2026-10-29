@@ -50,3 +50,5 @@ POST `/api/command` 返回 `{id,accepted:true}` 后，通过 `/ws` 等待同 id 
 设备缓存最近 16 条回执去重，不构成跨重启持久化幂等。USB 使用 UART0/stdin/stdout，禁止同时用 mpremote / Thonny 占用，上传前应释放 bridge 连接。
 
 WebSocket 首包为 `snapshot`（BridgeState），随后为 `event`（DeviceEvent）或 `connection`。归并器保留最新 OLED / pins / status 和最多 200 条日志。慢客户端超过缓冲上限会断开，重连获取新快照。
+
+固件 GPIO 快照按 6 项分片，每片均为 `partial=true`。主机在 bootId / 会话变化时清空，再按 GPIO 合并；同次启动刷新时保留此前已知记录，避免坏片使完整引脚表被首片清空。

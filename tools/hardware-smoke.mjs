@@ -8,10 +8,12 @@ const origin = 'http://127.0.0.1:8787';
 const port = process.argv.find((arg) => arg.startsWith('--port='))?.slice(7) ?? 'COM3';
 const rollback = process.argv.includes('--wifi-rollback');
 const minuteProbe = process.argv.includes('--minute-probe');
+const clockSync = process.argv.includes('--clock-sync');
 const pending = new Map();
 const samples = [];
 const frames = [];
 const probeSamples = new Map();
+const clockSamples = new Map();
 const protocolErrors = [];
 let recoverableFrameWarnings = 0;
 let bootId;
@@ -31,6 +33,9 @@ socket.addEventListener('message', ({ data }) => {
       !probeSamples.has(probe.tcpSamples)
     )
       probeSamples.set(probe.tcpSamples, probe);
+    const quality = event.data.clock;
+    if (quality?.samples > 0 && !quality.busy && !clockSamples.has(quality.samples))
+      clockSamples.set(quality.samples, quality);
   }
   if (event.type === 'oled') frames.push(event.data);
   if (event.type === 'log') {
@@ -168,8 +173,21 @@ try {
     assert.equal(restored.result.values.SSID, config.result.values.SSID);
     console.log('PASS failed Wi-Fi trial rolled back; original revision and connection restored');
   } else {
-    if (minuteProbe) console.log('Observing clock motion and two minute-spaced TCP samples');
-    await new Promise((resolve) => setTimeout(resolve, minuteProbe ? 65_000 : 15_000));
+    if (clockSync) {
+      console.log(
+        'Waiting for a second independent NTP response and pre-correction precision measurement',
+      );
+      await waitFor(
+        (value) =>
+          value.status?.data.clock?.samples >= 2 &&
+          (!minuteProbe || value.status?.data.maintenance?.tcpSamples >= 2),
+        'second clock synchronization',
+        120_000,
+      );
+    } else {
+      if (minuteProbe) console.log('Observing clock motion and two minute-spaced TCP samples');
+      await new Promise((resolve) => setTimeout(resolve, minuteProbe ? 65_000 : 15_000));
+    }
   }
 
   assert(frames.length >= 2);
@@ -187,6 +205,15 @@ try {
       const interval = probeTimes[index] - probeTimes[index - 1];
       assert(interval >= 60_000 && interval < 62_500, 'TCP start interval must be one minute');
     }
+  }
+  if (clockSync) {
+    const second = [...clockSamples.values()].at(-1);
+    assert(second?.samples >= 2, 'need two independently received clock samples');
+    assert(
+      Math.abs(second.lastOffsetUs) / 1000 + second.uncertaintyMs <= 500,
+      'pre-correction clock error plus network uncertainty must fit the 500ms target',
+    );
+    assert(second.withinTarget, 'reported precision must meet the target');
   }
   assert(samples.length >= 4);
   assert.equal(protocolErrors.length, 0);
@@ -207,6 +234,14 @@ try {
       recoverableFrameWarnings,
       distinctClockSeconds: clockSeconds.size,
       tcpProbeStartsMs: probeTimes,
+      clockMeasurements: [...clockSamples.values()].map((quality) => ({
+        samples: quality.samples,
+        lastOffsetUs: quality.lastOffsetUs,
+        uncertaintyMs: quality.uncertaintyMs,
+        estimatedErrorMs: quality.estimatedErrorMs,
+        intervalMs: quality.intervalMs,
+        driftPpm: quality.driftPpm,
+      })),
       sensorEnabled: state.status.data.sensorEnabled,
       debugEnabled: state.debug.data.enabled,
     }),
