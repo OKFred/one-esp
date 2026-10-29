@@ -19,10 +19,11 @@ from components.board_profile import DEBUG_OUTPUTS, PinRegistry
 from components.device_config import ConfigStore
 from components.debug_service import DebugService
 from components.time_sync import time_sync, get_local_time
-from components.socket_test import socket_test
+from components.network_probe import NetworkProbe
 
 
-MAINTENANCE_INTERVAL_MS = 600000
+NTP_INTERVAL_MS = 600000
+TCP_INTERVAL_MS = 60000
 
 
 class DiagnosticRuntime:
@@ -46,13 +47,19 @@ class DiagnosticRuntime:
         self.network_state = 'idle'
         self.trial_id = None
         self.restart_at = None
-        self.maintenance_at = 0
-        self.maintenance_phase = 'ntp'
         self.maintenance_busy = None
-        self.maintenance_revision = self.config.revision
+        self.ntp_at = 0
+        self.tcp_at = 0
+        self.ntp_server = self.config.values['NTP_SERVER']
+        self.tcp_target = (self.config.values['NETWORK_TEST_HOST'],
+                           int(self.config.values['NETWORK_TEST_PORT']))
+        self.probe = NetworkProbe(self.service.now)
         self.ntp_synced = False
         self.tcp_ok = None
         self.tcp_ms = None
+        self.tcp_samples = 0
+        self.tcp_last_test_ms = None
+        self.tcp_last_started_ms = None
         self.last_clock = -1000
         self.service.hello()
 
@@ -73,7 +80,14 @@ class DiagnosticRuntime:
                 'wifi': wifi, 'sensorEnabled': False,
                 'maintenancePaused': self.service.enabled,
                 'maintenance': {'busy': self.maintenance_busy, 'clockSynced': self.ntp_synced,
-                                'tcpOk': self.tcp_ok, 'tcpMs': self.tcp_ms}}
+                                'ntpPaused': self.service.enabled,
+                                'tcpOk': self.tcp_ok, 'tcpMs': self.tcp_ms,
+                                'tcpSamples': self.tcp_samples,
+                                'tcpLastStartedMs': self.tcp_last_started_ms,
+                                'tcpLastTestMs': self.tcp_last_test_ms,
+                                'tcpIntervalMs': TCP_INTERVAL_MS,
+                                'tcpNextInMs': max(0, self.tcp_at - self.service.now()),
+                                'tcpInFlight': self.probe.busy}}
 
     def show(self, text):
         if self.display:
@@ -83,6 +97,8 @@ class DiagnosticRuntime:
                 self.service.log('error', 'OLED update failed')
 
     def start_wifi(self, values, timeout_ms=20000):
+        self.probe.cancel()
+        self.maintenance_busy = None
         self.wifi_timeout = timeout_ms
         self.wifi_started = self.service.now()
         self.network_state = 'disconnecting'
@@ -105,10 +121,13 @@ class DiagnosticRuntime:
         self.start_wifi(candidate, 60000)
 
     def schedule_restart(self):
+        self.probe.cancel()
         # Allow the accepted ACK to drain before resetting.
         self.restart_at = self.service.now() + 250
 
     def network_failure(self, reason):
+        self.probe.cancel()
+        self.maintenance_busy = None
         self.wifi_started = None
         try:
             self.wlan.disconnect()
@@ -156,8 +175,7 @@ class DiagnosticRuntime:
                         self.start_wifi(self.config.values)
                         return
                 self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nSensors disabled')
-                self.maintenance_at = self.service.now() + 1000
-                self.maintenance_phase = 'ntp'
+                self.schedule_network_jobs()
                 self.service.log('info', 'WiFi connected; sensor acquisition remains disabled')
                 self.service.emit('status', self.status(), True)
             elif self.service.now() - self.wifi_started >= self.wifi_timeout:
@@ -173,6 +191,8 @@ class DiagnosticRuntime:
                 self.network_failure(reason)
                 self.service.emit('status', self.status(), True)
         elif self.network_state == 'connected' and not connected:
+            self.probe.cancel()
+            self.maintenance_busy = None
             self.network_state = 'reconnecting'
             self.show('WiFi offline\nReconnecting...\nUSB debug ready')
             self.service.log('warn', 'WiFi disconnected; USB diagnostics remain available')
@@ -180,8 +200,12 @@ class DiagnosticRuntime:
             self.network_state = 'connected'
             self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nSensors disabled')
             self.service.log('info', 'WiFi connection restored')
-            self.maintenance_at = self.service.now() + 1000
-            self.maintenance_phase = 'ntp'
+            self.schedule_network_jobs()
+
+    def schedule_network_jobs(self):
+        now = self.service.now()
+        self.ntp_at = now + 1000
+        self.tcp_at = now + 1000
 
     def clock_tick(self):
         now = self.service.now()
@@ -196,37 +220,64 @@ class DiagnosticRuntime:
 
     def maintenance_tick(self):
         now = self.service.now()
-        if self.config.revision != self.maintenance_revision:
-            self.maintenance_revision = self.config.revision
-            self.maintenance_at = now + 500
-            self.maintenance_phase = 'ntp'
-        if self.service.enabled or self.network_state != 'connected' or now < self.maintenance_at:
-            return
-        # Run only one bounded socket job per iteration. These libraries use
-        # synchronous DNS, which may still delay USB until resolution returns.
-        self.maintenance_busy = self.maintenance_phase
-        try:
-            if self.maintenance_phase == 'ntp':
-                self.ntp_synced = time_sync(self.config.values['NTP_SERVER'], timeout=2)
-                self.service.log('info' if self.ntp_synced else 'warn',
-                                 'Clock synchronized' if self.ntp_synced else 'NTP synchronization failed')
-                self.maintenance_phase = 'tcp'
-                self.maintenance_at = self.service.now() + 100
-            else:
-                result = socket_test({'host': self.config.values['NETWORK_TEST_HOST'],
-                                      'port': int(self.config.values['NETWORK_TEST_PORT'])}, timeout=2)
-                self.tcp_ok = bool(result.get('ok'))
-                self.tcp_ms = result.get('data', {}).get('ping') if self.tcp_ok else None
-                self.service.log('info' if self.tcp_ok else 'warn',
-                                 'TCP connection test completed' if self.tcp_ok else 'TCP connection test failed')
-                self.maintenance_phase = 'ntp'
-                self.maintenance_at = self.service.now() + MAINTENANCE_INTERVAL_MS
-        except OSError:
-            self.service.log('warn', 'Network maintenance failed')
-            self.maintenance_phase = 'ntp'
-            self.maintenance_at = self.service.now() + MAINTENANCE_INTERVAL_MS
-        finally:
+        # Revision changes may be no-op saves. Only reset a job when its actual
+        # endpoint changes, otherwise repeated form saves could cause probe bursts.
+        ntp_server = self.config.values['NTP_SERVER']
+        target = (self.config.values['NETWORK_TEST_HOST'],
+                  int(self.config.values['NETWORK_TEST_PORT']))
+        if ntp_server != self.ntp_server:
+            self.ntp_server = ntp_server
+            self.ntp_synced = False
+            self.ntp_at = now + 500
+        if target != self.tcp_target:
+            self.probe.cancel()
             self.maintenance_busy = None
+            self.tcp_target = target
+            self.tcp_at = now + 500
+            self.tcp_ok, self.tcp_ms = None, None
+        if self.restart_at is not None or self.network_state != 'connected' or not self.wlan.isconnected():
+            self.probe.cancel()
+            self.maintenance_busy = None
+            return
+        if self.probe.busy:
+            result = self.probe.tick()
+            self.maintenance_busy = 'tcp' if self.probe.busy else None
+            if result is not None:
+                self.record_probe(result)
+            return
+        if now >= self.tcp_at:
+            # Start-to-start cadence, including failed DNS/connection attempts.
+            # Missed intervals never trigger a burst of catch-up connections.
+            self.tcp_at = now + TCP_INTERVAL_MS
+            self.tcp_last_started_ms = now
+            self.maintenance_busy = 'tcp'
+            result = self.probe.start(target[0], target[1])
+            self.maintenance_busy = 'tcp' if self.probe.busy else None
+            if result is not None:
+                self.record_probe(result)
+            return
+        if self.service.enabled or now < self.ntp_at:
+            return
+        # NTP and the initial/changed endpoint's DNS lookup remain synchronous.
+        # Cached-address TCP connect/poll never waits for the network.
+        self.maintenance_busy = 'ntp'
+        try:
+            self.ntp_synced = time_sync(self.ntp_server, timeout=2)
+            self.service.log('info' if self.ntp_synced else 'warn',
+                             'Clock synchronized' if self.ntp_synced else 'NTP synchronization failed')
+        except OSError:
+            self.service.log('warn', 'NTP synchronization failed')
+        finally:
+            self.ntp_at = self.service.now() + NTP_INTERVAL_MS
+            self.maintenance_busy = None
+
+    def record_probe(self, result):
+        self.tcp_ok = bool(result['ok'])
+        self.tcp_ms = result['ping'] if self.tcp_ok else None
+        self.tcp_samples += 1
+        self.tcp_last_test_ms = result['completedAtMs']
+        self.service.log('info' if self.tcp_ok else 'warn',
+                         'TCP connection test completed' if self.tcp_ok else 'TCP connection test failed')
 
     def poll_commands(self):
         # Bound per-loop work. Do not consume the UART through a second driver.
@@ -269,4 +320,5 @@ def run():
     try:
         runtime.run()
     finally:
+        runtime.probe.cancel()
         runtime.service.stop()

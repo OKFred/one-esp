@@ -7,9 +7,11 @@ import { decodeOledPixels } from '../packages/protocol/dist/index.js';
 const origin = 'http://127.0.0.1:8787';
 const port = process.argv.find((arg) => arg.startsWith('--port='))?.slice(7) ?? 'COM3';
 const rollback = process.argv.includes('--wifi-rollback');
+const minuteProbe = process.argv.includes('--minute-probe');
 const pending = new Map();
 const samples = [];
 const frames = [];
+const probeSamples = new Map();
 const protocolErrors = [];
 let recoverableFrameWarnings = 0;
 let bootId;
@@ -19,7 +21,17 @@ socket.addEventListener('message', ({ data }) => {
   if (packet.type !== 'event') return;
   const event = packet.data;
   if (event.type === 'hello') bootId = event.bootId;
-  if (event.type === 'status') samples.push(event.data.memFree);
+  if (event.type === 'status') {
+    samples.push(event.data.memFree);
+    const probe = event.data.maintenance;
+    if (
+      probe?.tcpSamples > 0 &&
+      !probe.tcpInFlight &&
+      probe.tcpLastTestMs >= probe.tcpLastStartedMs &&
+      !probeSamples.has(probe.tcpSamples)
+    )
+      probeSamples.set(probe.tcpSamples, probe);
+  }
   if (event.type === 'oled') frames.push(event.data);
   if (event.type === 'log') {
     if (/格式错误|超过 8 KiB/.test(event.data.message)) recoverableFrameWarnings++;
@@ -156,11 +168,26 @@ try {
     assert.equal(restored.result.values.SSID, config.result.values.SSID);
     console.log('PASS failed Wi-Fi trial rolled back; original revision and connection restored');
   } else {
-    await new Promise((resolve) => setTimeout(resolve, 15_000));
+    if (minuteProbe) console.log('Observing clock motion and two minute-spaced TCP samples');
+    await new Promise((resolve) => setTimeout(resolve, minuteProbe ? 65_000 : 15_000));
   }
 
   assert(frames.length >= 2);
   for (const frame of frames) assert.equal(decodeOledPixels(frame).length, 8192);
+  const clockSeconds = new Set(frames.map((frame) => frame.text.split('\n')[2]).filter(Boolean));
+  assert(clockSeconds.size >= 5, 'RTC and mirrored framebuffer must advance every second');
+  const probeTimes = [...probeSamples.values()].map((probe) => probe.tcpLastStartedMs);
+  if (minuteProbe) {
+    assert(probeTimes.length >= 2, 'TCP must continue sampling while debug is enabled');
+    assert(
+      [...probeSamples.values()].some((probe) => probe.tcpOk),
+      'TCP endpoint must be reachable',
+    );
+    for (let index = 1; index < probeTimes.length; index++) {
+      const interval = probeTimes[index] - probeTimes[index - 1];
+      assert(interval >= 60_000 && interval < 62_500, 'TCP start interval must be one minute');
+    }
+  }
   assert(samples.length >= 4);
   assert.equal(protocolErrors.length, 0);
   await waitFor(
@@ -178,6 +205,8 @@ try {
       minFreeHeapBytes: Math.min(...samples),
       maxFreeHeapBytes: Math.max(...samples),
       recoverableFrameWarnings,
+      distinctClockSeconds: clockSeconds.size,
+      tcpProbeStartsMs: probeTimes,
       sensorEnabled: state.status.data.sensorEnabled,
       debugEnabled: state.debug.data.enabled,
     }),

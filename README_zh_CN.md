@@ -43,7 +43,7 @@ OLED 按 `128×64 MONO_VLSB` 原始 1024 字节绘制 Canvas，顶部黄 / 下�
 
 **GPIO 输出白名单为空**，所有输出按钮禁用。OLED 用 GPIO4 / SCL、GPIO5 / SDA；GPIO1 / 3 是 UART0；GPIO6–11 属于 Flash。板图按丝印作参考，不表示所有芯片 GPIO 均从板上引出。
 
-仅保留最新屏幕帧、有界日志队列和引脚变化量；不通过反复中断 REPL 采集。debug 开启暂停低频 NTP / TCP 维护，RTC 时钟继续刷新。已经开始的同步 DNS 查询可能暂时延迟 USB 响应，见 [固件说明](apps/firmware/README.md)。
+仅保留最新屏幕帧、有界日志队列和引脚变化量；不通过反复中断 REPL 采集。RTC 时钟每秒刷新，时区以整数秒换算，屏幕帧优先于周期 GPIO，避免画面被高频引脚变化挤占。TCP 连通性每分钟测试一次，debug 开启时继续；连接使用非阻塞轮询。NTP 每 10 分钟校时，debug 开启时暂停。首次 DNS 解析可能暂时延迟 USB 响应，见 [固件说明](apps/firmware/README.md)。
 
 ## 配置
 
