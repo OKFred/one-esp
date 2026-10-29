@@ -98,26 +98,38 @@ def backup(port, restart=True):
     return target
 
 
-def upload(port):
-    backup(port, restart=False)
-    files = sorted(path for path in FIRMWARE.rglob("*.py")
-                   if "tests" not in path.relative_to(FIRMWARE).parts
-                   and "__pycache__" not in path.parts)
-    relative = [path.relative_to(FIRMWARE).as_posix() for path in files]
+def build_upload_plan(firmware=FIRMWARE):
+    """Prepare staged copies and a checksum/compile barrier before any rename."""
+    files = sorted(path for path in firmware.rglob("*.py")
+                   if "tests" not in path.relative_to(firmware).parts
+                   and "__pycache__" not in path.parts
+                   and not any(part.startswith(".env") for part in path.relative_to(firmware).parts))
+    relative = [path.relative_to(firmware).as_posix() for path in files]
+    digests = {remote: hashlib.sha256(path.read_bytes()).hexdigest()
+               for path, remote in zip(files, relative)}
     directories = sorted({str(Path(path).parent).replace("\\", "/")
                           for path in relative if "/" in path}, key=lambda path: path.count("/"))
     setup = "import os\nfor path in " + repr(directories) + ":\n try:\n  os.mkdir(path)\n except OSError:\n  pass\n"
     arguments = ["exec", setup]
     for path, remote in zip(files, relative):
-        arguments.extend(["fs", "cp", str(path), ":" + remote + ".upload", "+"])
-    # Validate all files before replacing any existing source file.
-    finish = "import os\npaths=" + repr(relative) + "\n"
-    finish += "for path in paths:\n compile(open(path+'.upload').read(),path,'exec')\n"
-    finish += "for path in paths:\n os.rename(path+'.upload',path)\n"
+        # Old MicroPython bytes repr can corrupt mpremote's binary hash reply.
+        # Always copy; the ASCII-hex verification below replaces its skip check.
+        arguments.extend(["fs", "cp", "-f", str(path), ":" + remote + ".upload", "+"])
+    # Verify every staged file, then compile every file, before replacing any.
+    # Small chunks and collection between files leave space for the compiler.
+    finish = "import os, ubinascii, uhashlib, gc\ndigests=" + repr(digests) + "\n"
+    finish += "for path, expected in digests.items():\n gc.collect()\n digest=uhashlib.sha256()\n with open(path+'.upload','rb') as stream:\n  while True:\n   chunk=stream.read(256)\n   if not chunk: break\n   digest.update(chunk)\n if ubinascii.hexlify(digest.digest()).decode('ascii') != expected:\n  raise RuntimeError('Upload checksum mismatch: '+path)\n del digest, chunk\n gc.collect()\n"
+    finish += "for path in digests:\n gc.collect()\n with open(path+'.upload') as stream:\n  source=stream.read()\n compile(source,path,'exec')\n del source\n gc.collect()\n"
+    finish += "for path in digests:\n os.rename(path+'.upload',path)\n"
     finish += "print('Code uploaded; existing device credentials preserved')\n"
     arguments.extend(["exec", finish])
+    return arguments
+
+
+def upload(port):
+    backup(port, restart=False)
     try:
-        mpremote(port, *arguments)
+        mpremote(port, *build_upload_plan())
     finally:
         mpremote(port, "reset")
 

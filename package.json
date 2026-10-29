@@ -10,6 +10,7 @@
     "typecheck": "pnpm --filter @one-esp/protocol build && pnpm --filter @one-esp/bridge typecheck && pnpm --filter @one-esp/web typecheck",
     "test": "vitest run",
     "test:firmware": "uv run --locked python -B -m unittest discover -s apps/firmware/tests -v",
+    "test:tools": "uv run --locked python -B -m unittest discover -s tools/tests -v",
     "test:e2e": "playwright test",
     "lint": "oxlint packages/protocol/src apps/bridge/src apps/web/src && eslint apps/web/src",
     "format": "oxfmt --write .",
