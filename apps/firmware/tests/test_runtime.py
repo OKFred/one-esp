@@ -27,6 +27,9 @@ class Clock:
     def ticks_diff(self, new, old):
         return new - old
 
+    def time(self):
+        return 846127200 + self.value // 1000
+
 
 class Wlan:
     def __init__(self):
@@ -87,6 +90,74 @@ class Probe:
         self.finish_result = None
 
 
+class ClockSynchronizer:
+    """Scheduler-facing contract; packet math is tested in test_clock_sync."""
+    def __init__(self, clock):
+        self.clock = clock
+        self.server = None
+        self.next_due_ms = 0
+        self.busy = False
+        self.starts = []
+        self.cancels = 0
+        self.requests = 0
+        self.polls = 0
+        self.synced = False
+        self.samples = 0
+        self.failures = 0
+        self.last_sync = None
+        self.interval_ms = 60000
+        self.start_result = True
+        self.finish_result = None
+
+    def configure(self, server):
+        if server != self.server:
+            self.cancel()
+            self.server = server
+            self.next_due_ms = self.clock.value
+
+    def request_sync(self):
+        self.requests += 1
+        self.next_due_ms = self.clock.value
+
+    def complete(self, result):
+        self.busy = False
+        if result['ok']:
+            self.synced = True
+            self.samples += 1
+            self.last_sync = self.clock.value
+            self.next_due_ms = self.clock.value + self.interval_ms
+        else:
+            self.failures += 1
+            self.next_due_ms = self.clock.value + 30000
+        return result
+
+    def start(self):
+        self.starts.append((self.clock.value, self.server))
+        self.busy = self.start_result is None
+        if self.busy:
+            return None
+        return self.complete({'ok': self.start_result})
+
+    def tick(self):
+        self.polls += 1
+        result, self.finish_result = self.finish_result, None
+        return self.complete(result) if result is not None else None
+
+    def cancel(self):
+        self.cancels += 1
+        self.busy = False
+        self.finish_result = None
+
+    def status(self):
+        return {'synced': self.synced, 'targetMs': 500,
+                'estimatedErrorMs': 40 if self.synced else None,
+                'withinTarget': self.synced, 'samples': self.samples,
+                'failures': self.failures, 'intervalMs': self.interval_ms,
+                'nextInMs': max(0, self.next_due_ms - self.clock.value),
+                'lastSyncAgeMs': None if self.last_sync is None else self.clock.value - self.last_sync,
+                'busy': self.busy}
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -101,8 +172,8 @@ class RuntimeTests(unittest.TestCase):
             UART=Mock(side_effect=AssertionError('UART must not be initialized')),
             unique_id=lambda: b'device', reset=Mock(),
         )
-        self.ntp = Mock(return_value=True)
         self.probe = Probe(self.clock)
+        self.sync = ClockSynchronizer(self.clock)
         self.local_time = Mock(return_value={'formatted_simple_date_time': '10-30 12:34:56',
                                             'formatted_time': '12:34:56'})
         modules = {
@@ -112,8 +183,9 @@ class RuntimeTests(unittest.TestCase):
                                             STAT_IDLE=1000, STAT_CONNECTING=1001),
             'time': self.clock, 'gc': types.SimpleNamespace(mem_free=lambda: 200000),
             'uselect': types.SimpleNamespace(poll=lambda: Mock(), POLLIN=1),
-            'components.time_sync': types.SimpleNamespace(time_sync=self.ntp, get_local_time=self.local_time),
+            'components.time_sync': types.SimpleNamespace(get_local_time=self.local_time),
             'components.network_probe': types.SimpleNamespace(NetworkProbe=lambda _: self.probe),
+            'components.clock_sync': types.SimpleNamespace(ClockSync=lambda _: self.sync),
         }
         spec = importlib.util.spec_from_file_location('_runtime_test', ROOT / 'application/runtime.py')
         self.module = importlib.util.module_from_spec(spec)
@@ -163,47 +235,54 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(acks[-1]['result']['stage'], 'rolled-back')
         self.assertNotIn('new-private', self.output.getvalue())
 
-    def test_debug_pauses_ntp_but_pending_tcp_and_clock_continue(self):
+    def test_debug_keeps_pending_ntp_tcp_clock_and_usb_running(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.command('debug.set', {'enabled': True, 'ttlSeconds': 600}, 'enable')
+        self.sync.start_result = None
         self.probe.start_result = None
         self.local_time.side_effect = [
             {'formatted_simple_date_time': '10-30 12:34:56', 'formatted_time': '12:34:56'},
             {'formatted_simple_date_time': '10-30 12:34:57', 'formatted_time': '12:34:57'},
         ]
         self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
         self.runtime.clock_tick()
-        self.ntp.assert_not_called()
+        self.assertEqual(self.sync.starts, [(0, 'ntp.aliyun.com')])
         self.assertEqual(self.probe.starts, [(0, 'baidu.com', 443)])
+        self.assertTrue(self.sync.busy)
         self.assertTrue(self.probe.busy)
         self.clock.value = 1000
         self.runtime.maintenance_tick()
         self.runtime.clock_tick()
-        self.command('config.get', identifier='while-probe-pending')
+        self.command('config.get', identifier='while-network-pending')
         text = [call.args[0] for call in self.display.screen_display.call_args_list]
         self.assertIn('RTC 12:34:56', text[0])
         self.assertIn('RTC 12:34:57', text[1])
-        self.assertIn('while-probe-pending', self.output.getvalue())
-        self.assertTrue(self.runtime.status()['maintenancePaused'])
-        self.assertTrue(self.runtime.status()['maintenance']['ntpPaused'])
-        self.ntp.assert_not_called()
+        self.assertIn('while-network-pending', self.output.getvalue())
+        self.assertFalse(self.runtime.status()['maintenancePaused'])
+        self.assertFalse(self.runtime.status()['maintenance']['ntpPaused'])
+        self.assertGreaterEqual(self.sync.polls, 1)
+        self.sync.finish_result = {'ok': True}
         self.probe.finish_result = self.probe.result(True)
         self.runtime.maintenance_tick()
+        self.assertTrue(self.runtime.ntp_synced)
         self.assertEqual(self.runtime.tcp_ms, 42)
-        self.runtime.service.enabled = False
-        self.runtime.maintenance_tick()
-        self.ntp.assert_called_once_with('ntp.aliyun.com', timeout=2)
+        self.assertIsNone(self.runtime.maintenance_busy)
+        self.assertEqual(self.runtime.status()['clock']['targetMs'], 500)
+        self.assertTrue(self.runtime.status()['clock']['withinTarget'])
 
     def test_tcp_runs_once_per_minute_during_debug_without_catchup_bursts(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.runtime.service.enabled = True
         self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
         self.clock.value = 59999
         self.runtime.maintenance_tick()
         self.assertEqual(len(self.probe.starts), 1)
         self.clock.value = 60000
+        self.runtime.maintenance_tick()
         self.runtime.maintenance_tick()
         self.assertEqual([start[0] for start in self.probe.starts], [0, 60000])
         self.clock.value = 245000
@@ -213,13 +292,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.status()['maintenance']['tcpNextInMs'], 60000)
         self.assertEqual(self.runtime.status()['maintenance']['tcpSamples'], 3)
         self.assertEqual(self.runtime.status()['maintenance']['tcpLastTestMs'], 245000)
-        self.ntp.assert_not_called()
+        self.assertEqual(len(self.sync.starts), 3)
 
     def test_failed_probe_waits_a_minute_before_retrying(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.runtime.service.enabled = True
         self.probe.start_result = False
+        self.runtime.maintenance_tick()
         self.runtime.maintenance_tick()
         self.assertFalse(self.runtime.tcp_ok)
         self.assertIsNone(self.runtime.tcp_ms)
@@ -228,50 +308,62 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.probe.starts), 1)
         self.clock.value = 60000
         self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
         self.assertEqual(len(self.probe.starts), 2)
 
-    def test_ntp_keeps_its_ten_minute_schedule(self):
+    def test_ntp_uses_component_deadline_even_during_debug(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
+        self.runtime.service.enabled = True
         self.runtime.maintenance_tick()
-        self.clock.value = 1
+        self.assertEqual(self.sync.starts, [(0, 'ntp.aliyun.com')])
         self.runtime.maintenance_tick()
-        self.assertEqual(self.ntp.call_count, 1)
+        self.clock.value = 59999
+        self.runtime.maintenance_tick()
+        self.assertEqual(len(self.sync.starts), 1)
+        # The component, rather than a fixed runtime period, selects the next
+        # interval from its uncertainty and drift estimate.
+        self.sync.interval_ms = 175000
         self.clock.value = 60000
         self.runtime.maintenance_tick()
-        self.assertEqual(self.ntp.call_count, 1)
-        self.clock.value = 600000
         self.runtime.maintenance_tick()
+        self.assertEqual(self.sync.starts[-1], (60000, 'ntp.aliyun.com'))
+        self.assertEqual(self.sync.next_due_ms, 235000)
+        self.clock.value = 234999
         self.runtime.maintenance_tick()
-        self.assertEqual(self.ntp.call_count, 1)
-        self.clock.value = 600001
+        self.assertEqual(len(self.sync.starts), 2)
+        self.clock.value = 235000
         self.runtime.maintenance_tick()
-        self.assertEqual(self.ntp.call_count, 2)
+        self.assertEqual(len(self.sync.starts), 3)
 
     def test_same_value_save_does_not_reset_network_schedules(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.runtime.service.enabled = True
         self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
+        ntp_due = self.sync.next_due_ms
         self.clock.value = 1000
         self.config.begin({'TIMEZONE_HOURS': 9, 'NETWORK_TEST_PORT': 443}, self.config.revision)
         self.config.commit()
         self.runtime.maintenance_tick()
         self.assertEqual(len(self.probe.starts), 1)
+        self.assertEqual(len(self.sync.starts), 1)
         self.assertEqual(self.runtime.tcp_at, 60000)
-        self.assertEqual(self.runtime.ntp_at, 0)
+        self.assertEqual(self.sync.next_due_ms, ntp_due)
 
     def test_endpoint_changes_only_reset_the_affected_job(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.runtime.service.enabled = True
         self.runtime.maintenance_tick()
-        self.runtime.ntp_at = 600000
+        self.runtime.maintenance_tick()
+        ntp_due = self.sync.next_due_ms
         self.clock.value = 1000
         self.config.values['NETWORK_TEST_HOST'] = 'new.example.com'
         self.runtime.maintenance_tick()
         self.assertIsNone(self.runtime.tcp_ok)
-        self.assertEqual(self.runtime.ntp_at, 600000)
+        self.assertEqual(self.sync.next_due_ms, ntp_due)
         self.clock.value = 1499
         self.runtime.maintenance_tick()
         self.assertEqual(len(self.probe.starts), 1)
@@ -282,36 +374,97 @@ class RuntimeTests(unittest.TestCase):
         self.config.values['NTP_SERVER'] = 'other.example.com'
         self.runtime.maintenance_tick()
         self.assertEqual(self.runtime.tcp_at, tcp_at)
-        self.assertEqual(self.runtime.ntp_at, 2000)
+        self.assertEqual(self.sync.starts[-1], (1500, 'other.example.com'))
+        # A server change does not invalidate the already calibrated RTC.
+        self.assertTrue(self.runtime.status()['clock']['synced'])
 
-    def test_wifi_loss_and_restart_close_pending_probe(self):
+    def test_wifi_loss_reconnect_and_restart_clean_up_both_jobs(self):
         self.wlan.connected = True
         self.runtime.network_state = 'connected'
         self.runtime.service.enabled = True
         self.probe.start_result = None
+        self.sync.start_result = None
+        self.runtime.maintenance_tick()
         self.runtime.maintenance_tick()
         self.assertTrue(self.probe.busy)
+        self.assertTrue(self.sync.busy)
         self.wlan.connected = False
         self.runtime.network_tick()
         self.assertFalse(self.probe.busy)
+        self.assertFalse(self.sync.busy)
         self.clock.value = 100
         self.wlan.connected = True
         self.runtime.network_tick()
         self.assertEqual(self.runtime.tcp_at, 1100)
+        self.assertEqual(self.sync.next_due_ms, 100)
+        self.runtime.maintenance_tick()
+        self.assertTrue(self.sync.busy)
         self.clock.value = 1100
         self.runtime.maintenance_tick()
         self.assertTrue(self.probe.busy)
         self.runtime.schedule_restart()
         self.assertFalse(self.probe.busy)
+        self.assertFalse(self.sync.busy)
         self.clock.value = 62000
         self.runtime.maintenance_tick()
         self.assertFalse(self.probe.busy)
+        self.assertFalse(self.sync.busy)
         self.assertEqual(len(self.probe.starts), 2)
+        self.assertEqual(len(self.sync.starts), 2)
 
-    def test_wifi_trial_closes_pending_probe(self):
+    def test_wifi_trial_closes_pending_ntp_and_tcp(self):
         self.probe.busy = True
+        self.sync.busy = True
         self.runtime.start_wifi(self.config.values)
         self.assertFalse(self.probe.busy)
+        self.assertFalse(self.sync.busy)
+
+    def test_ntp_failure_retains_last_calibration_and_retries_its_deadline(self):
+        self.wlan.connected = True
+        self.runtime.network_state = 'connected'
+        self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
+        self.assertTrue(self.runtime.ntp_synced)
+        self.sync.start_result = False
+        self.clock.value = 60000
+        self.runtime.maintenance_tick()
+        self.runtime.maintenance_tick()
+        self.assertTrue(self.runtime.ntp_synced)
+        self.assertEqual(self.runtime.status()['clock']['samples'], 1)
+        self.assertEqual(self.runtime.status()['clock']['failures'], 1)
+        self.clock.value = 89999
+        self.runtime.maintenance_tick()
+        self.assertEqual(len(self.sync.starts), 2)
+        self.clock.value = 90000
+        self.runtime.maintenance_tick()
+        self.assertEqual(len(self.sync.starts), 3)
+
+    def test_clock_tracks_rtc_second_boundaries_without_extra_i2c_refreshes(self):
+        self.wlan.connected = True
+        self.runtime.network_state = 'connected'
+        self.local_time.side_effect = lambda _: {
+            'formatted_simple_date_time': '10-30 12:34:%02d' % (self.clock.time() % 60),
+            'formatted_time': '12:34:%02d' % (self.clock.time() % 60),
+        }
+        self.clock.value = 900
+        self.runtime.clock_tick()
+        self.clock.value = 999
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 1)
+        self.clock.value = 1000
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 2)
+        self.assertIn('RTC 12:34:01', self.display.screen_display.call_args.args[0])
+        for now in range(1100, 2000, 100):
+            self.clock.value = now
+            self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 2)
+        self.runtime.tcp_ok, self.runtime.tcp_ms = True, 51
+        self.clock.value = 1901
+        self.runtime.clock_tick()
+        self.clock.value = 2000
+        self.runtime.clock_tick()
+        self.assertIn('TCP: 51ms', self.display.screen_display.call_args.args[0])
 
     def test_trial_cannot_commit_an_old_asynchronously_disconnecting_connection(self):
         self.wlan.connected = True

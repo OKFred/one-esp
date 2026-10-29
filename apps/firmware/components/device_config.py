@@ -97,7 +97,7 @@ class ConfigStore:
                 'SSID': '60-second connection trial, then saved on success',
                 'PASSWORD': '60-second connection trial, then saved on success',
                 'TIMEZONE_HOURS': 'next clock display update',
-                'NTP_SERVER': 'next NTP cycle while debug is disabled',
+                'NTP_SERVER': 'new non-blocking clock synchronization when the value changes',
                 'NETWORK_TEST_HOST': 'new non-blocking TCP probe when the value changes',
                 'NETWORK_TEST_PORT': 'new non-blocking TCP probe when the value changes',
                 'POLL_INTERVAL_MS': 'saved; inactive while sensor acquisition is disabled',
