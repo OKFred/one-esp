@@ -1,0 +1,13 @@
+packages:
+  - apps/bridge
+  - apps/web
+  - packages/*
+allowBuilds:
+  '@serialport/bindings-cpp': true
+  core-js: false
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@iconify-icons/lucide@2.0.25'
+  - '@types/node@26.6.6'
+engineStrict: true
+saveExact: true
