@@ -126,20 +126,19 @@ export function createReplaySession(
       },
       sensorEnabled: false,
     });
-  const snapshot = () => {
-    send('hello', {
-      firmware: 'one-esp / replay',
-      board: 'esp32-oled-096',
-      capabilities: ['oled', 'pins', 'logs', 'config.read', 'replay'],
-    });
-    status();
-    debug();
+  const screen = () => {
+    const clock = new Date(Date.now() + 8 * 3600_000).toISOString();
     const lines =
       scenario === 'wifi-error'
         ? ['WiFi failed', 'Check password', 'Edit .env', 'Restart to retry']
         : scenario === 'offline'
           ? ['DEVICE OFFLINE', 'LAST KNOWN FRAME', 'CHECK CONNECTION', 'SENSOR DISABLED']
-          : ['WiFi Connected!', '192.0.2.100', 'Debug / USB', 'Sensor disabled'];
+          : [
+              'WiFi Connected!',
+              '192.0.2.100',
+              `${clock.slice(5, 10)} ${clock.slice(11, 19)}`,
+              'TCP: 42ms',
+            ];
     send('oled', {
       width: 128,
       height: 64,
@@ -148,6 +147,16 @@ export function createReplaySession(
       available: true,
       text: lines.join('\n'),
     });
+  };
+  const snapshot = () => {
+    send('hello', {
+      firmware: 'one-esp / replay',
+      board: 'esp32-oled-096',
+      capabilities: ['oled', 'pins', 'logs', 'config.read', 'replay'],
+    });
+    status();
+    debug();
+    screen();
     send('pins', {
       pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 25, 26, 36, 39].map((gpio) => {
         const owner = [4, 5].includes(gpio)
@@ -195,7 +204,10 @@ export function createReplaySession(
             enabled = false;
             debug();
           }
-          if (enabled) status();
+          if (enabled) {
+            status();
+            if (scenario === 'normal') screen();
+          }
         }, 1000);
         timer.unref();
       }
