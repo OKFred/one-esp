@@ -107,10 +107,42 @@ class DebugServiceTests(unittest.TestCase):
         self.assertEqual({event['type'] for event in self.events()},
                          {'ack', 'hello', 'status', 'debug', 'pins', 'oled'})
         pin_events = self.events('pins')
-        self.assertFalse(pin_events[0]['data']['partial'])
-        self.assertTrue(all(event['data']['partial'] for event in pin_events[1:]))
+        self.assertTrue(all(event['data']['partial'] for event in pin_events))
         self.assertGreater(sum(len(event['data']['pins']) for event in pin_events), 20)
         self.assertTrue(all(len(line.encode()) <= MAX_LINE_BYTES for line in self.frames))
+
+    def test_dropped_refresh_fragment_does_not_erase_known_pins_in_same_boot(self):
+        host_pins = {}
+
+        def receive(event):
+            if not event['data']['partial']:
+                host_pins.clear()
+            for pin in event['data']['pins']:
+                host_pins[pin['gpio']] = pin
+
+        self.enable()
+        self.drain_snapshot()
+        for event in self.events('pins'):
+            receive(event)
+        self.assertEqual(len(host_pins), 34)
+        old_gpio12 = host_pins[12]
+
+        self.pins.inputs[36].current = 1
+        self.frames.clear()
+        self.service.snapshot()
+        self.clock.advance(2000)
+        self.drain_snapshot()
+        fragments = self.events('pins')
+        self.assertGreater(len(fragments), 2)
+        for index, event in enumerate(fragments):
+            if index != 2:  # Simulate one damaged six-pin UART fragment.
+                receive(event)
+
+        self.assertEqual(len(host_pins), 34,
+                         'A same-boot refresh must not erase pins when one fragment is lost')
+        self.assertEqual(host_pins[12], old_gpio12)
+        self.assertEqual(host_pins[36]['value'], 1)
+        self.assertTrue(all(event['data']['partial'] for event in fragments))
 
     def test_output_is_denied_with_default_empty_allowlist(self):
         self.enable()

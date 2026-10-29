@@ -181,7 +181,10 @@ class DebugService:
                 self._snapshot_pin_index = 0
             start = self._snapshot_pin_index
             chunk = self._snapshot_rows[start:start + SNAPSHOT_PIN_CHUNK]
-            sent = self.emit('pins', {'pins': chunk, 'partial': start != 0})
+            # A refresh is split across independent serial frames. Never clear
+            # known pins in this boot if a later fragment is lost; the host
+            # already resets its map when the device boot/session changes.
+            sent = self.emit('pins', {'pins': chunk, 'partial': True})
             if sent:
                 self._snapshot_pin_index += len(chunk)
                 if self._snapshot_pin_index < len(self._snapshot_rows):
