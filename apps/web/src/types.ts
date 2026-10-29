@@ -23,6 +23,7 @@ export interface StatusData {
   memFree: number | null;
   wifi: { connected: boolean; status: number | string; ssid?: string; ip?: string; rssi?: number };
   sensorEnabled: boolean;
+  maintenance?: { tcpMs?: number | null; tcpOk?: boolean | null };
   clock?: {
     synced: boolean;
     targetMs: number;

@@ -149,7 +149,11 @@ export class BridgeController {
     port: string | null,
     error: string | null = null,
   ): void {
-    this.state = { ...this.state, connection: { connected, mode, port, error } };
+    this.state = {
+      ...this.state,
+      connection: { connected, mode, port, error },
+      ...(!connected ? { metrics: null } : {}),
+    };
     this.publish({ type: 'connection', data: this.state.connection });
   }
 

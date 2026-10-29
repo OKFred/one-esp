@@ -5,6 +5,7 @@ import {
   type BridgeState,
   type DeviceCommand,
   type DeviceEvent,
+  type MetricsData,
 } from '@one-esp/protocol';
 import type { AckData, DebugData, OledData, PinData, PortInfo, StatusData } from '../types';
 
@@ -41,11 +42,21 @@ export function useDevice() {
   const status = computed(() => state.value.status?.data as unknown as StatusData | undefined);
   const debug = computed(() => state.value.debug?.data as unknown as DebugData | undefined);
   const oled = computed(() => state.value.oled?.data as unknown as OledData | undefined);
+  const metrics = computed(() => state.value.metrics?.data as unknown as MetricsData | undefined);
+  const deviceUptimeMs = computed(() => {
+    const event = state.value.status ?? state.value.metrics;
+    if (!event) return undefined;
+    const uptime = event.type === 'status' ? Number(event.data.uptimeMs) : event.ts;
+    // Continue ageing cached samples after debug stops or the transport closes.
+    return uptime + Math.max(0, now.value - eventReceivedAt(event));
+  });
   const pins = computed(() => {
     const value = state.value.pins?.data as unknown as { pins?: PinData[] } | undefined;
     return value?.pins ?? [];
   });
-  const bootId = computed(() => state.value.hello?.bootId ?? state.value.status?.bootId);
+  const bootId = computed(
+    () => state.value.hello?.bootId ?? state.value.status?.bootId ?? state.value.metrics?.bootId,
+  );
   const deviceId = computed(() => state.value.hello?.deviceId ?? state.value.status?.deviceId);
   const age = computed(() =>
     state.value.lastSeen === null ? null : Math.max(0, now.value - state.value.lastSeen),
@@ -53,6 +64,10 @@ export function useDevice() {
   const stale = computed(
     () => !state.value.connection.connected || (age.value !== null && age.value > 10000),
   );
+  const received = new Map<string, number>();
+  function eventReceivedAt(event: DeviceEvent) {
+    return received.get(event.type) ?? state.value.lastSeen ?? now.value;
+  }
 
   function rejectPending(reason: string) {
     for (const command of pending.values()) {
@@ -75,7 +90,9 @@ export function useDevice() {
     if (previousBoot && event.bootId !== previousBoot && event.type !== 'log') {
       rejectPending('设备已重启，旧命令已取消');
       state.value = { ...createBridgeState(), connection: state.value.connection };
+      received.clear();
     }
+    received.set(event.type, Date.now());
     state.value = applyDeviceEvent(state.value, event, Date.now());
     if (event.type === 'ack') {
       const ack = event.data as unknown as AckData;
@@ -114,7 +131,8 @@ export function useDevice() {
           if (bootId.value && snapshot.hello?.bootId && snapshot.hello.bootId !== bootId.value) {
             rejectPending('设备会话已变化，请重新操作');
           }
-          state.value = snapshot;
+          state.value = { ...snapshot, metrics: snapshot.metrics ?? null };
+          received.clear();
         } else if (packet.type === 'event') acceptEvent(packet.data as DeviceEvent);
         else if (packet.type === 'connection') {
           const connection = packet.data as BridgeState['connection'];
@@ -124,7 +142,7 @@ export function useDevice() {
           if (!connection.connected || changed) rejectPending('设备连接已变化，命令已取消');
           state.value = changed
             ? { ...createBridgeState(), connection }
-            : { ...state.value, connection };
+            : { ...state.value, connection, ...(!connection.connected ? { metrics: null } : {}) };
         }
       } catch {
         error.value = '收到无法解析的 bridge 消息';
@@ -135,6 +153,7 @@ export function useDevice() {
     };
     socket.onclose = () => {
       channelConnected.value = false;
+      state.value = { ...state.value, metrics: null };
       rejectPending('调试通道已断开');
       if (!stopped) {
         retryTimer = setTimeout(connectSocket, retryDelay);
@@ -256,6 +275,8 @@ export function useDevice() {
     status,
     debug,
     oled,
+    metrics,
+    deviceUptimeMs,
     pins,
     bootId,
     deviceId,

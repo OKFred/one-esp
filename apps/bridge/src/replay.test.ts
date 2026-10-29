@@ -27,3 +27,37 @@ it('normal replay emits changing framebuffer seconds and pauses when debug is of
   session.stop();
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it('replays resource metrics at 5/15 second cadence and stops on debug expiry', () => {
+  vi.useFakeTimers();
+  const events: DeviceEvent[] = [];
+  const session = createReplaySession(
+    'normal',
+    (event) => events.push(event),
+    () => {},
+  );
+  session.start();
+  const samples = () => events.filter((event) => event.type === 'metrics');
+  expect(samples()).toHaveLength(1);
+  expect(samples()[0]?.data.simulated).toBe(true);
+  vi.advanceTimersByTime(4000);
+  expect(samples()).toHaveLength(1);
+  vi.advanceTimersByTime(1000);
+  expect(samples()).toHaveLength(2);
+  session.command({
+    v: 1,
+    id: 'lite',
+    command: 'debug.set',
+    args: { enabled: true, profile: 'lite', ttlSeconds: 20 },
+  });
+  const initial = samples().length;
+  vi.advanceTimersByTime(14000);
+  expect(samples()).toHaveLength(initial);
+  vi.advanceTimersByTime(1000);
+  expect(samples()).toHaveLength(initial + 1);
+  expect(samples().at(-1)?.data.intervalMs).toBe(15000);
+  vi.advanceTimersByTime(30000);
+  expect(samples()).toHaveLength(initial + 1);
+  session.stop();
+  expect(vi.getTimerCount()).toBe(0);
+});

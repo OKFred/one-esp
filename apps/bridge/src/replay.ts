@@ -89,6 +89,9 @@ export function createReplaySession(
   let expiresAt = started + 600_000;
   let timer: ReturnType<typeof setInterval> | undefined;
   let offlineTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastMetricsAt = -15_000;
+  let storageSampledAt = 0;
+  let temperatureSampledAt = 0;
   const send = (type: DeviceEvent['type'], data: Record<string, unknown>) => {
     const event = parseDeviceLine(
       WIRE_PREFIX +
@@ -125,6 +128,10 @@ export function createReplaySession(
         ...(scenario === 'normal' ? { ip: '192.0.2.100', rssi: -47 } : {}),
       },
       sensorEnabled: false,
+      maintenance: {
+        tcpOk: scenario === 'normal' ? true : null,
+        tcpMs: scenario === 'normal' ? 42 : null,
+      },
       ...(scenario === 'normal'
         ? {
             clock: {
@@ -141,6 +148,25 @@ export function createReplaySession(
           }
         : {}),
     });
+  const metrics = () => {
+    const now = Date.now() - started;
+    if (now - storageSampledAt >= 60_000) storageSampledAt = now;
+    if (now - temperatureSampledAt >= 30_000) temperatureSampledAt = now;
+    lastMetricsAt = now;
+    send('metrics', {
+      sampledAtMs: now,
+      intervalMs: profile === 'full' ? 5000 : 15000,
+      cpuHz: 160_000_000,
+      memory: { freeBytes: 112_640, allocatedBytes: 98_304, totalBytes: 210_944 },
+      idfHeap: { totalBytes: 262_144, freeBytes: 149_504, largestBlockBytes: 69_632 },
+      storage: { sampledAtMs: storageSampledAt, totalBytes: 2_097_152, freeBytes: 1_572_864 },
+      flashBytes: 4_194_304,
+      temperature: { sampledAtMs: temperatureSampledAt, celsius: 48.9 },
+      rssiDbm: scenario === 'normal' ? -47 : null,
+      sampleDurationUs: 420,
+      simulated: true,
+    });
+  };
   const screen = () => {
     const clock = new Date(Date.now() + 8 * 3600_000).toISOString();
     const lines =
@@ -167,10 +193,11 @@ export function createReplaySession(
     send('hello', {
       firmware: 'one-esp / replay',
       board: 'esp32-oled-096',
-      capabilities: ['oled', 'pins', 'logs', 'config.read', 'replay'],
+      capabilities: ['oled', 'pins', 'logs', 'metrics', 'config.read', 'replay'],
     });
     status();
     debug();
+    metrics();
     screen();
     send('pins', {
       pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 25, 26, 36, 39].map((gpio) => {
@@ -222,6 +249,8 @@ export function createReplaySession(
           if (enabled) {
             status();
             if (scenario === 'normal') screen();
+            if (Date.now() - started - lastMetricsAt >= (profile === 'full' ? 5000 : 15000))
+              metrics();
           }
         }, 1000);
         timer.unref();
@@ -233,6 +262,7 @@ export function createReplaySession(
         profile = command.args.profile === 'lite' ? 'lite' : 'full';
         expiresAt = Date.now() + Math.min(1800, Number(command.args.ttlSeconds) || 600) * 1000;
         debug();
+        if (enabled) metrics();
       } else if (command.command === 'snapshot.get') {
         snapshot();
       } else if (command.command === 'config.get') {

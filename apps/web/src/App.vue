@@ -30,6 +30,7 @@ import type { DeviceEvent } from '@one-esp/protocol';
 import BoardView from './components/BoardView.vue';
 import OledScreen from './components/OledScreen.vue';
 import ClockQuality from './components/ClockQuality.vue';
+import SystemMetrics from './components/SystemMetrics.vue';
 import { useDevice } from './composables/useDevice';
 import { configValuesForSave, createConfigForm, readConfigValues } from './config';
 import type { PinData } from './types';
@@ -45,6 +46,8 @@ const {
   status,
   debug,
   oled,
+  metrics,
+  deviceUptimeMs,
   pins,
   deviceId,
   age,
@@ -480,6 +483,15 @@ function clearVisibleLogs() {
                 >
               </div>
             </section>
+
+            <SystemMetrics
+              :metrics="metrics"
+              :active="!!debug?.enabled && channelConnected"
+              :connected="state.connection.connected && channelConnected"
+              :uptime-ms="deviceUptimeMs"
+              :tcp-ms="status?.maintenance?.tcpMs"
+              :tcp-ok="status?.maintenance?.tcpOk"
+            />
 
             <section class="panel pins-panel">
               <div class="panel-heading">

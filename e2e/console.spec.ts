@@ -53,6 +53,10 @@ for (const viewport of [
     await expect(page.getByText('Wi-Fi 已连接', { exact: true })).toBeVisible();
     await expect(page.getByText('场景回放模式', { exact: true })).toBeVisible();
     await expect(page.getByLabel('时间校准状态', { exact: true })).toContainText('目标 500 ms');
+    const resources = page.getByRole('region', { name: '设备资源指标', exact: true });
+    await expect(resources).toContainText('160 MHz');
+    await expect(resources).toContainText('非环境温度');
+    await expect(resources).toContainText('Wi-Fi 吞吐率：固件未提供');
     const canvas = page.locator('.oled-glass canvas');
     await expect(canvas).toHaveAttribute('width', '128');
     await expect(canvas).toHaveAttribute('height', '64');
@@ -95,6 +99,7 @@ for (const viewport of [
     await expect(debugSwitch).toBeChecked();
     await debugSwitch.click();
     await expect(debugSwitch).not.toBeChecked();
+    await expect(resources).toContainText('采集已暂停');
     await expect(page.getByRole('button', { name: '应用参数 / 续期', exact: true })).toBeDisabled();
     await debugSwitch.click();
     await expect(debugSwitch).toBeChecked();

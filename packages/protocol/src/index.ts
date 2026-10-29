@@ -37,6 +37,25 @@ export const OledFrameSchema = z
   });
 export type OledFrame = z.infer<typeof OledFrameSchema>;
 
+const bytes = z.number().int().nonnegative();
+export const MetricsSchema = z.object({
+  sampledAtMs: bytes,
+  intervalMs: z.number().int().positive(),
+  cpuHz: bytes.nullable(),
+  memory: z.object({
+    freeBytes: bytes.nullable(),
+    allocatedBytes: bytes.nullable(),
+    totalBytes: bytes.nullable(),
+  }),
+  idfHeap: z.object({ totalBytes: bytes, freeBytes: bytes, largestBlockBytes: bytes }).nullable(),
+  storage: z.object({ sampledAtMs: bytes, totalBytes: bytes, freeBytes: bytes }).nullable(),
+  flashBytes: bytes.nullable(),
+  temperature: z.object({ sampledAtMs: bytes, celsius: z.number() }).nullable(),
+  rssiDbm: z.number().nullable(),
+  sampleDurationUs: bytes.nullable(),
+});
+export type MetricsData = z.infer<typeof MetricsSchema>;
+
 const eventDataSchemas = {
   hello: z
     .object({ firmware: z.string(), board: z.string(), capabilities: z.array(z.string()) })
@@ -58,6 +77,7 @@ const eventDataSchemas = {
     })
     .passthrough(),
   oled: OledFrameSchema,
+  metrics: MetricsSchema,
   pins: z.object({ pins: z.array(PinStateSchema).max(40), partial: z.boolean().optional() }),
   log: z.object({
     level: z.enum(['debug', 'info', 'warn', 'error']),
@@ -90,7 +110,7 @@ export const DeviceEventSchema = z
     bootId: z.string().min(1).max(100),
     seq: z.number().int().nonnegative(),
     ts: z.number().nonnegative(),
-    type: z.enum(['hello', 'status', 'oled', 'pins', 'log', 'ack', 'debug']),
+    type: z.enum(['hello', 'status', 'oled', 'pins', 'log', 'ack', 'debug', 'metrics']),
     data: record,
   })
   .superRefine((event, ctx) => {
@@ -174,6 +194,7 @@ export interface BridgeState {
   oled: DeviceEvent | null;
   pins: DeviceEvent | null;
   debug: DeviceEvent | null;
+  metrics: DeviceEvent | null;
   logs: DeviceEvent[];
   lastSeen: number | null;
 }
@@ -190,6 +211,7 @@ export function createBridgeState(): BridgeState {
     oled: null,
     pins: null,
     debug: null,
+    metrics: null,
     logs: [],
     lastSeen: null,
   };
@@ -207,7 +229,7 @@ export function applyDeviceEvent(
   event: DeviceEvent,
   receivedAt = Date.now(),
 ): BridgeState {
-  const previousBoot = state.hello?.bootId ?? state.status?.bootId;
+  const previousBoot = state.hello?.bootId ?? state.status?.bootId ?? state.metrics?.bootId;
   const next =
     previousBoot && previousBoot !== event.bootId
       ? { ...createBridgeState(), connection: state.connection }

@@ -1,7 +1,7 @@
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils';
 import { defineComponent } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DeviceEvent } from '@one-esp/protocol';
+import { createBridgeState, type DeviceEvent } from '@one-esp/protocol';
 import { useDevice } from './useDevice';
 
 class FakeSocket {
@@ -70,6 +70,26 @@ afterEach(() => {
 });
 
 describe('device command lifecycle', () => {
+  it('clears resource samples on disconnect/reboot and accepts older snapshots', () => {
+    FakeSocket.current.receive('event', event('metrics', { sampledAtMs: 100 }));
+    expect(device.metrics.value?.sampledAtMs).toBe(100);
+    FakeSocket.current.receive('connection', {
+      connected: false,
+      mode: 'usb',
+      port: 'COM3',
+      error: null,
+    });
+    expect(device.metrics.value).toBeUndefined();
+    FakeSocket.current.receive('event', event('metrics', { sampledAtMs: 100 }));
+    FakeSocket.current.receive(
+      'event',
+      event('hello', { firmware: 'test', board: 'test', capabilities: [] }, 'boot-b'),
+    );
+    expect(device.metrics.value).toBeUndefined();
+    const { metrics: _oldMetrics, ...olderSnapshot } = createBridgeState();
+    FakeSocket.current.receive('snapshot', olderSnapshot);
+    expect(device.state.value.metrics).toBeNull();
+  });
   it('does not report HTTP accepted as success until the matching device acknowledgement arrives', async () => {
     let finished = false;
     const promise = device.command('snapshot.get').then((ack) => {

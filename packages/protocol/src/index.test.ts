@@ -20,6 +20,19 @@ const event = {
   data: { level: 'info', message: 'ready' },
 };
 
+const metrics = {
+  sampledAtMs: 0,
+  intervalMs: 5000,
+  cpuHz: 160_000_000,
+  memory: { freeBytes: 81920, allocatedBytes: 65536, totalBytes: 147456 },
+  idfHeap: { totalBytes: 200000, freeBytes: 100000, largestBlockBytes: 50000 },
+  storage: { sampledAtMs: 0, totalBytes: 2000000, freeBytes: 1000000 },
+  flashBytes: 4194304,
+  temperature: { sampledAtMs: 0, celsius: 48.9 },
+  rssiDbm: -50,
+  sampleDurationUs: 400,
+};
+
 describe('portable device protocol', () => {
   it('does not interpret ordinary boot logs as protocol', () => {
     expect(parseDeviceLine('ets Jul 29 2019')).toBeNull();
@@ -115,5 +128,58 @@ describe('portable device protocol', () => {
       data: { pins: [{ ...second, value: 1 }], partial: true },
     });
     expect(state.pins?.data.pins).toEqual([first, { ...second, value: 1 }]);
+  });
+  it('validates measured resource metrics and explicit unavailable values', () => {
+    const measured = { ...event, type: 'metrics', data: metrics };
+    expect(DeviceEventSchema.safeParse(measured).success).toBe(true);
+    expect(
+      DeviceEventSchema.safeParse({ ...measured, data: { ...metrics, cpuHz: Infinity } }).success,
+    ).toBe(false);
+    expect(
+      DeviceEventSchema.safeParse({
+        ...measured,
+        data: { ...metrics, memory: { ...metrics.memory, freeBytes: -1 } },
+      }).success,
+    ).toBe(false);
+    expect(
+      DeviceEventSchema.safeParse({
+        ...measured,
+        data: { ...metrics, temperature: { sampledAtMs: 0, celsius: NaN } },
+      }).success,
+    ).toBe(false);
+    expect(
+      DeviceEventSchema.safeParse({
+        ...measured,
+        data: {
+          ...metrics,
+          cpuHz: null,
+          memory: { freeBytes: null, allocatedBytes: null, totalBytes: null },
+          idfHeap: null,
+          storage: null,
+          flashBytes: null,
+          temperature: null,
+          rssiDbm: null,
+          sampleDurationUs: null,
+        },
+      }).success,
+    ).toBe(true);
+  });
+  it('retains only the latest resource sample and clears it on the next boot', () => {
+    let state = applyDeviceEvent(createBridgeState(), { ...event, type: 'metrics', data: metrics });
+    state = applyDeviceEvent(state, {
+      ...event,
+      type: 'metrics',
+      seq: 2,
+      data: { ...metrics, sampledAtMs: 5000 },
+    });
+    expect(state.metrics?.data.sampledAtMs).toBe(5000);
+    expect(state.logs).toHaveLength(0);
+    state = applyDeviceEvent(state, {
+      ...event,
+      type: 'hello',
+      bootId: 'boot-2',
+      data: { firmware: 'test', board: 'test', capabilities: [] },
+    });
+    expect(state.metrics).toBeNull();
   });
 });
