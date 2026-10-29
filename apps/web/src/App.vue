@@ -29,6 +29,7 @@ import arrowIcon from '@iconify-icons/lucide/arrow-up-right';
 import type { DeviceEvent } from '@one-esp/protocol';
 import BoardView from './components/BoardView.vue';
 import OledScreen from './components/OledScreen.vue';
+import ClockQuality from './components/ClockQuality.vue';
 import { useDevice } from './composables/useDevice';
 import { configValuesForSave, createConfigForm, readConfigValues } from './config';
 import type { PinData } from './types';
@@ -463,7 +464,10 @@ function clearVisibleLogs() {
                 </div>
                 <span :class="['freshness', { expired: stale }]"><i></i>{{ screenAge }}</span>
               </div>
-              <div class="display-content"><OledScreen :frame="oled" :stale="stale" /></div>
+              <div class="display-content">
+                <OledScreen :frame="oled" :stale="stale" />
+                <ClockQuality v-if="status?.clock" :clock="status.clock" />
+              </div>
               <div class="display-toolbar">
                 <span class="mono"
                   >{{ debug?.oledFps ?? '—' }} FPS LIMIT <span class="toolbar-dot">·</span> 128 × 64

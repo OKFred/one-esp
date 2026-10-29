@@ -125,6 +125,21 @@ export function createReplaySession(
         ...(scenario === 'normal' ? { ip: '192.0.2.100', rssi: -47 } : {}),
       },
       sensorEnabled: false,
+      ...(scenario === 'normal'
+        ? {
+            clock: {
+              synced: true,
+              targetMs: 500,
+              estimatedErrorMs: 42,
+              withinTarget: true,
+              withinTargetAtNextSync: true,
+              lastSyncAgeMs: (Date.now() - started) % 60_000,
+              intervalMs: 60_000,
+              nextInMs: 60_000 - ((Date.now() - started) % 60_000),
+              simulated: true,
+            },
+          }
+        : {}),
     });
   const screen = () => {
     const clock = new Date(Date.now() + 8 * 3600_000).toISOString();

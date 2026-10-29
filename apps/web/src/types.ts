@@ -23,6 +23,16 @@ export interface StatusData {
   memFree: number | null;
   wifi: { connected: boolean; status: number | string; ssid?: string; ip?: string; rssi?: number };
   sensorEnabled: boolean;
+  clock?: {
+    synced: boolean;
+    targetMs: number;
+    estimatedErrorMs: number | null;
+    withinTarget: boolean;
+    withinTargetAtNextSync?: boolean;
+    lastSyncAgeMs: number | null;
+    intervalMs: number;
+    nextInMs: number;
+  };
 }
 
 export interface DebugData {

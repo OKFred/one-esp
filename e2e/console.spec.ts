@@ -52,6 +52,7 @@ for (const viewport of [
     await selectScenario(page, '正常启动');
     await expect(page.getByText('Wi-Fi 已连接', { exact: true })).toBeVisible();
     await expect(page.getByText('场景回放模式', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('时间校准状态', { exact: true })).toContainText('目标 500 ms');
     const canvas = page.locator('.oled-glass canvas');
     await expect(canvas).toHaveAttribute('width', '128');
     await expect(canvas).toHaveAttribute('height', '64');
