@@ -21,6 +21,7 @@ from components.debug_service import DebugService
 from components.time_sync import get_local_time
 from components.network_probe import NetworkProbe
 from components.clock_sync import ClockSync
+from components.system_metrics import SystemMetrics
 
 
 TCP_INTERVAL_MS = 60000
@@ -37,7 +38,9 @@ class DiagnosticRuntime:
         boot_id = binascii.hexlify(os.urandom(8)).decode()
         self.service = DebugService(sys.stdout.write, device_id, boot_id,
                                     self.status, self.pins, self.config,
-                                    self.apply_config, self.schedule_restart, clock=time)
+                                    self.apply_config, self.schedule_restart, clock=time,
+                                    metrics_provider=lambda interval: self.metrics.sample(interval))
+        self.metrics = SystemMetrics(self.service.now, wlan=self.wlan)
         self.poller = select.poll()
         self.poller.register(sys.stdin, select.POLLIN)
         self.display = None

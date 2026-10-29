@@ -26,11 +26,13 @@ PROFILES = {'full': (2, 10), 'lite': (1, 1)}
 
 class DebugService:
     def __init__(self, writer, device_id, boot_id, status_provider, pins,
-                 config_store, config_apply=None, restart=None, clock=None):
+                 config_store, config_apply=None, restart=None, clock=None,
+                 metrics_provider=None):
         self.writer = writer
         self.device_id = device_id
         self.boot_id = boot_id
         self.status_provider = status_provider
+        self.metrics_provider = metrics_provider
         self.pins = pins
         self.config = config_store
         self.config_apply = config_apply
@@ -51,6 +53,7 @@ class DebugService:
         self._last_pins = -1000
         self._last_oled = -1000
         self._last_debug = -1000
+        self._last_metrics = -15000
         self._debug_pending = False
         self._last_pin_rows = {}
         self._oled = {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
@@ -116,11 +119,29 @@ class DebugService:
         return True
 
     def hello(self, priority=True):
+        capabilities = ['usb', 'oled', 'pins', 'logs', 'debug', 'snapshot',
+                        'config', 'restart', 'gpio-allowlist']
+        if self.metrics_provider:
+            capabilities.append('metrics')
         return self.emit('hello', {
             'firmware': 'one-esp-debug/1.0', 'board': 'esp32-oled-096',
-            'capabilities': ['usb', 'oled', 'pins', 'logs', 'debug', 'snapshot',
-                             'config', 'restart', 'gpio-allowlist'],
+            'capabilities': capabilities,
         }, priority)
+
+    def _metrics_tick(self, now):
+        interval = 5000 if self.profile == 'full' else 15000
+        try:
+            data = self.metrics_provider(interval)
+            if self.emit('metrics', data):
+                self._last_metrics = now
+                return True
+        except Exception:
+            # Metrics are optional. Allocation/probe failures must not stop the
+            # application or leave the paced snapshot stuck on this stage.
+            self.dropped_events += 1
+            self._last_metrics = now
+            return True
+        return False
 
     def debug_state(self):
         return {'enabled': self.enabled, 'profile': self.profile,
@@ -192,16 +213,19 @@ class DebugService:
                 self._last_pin_rows = {row['gpio']: row for row in self._snapshot_rows}
                 self._last_pins = now
                 self._snapshot_rows = None
-        else:
+        elif self._snapshot_stage == 4:
             sent = self.emit('oled', self._oled)
             if sent:
                 self._sent_oled_revision = self._oled_revision
                 self._last_oled = now
+        else:
+            sent = self._metrics_tick(now)
+        if sent:
+            if self._snapshot_stage >= (5 if self.metrics_provider else 4):
                 self._snapshot_pending = False
                 self._snapshot_stage = 0
                 self._snapshot_finished = now
                 return True
-        if sent:
             self._snapshot_stage += 1
         return True
 
@@ -365,6 +389,11 @@ class DebugService:
             if self.emit('oled', self._oled):
                 self._sent_oled_revision = self._oled_revision
                 self._last_oled = now
+                return
+        # Cached metrics get their own low-frequency frame, rather than adding
+        # several hundred bytes to every status/OLED update. No idle sampling.
+        if self.metrics_provider and now - self._last_metrics >= (5000 if self.profile == 'full' else 15000):
+            if self._metrics_tick(now):
                 return
         if now - self._last_pins >= 1000 / self.gpio_hz:
             rows = self.pins.snapshot()

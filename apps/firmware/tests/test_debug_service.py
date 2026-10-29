@@ -67,6 +67,15 @@ class DebugServiceTests(unittest.TestCase):
     def restart(self):
         self.restart_count += 1
 
+    def metrics(self, interval):
+        now = self.service.now()
+        return {'sampledAtMs': now, 'intervalMs': interval, 'cpuHz': 160000000,
+                'memory': {'freeBytes': 60000, 'allocatedBytes': 80000, 'totalBytes': 140000},
+                'idfHeap': {'totalBytes': 300000, 'freeBytes': 100000, 'largestBlockBytes': 50000},
+                'storage': {'sampledAtMs': now, 'totalBytes': 2000000, 'freeBytes': 1500000},
+                'flashBytes': 4194304, 'temperature': {'sampledAtMs': now, 'celsius': 45.0},
+                'rssiDbm': -55, 'sampleDurationUs': 1200}
+
     def trial(self, command_id, candidate):
         self.trials.append((command_id, dict(candidate)))
 
@@ -110,6 +119,72 @@ class DebugServiceTests(unittest.TestCase):
         self.assertTrue(all(event['data']['partial'] for event in pin_events))
         self.assertGreater(sum(len(event['data']['pins']) for event in pin_events), 20)
         self.assertTrue(all(len(line.encode()) <= MAX_LINE_BYTES for line in self.frames))
+
+    def test_idle_metrics_only_sample_on_explicit_snapshot(self):
+        calls = []
+        self.service.metrics_provider = lambda interval: calls.append(interval) or self.metrics(interval)
+        for _ in range(10):
+            self.clock.advance(10000)
+            self.service.tick()
+        self.assertEqual(calls, [])
+        self.service.snapshot()
+        self.drain_snapshot()
+        self.assertFalse(self.service.enabled)
+        self.assertEqual(calls, [5000])
+        self.assertEqual(len(self.events('metrics')), 1)
+        self.assertIn('metrics', self.events('hello')[-1]['data']['capabilities'])
+        for _ in range(20):
+            self.clock.advance(1000)
+            self.service.tick()
+        self.assertEqual(calls, [5000])
+
+    def test_metrics_are_low_frequency_and_stop_at_session_expiry(self):
+        self.service.metrics_provider = self.metrics
+        for profile, interval in (('full', 5000), ('lite', 15000)):
+            with self.subTest(profile=profile):
+                self.enable(profile=profile, ttlSeconds=45)
+                self.drain_snapshot()
+                initial = len(self.events('metrics'))
+                started = self.clock.value
+                for _ in range(1000):
+                    before = len(self.frames)
+                    self.service.tick()
+                    self.assertLessEqual(len(self.frames) - before, 1)
+                    self.clock.advance(50)
+                metrics = self.events('metrics')[initial - 1:]
+                self.assertGreaterEqual(len(metrics), 3)
+                self.assertTrue(all(b['ts'] - a['ts'] >= interval
+                                    for a, b in zip(metrics, metrics[1:])))
+                self.assertLess(metrics[-1]['ts'] - started, 45000)
+                self.assertFalse(self.service.enabled)
+                before = len(self.events('metrics'))
+                self.clock.advance(60000)
+                for _ in range(10):
+                    self.service.tick()
+                self.assertEqual(len(self.events('metrics')), before)
+
+    def test_optional_metrics_failure_does_not_block_snapshot_or_screen(self):
+        calls = []
+
+        def unavailable(interval):
+            calls.append(interval)
+            raise MemoryError('optional telemetry allocation failed')
+
+        self.service.metrics_provider = unavailable
+        self.enable()
+        self.drain_snapshot()
+        self.assertEqual(calls, [5000])
+        self.assertEqual(len(self.events('oled')), 1)
+        self.assertEqual(sum(len(frame['data']['pins']) for frame in self.events('pins')), 34)
+        self.clock.advance(5100)
+        self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': 'still running'})
+        for _ in range(50):
+            self.service.tick()
+            self.clock.advance(10)
+        self.assertEqual(calls, [5000, 5000])
+        self.assertEqual(self.events('oled')[-1]['data']['text'], 'still running')
+        self.assertGreaterEqual(len(self.events('status')), 2)
+        self.assertEqual(self.events('metrics'), [])
 
     def test_dropped_refresh_fragment_does_not_erase_known_pins_in_same_boot(self):
         host_pins = {}
@@ -289,6 +364,7 @@ class DebugServiceTests(unittest.TestCase):
             self.clock.advance(wire_ms)
 
         self.service.writer = uart_write
+        self.service.metrics_provider = self.metrics
         self.pins.inputs = {36: NoisyInput(), 39: NoisyInput()}
         self.enable()
         self.drain_snapshot()
@@ -423,6 +499,7 @@ class DebugServiceTests(unittest.TestCase):
         self.assertEqual(self.service._pending_acks, [])
 
     def test_busy_debug_tick_emits_at_most_one_frame_with_logs_and_commands(self):
+        self.service.metrics_provider = self.metrics
         self.enable()
         self.drain_snapshot()
         self.frames.clear()
@@ -444,7 +521,7 @@ class DebugServiceTests(unittest.TestCase):
             self.assertLessEqual(len(emitted), 1, 'One tick must never write consecutive frames')
             for line in emitted:
                 seen.add(json.loads(line[len(WIRE_PREFIX):])['type'])
-        self.assertTrue({'ack', 'status', 'debug', 'pins', 'oled', 'log'} <= seen)
+        self.assertTrue({'ack', 'status', 'debug', 'pins', 'oled', 'log', 'metrics'} <= seen)
 
     def test_ttl_safety_update_precedes_a_queued_ack_without_emitting_two_frames(self):
         output = Pin()
