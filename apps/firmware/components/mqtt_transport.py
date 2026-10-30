@@ -44,6 +44,41 @@ def _error_number(error):
     return number if number is not None else (error.args[0] if error.args else None)
 
 
+def _failure_details(phase, operation, reason, error):
+    # Exception messages may include private values. Retain only fixed labels
+    # and a numeric errno; even an exception's class name needs an allowlist.
+    error_type = None
+    number = None
+    if error is not None:
+        name = type(error).__name__
+        error_type = name if name in ('OSError', 'ValueError', 'MemoryError',
+                                      'TypeError', 'RuntimeError') else 'Exception'
+        candidate = _error_number(error)
+        if type(candidate) is int:
+            number = candidate
+        if isinstance(error, ValueError):
+            message = error.args[0] if error.args else None
+            reason = 'value_error'
+            if isinstance(message, str):
+                if message == 'invalid cert':
+                    reason = 'invalid_cert'
+                elif (message.startswith('\nThe certificate ') or
+                      message.startswith('The certificate ') or
+                      message.startswith('\nThe CRL ') or
+                      message.startswith('The CRL ')):
+                    reason = 'certificate_verify'
+                elif message == 'MQTT connection refused':
+                    reason = 'connack_refused'
+                elif message in ('Unexpected MQTT CONNACK', 'Unexpected MQTT PINGRESP',
+                                  'Invalid MQTT CONNACK', 'Invalid MQTT PUBACK identifier',
+                                  'MQTT input must be bytes', 'Unexpected MQTT packet header',
+                                  'Invalid MQTT remaining length', 'MQTT packet is too large',
+                                  'Invalid MQTT packet length', 'MQTT receive flood'):
+                    reason = 'malformed_packet'
+    return {'phase': phase, 'operation': operation, 'errorType': error_type,
+            'errno': number, 'reason': reason}
+
+
 def _ipv4(value):
     if not isinstance(value, str):
         return False
@@ -158,6 +193,8 @@ class MqttTransport:
         self._attempt = 0
         self._connections = 0
         self._last_error = None
+        self._last_failure = None
+        self._operation = None
         self._last_tx_at = 0
         self._tx = None
         self._tx_offset = 0
@@ -188,11 +225,16 @@ class MqttTransport:
         acknowledged, self._acked = self._acked, False
         return acknowledged
 
+    @property
+    def handshaking(self):
+        return self._state in ('resolving', 'connecting', 'mqtt_connect')
+
     def status(self):
         return {'phase': self._state, 'connected': self._state == 'connected',
                 'inflight': self._pending is not None, 'acks': self._ack_count,
                 'publishes': self._publish_count, 'failures': self._failures,
                 'connections': self._connections, 'lastError': self._last_error,
+                'lastFailure': dict(self._last_failure) if self._last_failure else None,
                 'nextRetryInMs': max(0, self._retry_at - self._now())}
 
     def _drop_socket(self):
@@ -236,16 +278,19 @@ class MqttTransport:
         except Exception:
             pass
 
-    def _fail(self, reason):
+    def _fail(self, reason, error=None):
+        phase, operation = self._state, self._operation
         self._drop_socket()
         self._collect_once()
         self._last_error = reason
+        self._last_failure = _failure_details(phase, operation, reason, error)
         self._failures += 1
         self._retry_at = self._now() + min(MAX_BACKOFF_MS, 1000 * (1 << min(self._attempt, 6)))
         self._attempt += 1
         self._state = 'backoff'
 
     def _tcp_ready(self):
+        self._operation = 'connect'
         try:
             self._raw.connect(self._address)
             return True
@@ -261,6 +306,7 @@ class MqttTransport:
         # Unsupported certificate/hostname/deferred-handshake options fail closed.
         # MicroPython mbedTLS advances the handshake through read/write EAGAIN.
         self._collect_once()
+        self._operation = 'wrap'
         self._stream = self._ssl.wrap_socket(
             self._raw, cert_reqs=self._ssl.CERT_REQUIRED,
             cadata=self._config['ca_data'], server_hostname=self._server_hostname,
@@ -271,6 +317,7 @@ class MqttTransport:
         self._queue(self._connect_frame, 'connect')
 
     def _open(self, info):
+        self._operation = 'open'
         self._address = info[-1]
         self._raw = self._sockets.socket(*info[:3])
         self._raw.setblocking(False)
@@ -290,6 +337,7 @@ class MqttTransport:
     def _write_once(self):
         if self._tx is None:
             return
+        self._operation = 'write'
         end = min(len(self._tx), self._tx_offset + IO_BYTES_PER_TICK)
         try:
             count = self._stream.write(memoryview(self._tx)[self._tx_offset:end])
@@ -314,6 +362,7 @@ class MqttTransport:
                 self._ping_deadline = self._now() + PING_TIMEOUT_MS
 
     def _read_once(self):
+        self._operation = 'read'
         try:
             data = self._stream.read(IO_BYTES_PER_TICK)
         except OSError as error:
@@ -324,8 +373,10 @@ class MqttTransport:
             return
         if not data:
             raise OSError('MQTT stream closed')
+        self._operation = 'packet_decode'
         for packet_type, _, body in self._reader.feed(data):
             if packet_type == 2:
+                self._operation = 'connack'
                 if self._state != 'mqtt_connect' or body[0] != 0 or self._tx is not None:
                     raise ValueError('Unexpected MQTT CONNACK')
                 self._state = 'connected'
@@ -362,6 +413,7 @@ class MqttTransport:
             self._deadline = now + DNS_TIMEOUT_MS
         try:
             if self._state == 'resolving':
+                self._operation = 'resolve'
                 if now >= self._deadline:
                     self._resolver.invalidate()
                     self._fail('dns_timeout')
@@ -406,7 +458,7 @@ class MqttTransport:
                     self._queue(ping_packet(), 'ping')
             self._write_once()
             self._read_once()
-        except ValueError:
-            self._fail('tls_or_protocol_failed')
-        except Exception:
-            self._fail('transport_failed')
+        except ValueError as error:
+            self._fail('tls_or_protocol_failed', error)
+        except Exception as error:
+            self._fail('transport_failed', error)

@@ -70,6 +70,31 @@ class DebugServiceTests(unittest.TestCase):
     def restart(self):
         self.restart_count += 1
 
+    def test_tls_quiet_period_defers_bulk_snapshots_but_confirms_commands(self):
+        self.service.metrics_provider = self.metrics
+        self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': '12:34:56'})
+        self.service.handle(self.command('debug.set', {'enabled': True}))
+        with patch.object(self.service, '_oled_wire_data', wraps=self.service._oled_wire_data) as encode:
+            for _ in range(12):
+                self.service.tick(quiet=True)
+                self.clock.advance(10)
+            self.assertTrue(self.events('ack')[-1]['data']['ok'])
+            self.assertTrue(self.service.enabled)
+            self.assertFalse(self.events('oled'))
+            self.assertFalse(self.events('metrics'))
+            encode.assert_not_called()
+            for _ in range(80):
+                self.service.tick()
+                self.clock.advance(100)
+            self.assertTrue(self.events('oled'))
+            self.assertTrue(self.events('metrics'))
+
+    def test_tls_quiet_period_still_expires_debug_lease(self):
+        self.service.handle(self.command('debug.set', {'enabled': True, 'ttlSeconds': 1}))
+        self.clock.advance(1001)
+        self.service.tick(quiet=True)
+        self.assertFalse(self.service.enabled)
+
     def metrics(self, interval):
         now = self.service.now()
         return {'sampledAtMs': now, 'intervalMs': interval, 'cpuHz': 160000000,

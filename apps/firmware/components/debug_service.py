@@ -422,7 +422,7 @@ class DebugService:
                 else:
                     self._line += char
 
-    def tick(self):
+    def tick(self, quiet=False):
         now = self.now()
         # Safety expiry precedes all transmission, including a queued ACK.
         if self.enabled and now >= self.expires_at:
@@ -432,6 +432,10 @@ class DebugService:
         if self._debug_pending and self.emit('debug', self.debug_state()):
             self._debug_pending = False
             self._last_debug = now
+            return
+        if quiet:
+            # TLS construction gets memory priority. Commands/lease expiry and
+            # their small ACKs continue; queued snapshots resume afterwards.
             return
         if self._snapshot_tick(now):
             return
