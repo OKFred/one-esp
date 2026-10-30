@@ -22,6 +22,12 @@ The OLED clock uses integer epoch arithmetic, preserving second precision on ESP
 
 `status.clock` exposes pre-correction `lastOffsetUs`, RTT, uncertainty, synchronization age, adaptive interval, sample count and estimated holdover error. `withinTarget` and `withinTargetAtNextSync` are conditional estimates, not guarantees of Internet UTC accuracy or oscillator stability. The initial 100ppm drift allowance is an assumption until two spaced samples are available. Failed syncs retain time and retry after 30/60 seconds; offline holdover may exceed the 500ms goal. The dashboard shows the quality estimate and loss of precision instead of claiming the target is always met. See ESP32 [RTC implementation](https://github.com/micropython/micropython/blob/v1.22.2/ports/esp32/machine_rtc.c) and [RFC 5905](https://www.rfc-editor.org/info/rfc5905/) for timestamp/precision background.
 
+## Automatic renewal
+
+The web viewer enables automatic lease renewal by default after sampling has been explicitly started. The `debug-renew` capability supports `debug.renew` with the current boot ID and a TTL from 1 to 1800 seconds. Firmware requires an active, unexpired session; it only extends that lease, preserves profile/rates, emits an acknowledgement plus immediate debug state, and does not queue a full snapshot. A delayed renewal cannot start sampling after manual stop, expiry or reboot.
+
+Viewers renew ahead of expiry and retain the applied TTL across reconnects to the same device session. A full page reload or a new viewer adopts the default 600-second renewal duration. Closing a viewer stops its renewals, leaving the device to expire its current lease; other viewers can continue renewing. Sleep or browser freezing may still let the lease expire. Renewal failures remain visible. Bridge logs describe actual reported start/renew/stop transitions, without inferring a stop reason. Legacy firmware without the capability is not renewed through `debug.set`.
+
 ## Health metrics
 
 The optional `metrics` capability publishes a separate latest-value event instead of enlarging the once-per-second status. CPU frequency, GC counters, ESP-IDF heap and RSSI are sampled every 5 seconds in FULL and 15 seconds in LITE. Temperature is cached for 30 seconds, filesystem capacity for 60 seconds, and physical Flash size is queried once. Missing APIs or failed reads return null; slow probe attempts remain interval-limited even after failure. Each event includes sampling timestamps and collection duration.
