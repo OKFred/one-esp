@@ -44,6 +44,17 @@ def _error_number(error):
     return number if number is not None else (error.args[0] if error.args else None)
 
 
+def _dns_failure(reason, number=None):
+    return OSError(number, reason) if type(number) is int else OSError(reason)
+
+
+def _dns_failure_reason(error):
+    for value in error.args:
+        if isinstance(value, str) and value in ('dns_thread_start_failed', 'dns_lookup_failed'):
+            return value
+    return None
+
+
 def _certificate_reason(message):
     # Only recognize fixed mbedTLS verify-info text. Never retain subjects,
     # hostnames or any other free-form exception content in diagnostics.
@@ -136,6 +147,7 @@ class ThreadResolver:
 
     def _lookup(self, target, generation):
         info = None
+        number = None
         try:
             rows = self._sockets.getaddrinfo(target[0], target[1],
                                             self._sockets.AF_INET, self._sockets.SOCK_STREAM)
@@ -143,9 +155,11 @@ class ThreadResolver:
                 if _ipv4(row[-1][0]) and row[-1][0] != '0.0.0.0':
                     info = (row[0], row[1], row[2], (row[-1][0], target[1]))
                     break
-        except Exception:
-            pass
-        self._result = (generation, target, info)
+        except Exception as error:
+            candidate = _error_number(error)
+            if type(candidate) is int:
+                number = candidate
+        self._result = (generation, target, info, number)
         self._busy = False
 
     def resolve(self, host, port, now):
@@ -155,7 +169,7 @@ class ThreadResolver:
         result, self._result = self._result, None
         if result is not None and result[0] == self._generation and result[1] == target:
             if result[2] is None:
-                raise OSError('DNS resolution failed')
+                raise _dns_failure('dns_lookup_failed', result[3])
             self._cache = (target, result[2])
             self._cache_until = now + DNS_CACHE_MS
             return result[2]
@@ -167,9 +181,9 @@ class ThreadResolver:
         self._busy = True
         try:
             self._threads.start_new_thread(self._lookup, (target, self._generation))
-        except Exception:
+        except Exception as error:
             self._busy = False
-            raise OSError('DNS worker unavailable')
+            raise _dns_failure('dns_thread_start_failed', _error_number(error))
         return None
 
 
@@ -202,6 +216,7 @@ class MqttTransport:
         if config.get('broker_ip') is not None and not _ipv4(config['broker_ip']):
             raise ValueError('MQTT numeric endpoint must be IPv4')
         self._server_hostname = host
+        self._ca_data = ca_data
         self._keepalive = config.get('keepalive', 60)
         if isinstance(self._keepalive, bool) or not isinstance(self._keepalive, int) or not 10 <= self._keepalive <= 600:
             raise ValueError('Invalid MQTT keepalive')
@@ -237,16 +252,20 @@ class MqttTransport:
         self._ack_count = 0
         self._publish_count = 0
         self._ssl_context = None
-        if use_context:
-            # Keep the parsed trust chain across sessions. Re-parsing it while
-            # reconnecting would create another certificate allocation peak.
+        self._use_context = use_context
+
+    def _context(self):
+        if self._ssl_context is None:
+            # Let DNS finish and TCP connect before reserving TLS native memory.
+            # Keep the parsed trust chain afterwards, including across retries.
             # Advertised context support must succeed; errors never downgrade.
-            context = context_type(context_protocol)
+            context = self._ssl.SSLContext(self._ssl.PROTOCOL_TLS_CLIENT)
             context.verify_mode = self._ssl.CERT_REQUIRED
             if context.verify_mode != self._ssl.CERT_REQUIRED:
                 raise ValueError('Verified TLS context is unavailable')
-            context.load_verify_locations(cadata=ca_data)
+            context.load_verify_locations(cadata=self._ca_data)
             self._ssl_context = context
+        return self._ssl_context
 
     def publish(self, topic, payload):
         """Accept one immutable payload; keep it through reconnect until PUBACK."""
@@ -351,14 +370,14 @@ class MqttTransport:
         # MicroPython mbedTLS advances the handshake through read/write EAGAIN.
         self._collect_once()
         self._operation = 'wrap'
-        if self._ssl_context is not None:
-            self._stream = self._ssl_context.wrap_socket(
+        if self._use_context:
+            self._stream = self._context().wrap_socket(
                 self._raw, server_hostname=self._server_hostname,
                 do_handshake_on_connect=False)
         else:
             self._stream = self._ssl.wrap_socket(
                 self._raw, cert_reqs=self._ssl.CERT_REQUIRED,
-                cadata=self._config['ca_data'], server_hostname=self._server_hostname,
+                cadata=self._ca_data, server_hostname=self._server_hostname,
                 do_handshake=False)
         self._stream.setblocking(False)
         self._state = 'mqtt_connect'
@@ -510,4 +529,5 @@ class MqttTransport:
         except ValueError as error:
             self._fail('tls_or_protocol_failed', error)
         except Exception as error:
-            self._fail('transport_failed', error)
+            reason = _dns_failure_reason(error) if self._state == 'resolving' else None
+            self._fail(reason or 'transport_failed', error)

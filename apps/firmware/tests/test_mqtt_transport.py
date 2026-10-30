@@ -153,10 +153,12 @@ class MqttTransportTests(unittest.TestCase):
 
     def test_context_parses_ca_once_and_keeps_strict_options_across_reconnect(self):
         context = self.configure_context()
+        self.ssl.SSLContext.assert_not_called()
+        context.load_verify_locations.assert_not_called()
+        self.connect()
         self.ssl.SSLContext.assert_called_once_with(0)
         context.load_verify_locations.assert_called_once_with(cadata=b'unit-ca-der')
         self.assertEqual(context.verify_mode, self.ssl.CERT_REQUIRED)
-        self.connect()
         payload = self.publish(b'{"sample":"original bytes"}')
         original = self.streams[0].writes[-1]
         self.client.close()
@@ -212,10 +214,55 @@ class MqttTransportTests(unittest.TestCase):
                             pass
                     context = IgnoredVerification()
                     self.ssl.SSLContext.return_value = context
-                with self.assertRaises((OSError, ValueError)):
-                    MqttTransport(self.config, self.clock.now, self.sockets, self.ssl,
-                                  self.resolver, lambda: self.poll, collect=self.collect)
+                self.client = MqttTransport(self.config, self.clock.now, self.sockets, self.ssl,
+                                            self.resolver, lambda: self.poll, collect=self.collect)
+                self.ssl.SSLContext.assert_not_called()
+                self.client.tick(True, True)
+                self.assertEqual(self.client.status()['phase'], 'backoff')
+                self.assertEqual(self.client.status()['lastFailure']['operation'], 'wrap')
+                self.assertTrue(self.raws[0].closed)
                 self.ssl.wrap_socket.assert_not_called()
+
+    def test_context_is_deferred_until_dns_and_tcp_both_complete(self):
+        context = self.configure_context()
+        self.resolver.resolve.return_value = None
+        self.client.tick(True, True)
+        self.assertEqual(self.client.status()['phase'], 'resolving')
+        self.ssl.SSLContext.assert_not_called()
+        self.sockets.socket.assert_not_called()
+        self.resolver.resolve.return_value = ADDRESS
+        self.raws[0].connects = [OSError(errno.EINPROGRESS), OSError(errno.EISCONN)]
+        self.client.tick(True, True)
+        self.assertEqual(self.client.status()['phase'], 'connecting')
+        self.ssl.SSLContext.assert_not_called()
+        self.poll.events = [(self.raws[0], POLL_OUT)]
+        self.client.tick(True, True)
+        self.ssl.SSLContext.assert_called_once_with(0)
+        context.load_verify_locations.assert_called_once_with(cadata=b'unit-ca-der')
+        self.assertEqual(self.client.status()['phase'], 'mqtt_connect')
+
+    def test_delayed_context_keeps_validated_ca_and_hostname_snapshot(self):
+        context = self.configure_context()
+        self.config['ca_data'] = b'changed-after-validation'
+        self.config['server_hostname'] = 'changed.example.test'
+        self.connect()
+        context.load_verify_locations.assert_called_once_with(cadata=b'unit-ca-der')
+        self.assertEqual(context.wrap_socket.call_args.kwargs['server_hostname'], 'broker.example.test')
+
+    def test_dns_failure_classification_preserves_errno_and_does_not_create_context(self):
+        for reason, number in (('dns_thread_start_failed', errno.ENOMEM),
+                               ('dns_lookup_failed', -202)):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.configure_context()
+                self.resolver.resolve.side_effect = OSError(number, reason)
+                self.client.tick(True, True)
+                status = self.client.status()
+                self.assertEqual(status['lastError'], reason)
+                self.assertEqual(status['lastFailure'], {
+                    'phase': 'resolving', 'operation': 'resolve', 'errorType': 'OSError',
+                    'errno': number, 'reason': reason})
+                self.ssl.SSLContext.assert_not_called()
                 self.sockets.socket.assert_not_called()
 
     def test_session_wrap_failure_keeps_context_and_never_uses_legacy_path(self):
@@ -664,8 +711,38 @@ class ResolverTests(unittest.TestCase):
         self.sockets.getaddrinfo.return_value = [(2, 1, 6, '', ('0.0.0.0', 8883))]
         self.resolver.resolve('broker.example.test', 8883, 0)
         self.finish()
-        with self.assertRaises(OSError):
+        with self.assertRaises(OSError) as caught:
             self.resolver.resolve('broker.example.test', 8883, 1)
+        self.assertEqual(caught.exception.args, ('dns_lookup_failed',))
+
+    def test_thread_start_failure_has_fixed_reason_and_keeps_only_numeric_errno(self):
+        for error, expected in ((OSError(errno.ENOMEM, 'private-unit-host'),
+                                 (errno.ENOMEM, 'dns_thread_start_failed')),
+                                (RuntimeError('private-unit-host'), ('dns_thread_start_failed',))):
+            with self.subTest(expected=expected):
+                self.setUp()
+                self.threads.start_new_thread = Mock(side_effect=error)
+                with self.assertRaises(OSError) as caught:
+                    self.resolver.resolve('broker.example.test', 8883, 0)
+                self.assertEqual(caught.exception.args, expected)
+                self.assertNotIn('private-unit-host', str(caught.exception))
+                self.assertFalse(self.resolver._busy)
+                self.sockets.getaddrinfo.assert_not_called()
+
+    def test_lookup_failure_has_distinct_fixed_reason_and_no_private_error_text(self):
+        for error, expected in ((OSError(-202, 'private-unit-host'), (-202, 'dns_lookup_failed')),
+                                (RuntimeError('private-unit-host'), ('dns_lookup_failed',))):
+            with self.subTest(expected=expected):
+                self.setUp()
+                self.sockets.getaddrinfo.side_effect = error
+                self.resolver.resolve('broker.example.test', 8883, 0)
+                self.finish()
+                with self.assertRaises(OSError) as caught:
+                    self.resolver.resolve('broker.example.test', 8883, 1)
+                self.assertEqual(caught.exception.args, expected)
+                self.assertNotIn('private-unit-host', str(caught.exception))
+                self.assertFalse(self.resolver._busy)
+                self.assertIsNone(self.resolver._cache)
 
 
 if __name__ == '__main__':
