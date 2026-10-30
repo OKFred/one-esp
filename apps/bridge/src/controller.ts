@@ -70,15 +70,17 @@ export class BridgeController {
   private readonly enumeratePorts: () => Promise<PortDescription[]>;
   private readonly reconnect: boolean;
   private transport: DeviceTransport | null = null;
+  private closingTransport: { transport: DeviceTransport; promise: Promise<void> } | undefined;
   private replay: ReplaySession | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private snapshotRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private livenessTimer: ReturnType<typeof setInterval> | undefined;
   private generation = 0;
   private attempt = 0;
   private failures = 0;
   private desiredPort: string | null = null;
   private syntheticSequence = 0;
-  private activeWrites = 0;
+  private readonly activeWrites = new Map<symbol, number>();
   private debugExpiresAt = 0;
   private mutation: Promise<unknown> = Promise.resolve();
 
@@ -184,16 +186,32 @@ export class BridgeController {
     this.snapshotRecoveryTimer = undefined;
   }
 
+  private cancelLivenessCheck(): void {
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    this.livenessTimer = undefined;
+  }
+
   private async release(): Promise<void> {
     this.generation += 1;
     this.attempt += 1;
+    this.activeWrites.clear();
     this.desiredPort = null;
     this.failures = 0;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
     this.cancelSnapshotRecovery();
+    this.cancelLivenessCheck();
     this.replay?.stop();
     this.replay = null;
+    const closing = this.closingTransport;
+    if (closing) {
+      try {
+        await closing.promise;
+      } catch {
+        this.transport = closing.transport;
+        throw new BridgeError('串口关闭失败，请重试断开连接。', 503);
+      }
+    }
     const transport = this.transport;
     this.transport = null;
     if (transport) {
@@ -231,6 +249,7 @@ export class BridgeController {
   private async openUsb(path: string, generation: number): Promise<void> {
     if (generation !== this.generation || this.desiredPort !== path) return;
     this.cancelSnapshotRecovery();
+    this.cancelLivenessCheck();
     const attempt = ++this.attempt;
     let transport: DeviceTransport;
     try {
@@ -242,6 +261,7 @@ export class BridgeController {
       throw new BridgeError(message, 503);
     }
     this.transport = transport;
+    let lastDeviceFrameAt = Date.now();
     let recoveryRequests = 0;
     const isCurrentSession = () =>
       attempt === this.attempt &&
@@ -278,8 +298,10 @@ export class BridgeController {
         if (!line.trim()) return;
         try {
           const event = parseDeviceLine(line);
-          if (event) this.accept(event);
-          else this.note('info', line);
+          if (event) {
+            lastDeviceFrameAt = Date.now();
+            this.accept(event);
+          } else this.note('info', line);
         } catch {
           this.note('warn', '已忽略格式错误的设备遥测消息。');
           recoverSnapshot();
@@ -293,12 +315,28 @@ export class BridgeController {
     );
     const lost = (message: string) => {
       if (attempt !== this.attempt || generation !== this.generation) return;
-      this.attempt += 1;
+      const lostAttempt = ++this.attempt;
       this.cancelSnapshotRecovery();
+      this.cancelLivenessCheck();
       this.transport = null;
+      this.activeWrites.clear();
       this.connection(false, 'usb', path, safeMessage(message));
-      void transport.close().catch(() => {});
-      this.scheduleRetry(path, generation);
+      const closing = { transport, promise: transport.close() };
+      this.closingTransport = closing;
+      const stillDesired = () =>
+        generation === this.generation && lostAttempt === this.attempt && this.desiredPort === path;
+      void closing.promise.then(
+        () => {
+          if (this.closingTransport === closing) this.closingTransport = undefined;
+          if (stillDesired()) this.scheduleRetry(path, generation);
+        },
+        () => {
+          if (this.closingTransport === closing) this.closingTransport = undefined;
+          if (!stillDesired()) return;
+          this.transport = transport;
+          this.connection(false, 'usb', path, '串口关闭失败，请重试断开连接。');
+        },
+      );
     };
     try {
       await transport.open({
@@ -323,6 +361,20 @@ export class BridgeController {
       this.failures = 0;
       this.connection(true, 'usb', path);
       this.note('info', `串口 ${path} 已连接：115200 / 8N1，温湿度采集未启用。`);
+      this.livenessTimer = setInterval(() => {
+        if (
+          !isCurrentSession() ||
+          this.state.debug?.data.enabled !== true ||
+          Date.now() >= this.debugExpiresAt ||
+          (this.activeWrites.size > 0 &&
+            Date.now() - Math.min(...this.activeWrites.values()) < 30000) ||
+          Date.now() - lastDeviceFrameAt < 20000
+        )
+          return;
+        this.note('warn', '设备遥测已停更 20 秒，正在重新连接串口并获取只读快照。');
+        lost('设备遥测无响应，正在重新连接串口。');
+      }, 1000);
+      this.livenessTimer.unref();
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法打开串口。';
       lost(message);
@@ -410,14 +462,23 @@ export class BridgeController {
         if (pin?.writable !== true) throw new BridgeError('该引脚不在可控制的输出白名单中。', 403);
       }
     }
-    if (this.activeWrites >= 8) throw new BridgeError('命令发送过快，请等待设备响应。', 429);
-    this.activeWrites += 1;
+    if (this.activeWrites.size >= 8) throw new BridgeError('命令发送过快，请等待设备响应。', 429);
+    const writeId = Symbol();
+    this.activeWrites.set(writeId, Date.now());
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await transport.write(encodeCommand(command));
+      await Promise.race([
+        transport.write(encodeCommand(command)),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Serial write timed out')), 30000);
+          timer.unref();
+        }),
+      ]);
     } catch {
       throw new BridgeError('串口写入失败，请检查设备连接。', 503);
     } finally {
-      this.activeWrites -= 1;
+      if (timer) clearTimeout(timer);
+      this.activeWrites.delete(writeId);
     }
     return { id: command.id, accepted: true };
   }

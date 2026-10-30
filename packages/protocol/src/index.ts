@@ -206,6 +206,7 @@ export interface BridgeState {
 export type BridgeMessage =
   | { type: 'snapshot'; data: BridgeState }
   | { type: 'event'; data: DeviceEvent }
+  | { type: 'heartbeat'; data: { ts: number } }
   | { type: 'connection'; data: ConnectionState };
 
 export function createBridgeState(): BridgeState {

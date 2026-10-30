@@ -83,6 +83,17 @@ function post(path: string, body: unknown, origin = 'http://127.0.0.1:5173') {
   });
 }
 
+function debugLine(enabled = true, expiresInMs = 600000): string {
+  return eventLine('debug', {
+    enabled,
+    expiresInMs,
+    profile: 'full',
+    oledFps: 2,
+    gpioHz: 10,
+    droppedLogs: 0,
+  });
+}
+
 describe('bounded serial framing', () => {
   it('keeps split UTF-8 and CRLF intact across arbitrary chunks', () => {
     const lines: string[] = [];
@@ -240,7 +251,7 @@ describe('bridge controller without hardware', () => {
     expect(new Set(commands.map((command) => command.id)).size).toBe(4);
     expect(commands.every((command) => command.command === 'snapshot.get')).toBe(true);
     expect(commands.every((command) => command.bootId === undefined)).toBe(true);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1); // Only the session liveness timer remains.
     expect(
       controller.getState().logs.some((event) => String(event.data.message).includes('8 KiB')),
     ).toBe(true);
@@ -252,9 +263,9 @@ describe('bridge controller without hardware', () => {
     await controller.connect('COM-old');
     const old = transports[0]!;
     old.receive(WIRE_PREFIX + '{broken}\n');
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     await controller.connect('COM-new');
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
     old.receive(WIRE_PREFIX + '{still-broken}\n');
     old.receive('x'.repeat(9000) + '\n');
     await vi.advanceTimersByTimeAsync(3000);
@@ -549,6 +560,137 @@ describe('bridge controller without hardware', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(transports).toHaveLength(2);
   });
+
+  it('reopens a silent active port even when ordinary console output keeps arriving', async () => {
+    vi.useFakeTimers();
+    const transports: FakeTransport[] = [];
+    const controller = createBridgeController({
+      createTransport: () => {
+        const transport = new FakeTransport();
+        transports.push(transport);
+        return transport;
+      },
+    });
+    controllers.push(controller);
+    await controller.connect('COM-test');
+    const old = transports[0]!;
+    old.receive(eventLine());
+    old.receive(debugLine());
+    for (let index = 0; index < 3; index++) {
+      await vi.advanceTimersByTimeAsync(5000);
+      old.receive('ordinary console output\n');
+    }
+    expect(old.closeCount).toBe(0);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(old.closeCount).toBe(1);
+    expect(controller.getState().connection.connected).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(transports).toHaveLength(2);
+    expect(JSON.parse(transports[1]!.writes[0]!.slice(WIRE_PREFIX.length))).toMatchObject({
+      command: 'snapshot.get',
+      args: {},
+    });
+    expect(transports[1]!.writes).toHaveLength(1);
+    // Late input/error from the released port cannot mutate the replacement.
+    old.receive(debugLine());
+    old.listeners?.error(new Error('late error'));
+    await controller.disconnect();
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(transports).toHaveLength(2);
+    expect(transports[1]!.closeCount).toBe(1);
+  });
+
+  it('does not reconnect quiet paused or expired debug sessions', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    transports[0]!.receive(debugLine(false, 0));
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(transports[0]!.closeCount).toBe(0);
+    transports[0]!.receive(debugLine(true, 10000));
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(transports[0]!.closeCount).toBe(0);
+  });
+
+  it('bounds a hanging native write and recovers without replaying that command', async () => {
+    vi.useFakeTimers();
+    const transports: FakeTransport[] = [];
+    const controller = createBridgeController({
+      createTransport: () => {
+        const transport = new FakeTransport();
+        transports.push(transport);
+        return transport;
+      },
+    });
+    controllers.push(controller);
+    await controller.connect('COM-test');
+    const old = transports[0]!;
+    old.receive(debugLine());
+    vi.spyOn(old, 'write').mockReturnValueOnce(new Promise<void>(() => {}));
+    const writing = controller.command({
+      v: 1,
+      id: 'hung-write',
+      command: 'snapshot.get',
+      args: {},
+    });
+    const failed = expect(writing).rejects.toThrow('串口写入失败');
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(old.closeCount).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await failed;
+    expect(old.closeCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(transports).toHaveLength(2);
+    const commands = transports[1]!.writes.map((line) =>
+      JSON.parse(line.slice(WIRE_PREFIX.length)),
+    );
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ command: 'snapshot.get' });
+    expect(commands[0].id).not.toBe('hung-write');
+  });
+
+  it('waits for the released native handle to close before opening its replacement', async () => {
+    vi.useFakeTimers();
+    const transports: FakeTransport[] = [];
+    const controller = createBridgeController({
+      createTransport: () => {
+        const transport = new FakeTransport();
+        transports.push(transport);
+        return transport;
+      },
+    });
+    controllers.push(controller);
+    await controller.connect('COM-test');
+    const old = transports[0]!;
+    old.receive(debugLine());
+    let finishClose!: () => void;
+    vi.spyOn(old, 'close').mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishClose = resolve;
+        }),
+    );
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(transports).toHaveLength(1);
+    expect(controller.getState().connection.connected).toBe(false);
+    finishClose();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(transports).toHaveLength(2);
+    expect(controller.getState().connection.connected).toBe(true);
+  });
+
+  it('keeps an active port open while real device protocol frames advance', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    transports[0]!.receive(debugLine());
+    for (let index = 0; index < 6; index++) {
+      await vi.advanceTimersByTimeAsync(10000);
+      transports[0]!.receive(eventLine('log', { level: 'info', message: 'Device is alive' }));
+    }
+    expect(transports[0]!.closeCount).toBe(0);
+    expect(transports[0]!.writes).toHaveLength(1);
+  });
 });
 
 describe('Hono HTTP and WebSocket interface', () => {
@@ -617,5 +759,37 @@ describe('Hono HTTP and WebSocket interface', () => {
     await vi.waitFor(() => expect(received.some((message) => message.type === 'event')).toBe(true));
     expect(JSON.stringify(received)).toContain('demo-esp32');
     socket.close();
+  });
+
+  it('sends heartbeats while the device is quiet and closes viewers that stop answering pings', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    const { controller } = setup();
+    const server = await startBridgeServer({ port: 0, controller });
+    servers.push(server);
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/ws`, { autoPong: false });
+    const messages: { type: string; data: unknown }[] = [];
+    await new Promise<void>((resolve, reject) => {
+      socket.once('error', reject);
+      socket.on('message', (buffer) => {
+        const message = JSON.parse(buffer.toString()) as { type: string; data: unknown };
+        messages.push(message);
+        if (message.type === 'snapshot') resolve();
+      });
+    });
+    const heartbeat = new Promise<void>((resolve) => {
+      socket.once('message', () => resolve());
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    await heartbeat;
+    expect(messages.at(-1)).toEqual({ type: 'heartbeat', data: { ts: Date.now() } });
+    expect(controller.getState().lastSeen).toBeNull();
+    const closed = new Promise<void>((resolve) => socket.once('close', () => resolve()));
+    await vi.advanceTimersByTimeAsync(10000);
+    await closed;
+    const count = messages.length;
+    await server.close();
+    servers.splice(servers.indexOf(server), 1);
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(messages).toHaveLength(count);
   });
 });
