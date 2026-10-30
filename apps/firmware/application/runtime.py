@@ -28,10 +28,13 @@ TCP_INTERVAL_MS = 60000
 STAGE_RETRY_MS = 1000
 STAGE_LOG_INTERVAL_MS = 30000
 DISPLAY_INIT_RETRY_MS = 30000
+MQTT_INIT_RETRY_MS = 30000
+MQTT_INIT_MAX_RETRY_MS = 300000
+MQTT_GC_THRESHOLD_BYTES = 8192
 
 
 class DiagnosticRuntime:
-    def __init__(self):
+    def __init__(self, mqtt_config_path='.mqtt.json'):
         self.config = ConfigStore()
         self.wlan = network.WLAN(network.STA_IF)
         # No Pin.IN/Pin.OUT initialization here: 36 and 39 are input-only pads.
@@ -74,6 +77,14 @@ class DiagnosticRuntime:
         self._stage_log_at = {}
         self._display_import_at = 0
         self._wifi_initializing = False
+        self.mqtt = None
+        self._mqtt_config_path = mqtt_config_path
+        self._mqtt_initialized = False
+        self._mqtt_enabled = None
+        self._mqtt_retry_at = 0
+        self._mqtt_retry_delay = MQTT_INIT_RETRY_MS
+        self._mqtt_state = 'disabled'
+        self._mqtt_gc_previous = None
         self.service.hello()
 
     def status(self):
@@ -93,6 +104,7 @@ class DiagnosticRuntime:
         return {'uptimeMs': self.service.now(), 'memFree': gc.mem_free(),
                 'wifi': wifi, 'sensorEnabled': False,
                 'clock': clock_status,
+                'mqtt': self.mqtt.status() if self.mqtt else {'state': self._mqtt_state},
                 'maintenancePaused': False,
                 'maintenance': {'busy': self.maintenance_busy, 'clockSynced': clock_status['synced'],
                                 'ntpPaused': False,
@@ -385,6 +397,159 @@ class DiagnosticRuntime:
             self.pins.restore_safe_values()
             machine.reset()
 
+    def _mqtt_enabled_flag(self):
+        # ConfigStore already needs JSON. This short-lived parse retains only
+        # one boolean; it must not import MQTT, read the CA or start a socket.
+        try:
+            os.stat(self._mqtt_config_path)
+        except OSError as error:
+            if error.args and error.args[0] == 2:
+                return False
+            raise
+        try:
+            import ujson as json
+        except ImportError:
+            import json
+        with open(self._mqtt_config_path) as stream:
+            settings = stream.read(4097)
+        if len(settings) > 4096:
+            raise ValueError('MQTT configuration is too large')
+        settings = json.loads(settings)
+        if type(settings) is not dict or type(settings.get('enabled', False)) is not bool:
+            raise ValueError('Invalid MQTT enabled flag')
+        return settings.get('enabled', False)
+
+    def _mqtt_clock_ready(self):
+        quality = self.clock_sync.status()
+        age = quality.get('lastSyncAgeMs')
+        # Certificate validity and observation timestamps require a recent
+        # successful NTP result, not merely a plausible reset/holdover RTC.
+        if quality.get('synced') is not True or type(age) is not int or not 0 <= age <= 600000:
+            return False
+        try:
+            parts = time.gmtime()
+            return (len(parts) >= 6 and 2024 <= parts[0] <= 9999 and
+                    1 <= parts[1] <= 12 and 1 <= parts[2] <= 31 and
+                    0 <= parts[3] < 24 and 0 <= parts[4] < 60 and 0 <= parts[5] < 60)
+        except Exception:
+            return False
+
+    def _mqtt_init_failed(self, client, permanent):
+        self._restore_mqtt_gc_threshold()
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+        if permanent:
+            self._mqtt_enabled = False
+            self._mqtt_initialized = True
+            self._mqtt_state = 'configuration_error'
+        else:
+            self._mqtt_state = 'initialization_retry'
+            self._mqtt_retry_at = self.service.now() + self._mqtt_retry_delay
+            self._mqtt_retry_delay = min(MQTT_INIT_MAX_RETRY_MS, self._mqtt_retry_delay * 2)
+        # Collect only at the failed setup boundary, not in periodic telemetry.
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+    def _set_mqtt_gc_threshold(self):
+        # This is an allocation-triggered GC heuristic, not a memory reserve.
+        # Install it only after MQTT construction, and own only our change.
+        if self._mqtt_gc_previous is not None:
+            return
+        threshold = getattr(gc, 'threshold', None)
+        if not callable(threshold):
+            return
+        try:
+            previous = threshold()
+        except Exception:
+            return
+        if type(previous) is not int or previous < -1:
+            return
+        self._mqtt_gc_previous = previous
+        try:
+            threshold(MQTT_GC_THRESHOLD_BYTES)
+        except Exception:
+            # A port may reject this API. Try restoring even if the setter
+            # raised after changing its value; never block USB or the clock.
+            self._restore_mqtt_gc_threshold()
+
+    def _restore_mqtt_gc_threshold(self):
+        previous = self._mqtt_gc_previous
+        self._mqtt_gc_previous = None
+        if previous is None:
+            return
+        try:
+            threshold = getattr(gc, 'threshold', None)
+            if callable(threshold):
+                threshold(previous)
+        except Exception:
+            pass
+
+    def mqtt_tick(self):
+        now = self.service.now()
+        if not self.mqtt:
+            if self._mqtt_enabled is False:
+                self._restore_mqtt_gc_threshold()
+                return
+            if now < self._mqtt_retry_at:
+                return
+            if self._mqtt_enabled is None:
+                try:
+                    self._mqtt_enabled = self._mqtt_enabled_flag()
+                except ValueError:
+                    self._mqtt_init_failed(None, True)
+                    raise
+                except Exception:
+                    self._mqtt_init_failed(None, False)
+                    raise
+                if not self._mqtt_enabled:
+                    self._mqtt_initialized = True
+                    self._mqtt_state = 'disabled'
+                    self._restore_mqtt_gc_threshold()
+                    return
+            if not self.wlan.isconnected():
+                self._mqtt_state = 'waiting_network'
+                return
+            if not self._mqtt_clock_ready():
+                self._mqtt_state = 'waiting_clock'
+                return
+            # Association and the first NTP exchange get memory priority.
+            # Release the probe parse and construction temporaries only here.
+            client = None
+            try:
+                gc.collect()
+                from components.mqtt_telemetry import load_config, TemperatureTelemetry
+                config = load_config(self._mqtt_config_path)
+                if not config or not config.get('enabled'):
+                    self._mqtt_enabled = False
+                    self._mqtt_initialized = True
+                    self._mqtt_state = 'disabled'
+                    self._restore_mqtt_gc_threshold()
+                    gc.collect()
+                    return
+                from components.mqtt_transport import MqttTransport
+                client = MqttTransport(config, self.service.now)
+                publisher = TemperatureTelemetry(config, client, self.service.now,
+                                                   logger=self.service.log)
+                del config
+                gc.collect()
+                self.mqtt = publisher
+                self._mqtt_initialized = True
+                self._mqtt_retry_delay = MQTT_INIT_RETRY_MS
+                self._set_mqtt_gc_threshold()
+            except ValueError:
+                self._mqtt_init_failed(client, True)
+                raise
+            except Exception:
+                self._mqtt_init_failed(client, False)
+                raise
+        connected = self.wlan.isconnected()
+        self.mqtt.tick(connected, self._mqtt_clock_ready() if connected else False)
+
     def tick_once(self):
         # Optional network work, serial decoding and display errors must not
         # stop one another or drop the runtime into the REPL. Each failed stage
@@ -395,6 +560,7 @@ class DiagnosticRuntime:
         self._run_stage('maintenance', self.maintenance_tick)
         self._run_stage('clock', self.clock_tick)
         self._run_stage('telemetry', self.service.tick)
+        self._run_stage('mqtt', self.mqtt_tick)
         self._run_stage('restart', self._restart_step)
 
     def run(self):
@@ -402,7 +568,7 @@ class DiagnosticRuntime:
         # failed display import retries at most once per 30 seconds via show().
         self.show('One ESP\nUSB debug ready\nSensors disabled')
         self._run_stage('startup', lambda: self.service.log(
-            'info', 'Diagnostics ready; MQTT transport is reserved for a later release'))
+            'info', 'Diagnostics ready; private MQTT telemetry is optional'))
         self._wifi_initializing = True
         while True:
             # Receive network timestamps before I2C/USB output adds latency.
@@ -415,5 +581,14 @@ def run():
     try:
         runtime.run()
     finally:
-        runtime.cancel_network_jobs()
-        runtime.service.stop()
+        try:
+            runtime.cancel_network_jobs()
+        finally:
+            try:
+                if runtime.mqtt:
+                    runtime.mqtt.close()
+            finally:
+                try:
+                    runtime._restore_mqtt_gc_threshold()
+                finally:
+                    runtime.service.stop()
