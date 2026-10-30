@@ -399,6 +399,72 @@ describe('bridge controller without hardware', () => {
     expect(transport.writes).toHaveLength(1);
   });
 
+  it('forwards renewal only for a capable current boot with an active lease', async () => {
+    vi.useFakeTimers();
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    const transport = transports[0]!;
+    transport.receive(eventLine());
+    const active = {
+      enabled: true,
+      profile: 'lite',
+      expiresInMs: 1000,
+      oledFps: 1,
+      gpioHz: 1,
+      droppedLogs: 0,
+    };
+    transport.receive(eventLine('debug', active));
+    const renew = {
+      v: 1,
+      id: 'renew',
+      bootId: 'test-boot',
+      command: 'debug.renew',
+      args: { ttlSeconds: 600 },
+    };
+    await expect(controller.command({ ...renew, bootId: 'old-boot' })).rejects.toThrow('已重启');
+    await expect(controller.command(renew)).rejects.toThrow('不支持安全续期');
+    transport.receive(
+      eventLine('hello', { firmware: 'fixture', board: 'test', capabilities: ['debug-renew'] }),
+    );
+    transport.receive(eventLine('debug', { ...active, enabled: false, expiresInMs: 0 }));
+    await expect(controller.command(renew)).rejects.toThrow('未开启或已过期');
+    transport.receive(eventLine('debug', active));
+    await controller.command(renew);
+    expect(JSON.parse(transport.writes.at(-1)!.slice(WIRE_PREFIX.length))).toEqual(renew);
+    await vi.advanceTimersByTimeAsync(1001);
+    await expect(controller.command({ ...renew, id: 'expired' })).rejects.toThrow('未开启或已过期');
+    transport.receive(eventLine('debug', { ...active, enabled: false, expiresInMs: 0 }));
+    await expect(controller.command({ ...renew, id: 'after-stop' })).rejects.toThrow(
+      '未开启或已过期',
+    );
+    expect(transport.writes).toHaveLength(2);
+  });
+
+  it('logs reported renewal and stop transitions without heartbeat or duplicate spam', async () => {
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    const transport = transports[0]!;
+    transport.receive(eventLine());
+    const active = {
+      enabled: true,
+      profile: 'full',
+      expiresInMs: 60000,
+      oledFps: 2,
+      gpioHz: 10,
+      droppedLogs: 0,
+    };
+    transport.receive(eventLine('debug', active));
+    transport.receive(eventLine('debug', active));
+    const renewed = { ...active, expiresInMs: 120000 };
+    transport.receive(eventLine('debug', renewed));
+    transport.receive(eventLine('debug', renewed));
+    transport.receive(eventLine('debug', { ...active, enabled: false, expiresInMs: 0 }));
+    transport.receive(eventLine('debug', { ...active, enabled: false, expiresInMs: 0 }));
+    const messages = controller.getState().logs.map((event) => event.data.message);
+    expect(messages.filter((message) => message === '设备报告调试会话已续期。')).toHaveLength(1);
+    expect(messages.filter((message) => message === '设备报告调试采集已停止。')).toHaveLength(1);
+  });
+
   it('marks a lost serial device and releases all port resources on disconnect', async () => {
     const { controller, transports } = setup();
     await controller.connect('COM-test');

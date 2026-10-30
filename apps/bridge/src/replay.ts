@@ -86,12 +86,16 @@ export function createReplaySession(
   let sequence = 0;
   let enabled = true;
   let profile: 'full' | 'lite' = 'full';
+  let oledFps = 2;
+  let gpioHz = 10;
   let expiresAt = started + 600_000;
   let timer: ReturnType<typeof setInterval> | undefined;
   let offlineTimer: ReturnType<typeof setTimeout> | undefined;
   let lastMetricsAt = -15_000;
+  let lastDebugAt = started;
   let storageSampledAt = 0;
   let temperatureSampledAt = 0;
+  const acknowledgements = new Map<string, Record<string, unknown>>();
   const send = (type: DeviceEvent['type'], data: Record<string, unknown>) => {
     const event = parseDeviceLine(
       WIRE_PREFIX +
@@ -108,15 +112,24 @@ export function createReplaySession(
     if (!event) throw new Error('Invalid replay event');
     emit(event);
   };
-  const debug = () =>
-    send('debug', {
-      enabled,
-      profile,
-      expiresInMs: enabled ? Math.max(0, expiresAt - Date.now()) : 0,
-      oledFps: profile === 'full' ? 2 : 1,
-      gpioHz: profile === 'full' ? 10 : 1,
-      droppedLogs: 0,
-    });
+  const debugState = () => ({
+    enabled,
+    profile,
+    expiresInMs: enabled ? Math.max(0, expiresAt - Date.now()) : 0,
+    oledFps,
+    gpioHz,
+    droppedLogs: 0,
+  });
+  const debug = () => {
+    send('debug', debugState());
+    lastDebugAt = Date.now();
+  };
+  const acknowledge = (id: string, data: Record<string, unknown>) => {
+    const ack = { id, ...data };
+    acknowledgements.set(id, ack);
+    if (acknowledgements.size > 16) acknowledgements.delete(acknowledgements.keys().next().value!);
+    send('ack', ack);
+  };
   const status = () =>
     send('status', {
       uptimeMs: Date.now() - started,
@@ -193,7 +206,7 @@ export function createReplaySession(
     send('hello', {
       firmware: 'one-esp / replay',
       board: 'esp32-oled-096',
-      capabilities: ['oled', 'pins', 'logs', 'metrics', 'config.read', 'replay'],
+      capabilities: ['oled', 'pins', 'logs', 'metrics', 'config.read', 'replay', 'debug-renew'],
     });
     status();
     debug();
@@ -247,6 +260,7 @@ export function createReplaySession(
             debug();
           }
           if (enabled) {
+            if (Date.now() - lastDebugAt >= 5000) debug();
             status();
             if (scenario === 'normal') screen();
             if (Date.now() - started - lastMetricsAt >= (profile === 'full' ? 5000 : 15000))
@@ -257,19 +271,45 @@ export function createReplaySession(
       }
     },
     command(command) {
+      const cached = acknowledgements.get(command.id);
+      if (cached) {
+        send('ack', cached);
+        return;
+      }
       if (command.command === 'debug.set') {
         enabled = command.args.enabled === true;
         if (enabled) {
           profile = command.args.profile === 'lite' ? 'lite' : 'full';
+          oledFps = Number(command.args.oledFps) || (profile === 'full' ? 2 : 1);
+          gpioHz = Number(command.args.gpioHz) || (profile === 'full' ? 10 : 1);
           expiresAt = Date.now() + Math.min(1800, Number(command.args.ttlSeconds) || 600) * 1000;
         }
         debug();
         if (enabled) metrics();
+      } else if (command.command === 'debug.renew') {
+        if (command.bootId !== bootId) {
+          acknowledge(command.id, { ok: false, error: '设备已重启，请重新开启采集。' });
+          return;
+        }
+        if (!enabled || Date.now() >= expiresAt) {
+          enabled = false;
+          debug();
+          acknowledge(command.id, { ok: false, error: '调试会话未开启或已过期。' });
+          return;
+        }
+        const ttl = command.args.ttlSeconds;
+        if (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl < 1 || ttl > 1800) {
+          acknowledge(command.id, { ok: false, error: '续期时长无效。' });
+          return;
+        }
+        expiresAt = Date.now() + ttl * 1000;
+        acknowledge(command.id, { ok: true, result: debugState() });
+        debug();
+        return;
       } else if (command.command === 'snapshot.get') {
         snapshot();
       } else if (command.command === 'config.get') {
-        send('ack', {
-          id: command.id,
+        acknowledge(command.id, {
           ok: true,
           result: {
             revision: 0,
@@ -280,14 +320,19 @@ export function createReplaySession(
         });
         return;
       } else {
-        send('ack', {
-          id: command.id,
+        acknowledge(command.id, {
           ok: false,
           error: '演示模式不执行重启、配置修改或 GPIO 输出；请连接真实设备。',
         });
         return;
       }
-      send('ack', { id: command.id, ok: true, result: { simulated: true } });
+      acknowledge(command.id, {
+        ok: true,
+        result:
+          command.command === 'debug.set'
+            ? { ...debugState(), simulated: true }
+            : { simulated: true },
+      });
     },
     stop() {
       if (timer) clearInterval(timer);

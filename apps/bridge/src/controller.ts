@@ -120,6 +120,11 @@ export class BridgeController {
       };
     }
     const previousBoot = this.state.hello?.bootId ?? this.state.status?.bootId;
+    const previousDebugEvent = previousBoot === sanitized.bootId ? this.state.debug : null;
+    const previousDebug = previousDebugEvent?.data;
+    const previousReportedExpiry = previousDebugEvent
+      ? previousDebugEvent.ts + Number(previousDebug?.expiresInMs)
+      : 0;
     if (previousBoot && previousBoot !== sanitized.bootId) this.debugExpiresAt = 0;
     if (sanitized.type === 'debug') {
       this.debugExpiresAt =
@@ -127,6 +132,17 @@ export class BridgeController {
     }
     this.state = applyDeviceEvent(this.state, sanitized);
     this.publish({ type: 'event', data: sanitized });
+    if (sanitized.type === 'debug' && previousDebug) {
+      if (previousDebug.enabled === true && sanitized.data.enabled === false)
+        this.note('info', '设备报告调试采集已停止。');
+      else if (previousDebug.enabled === false && sanitized.data.enabled === true)
+        this.note('info', '设备报告调试采集已开启。');
+      else if (
+        sanitized.data.enabled === true &&
+        sanitized.ts + Number(sanitized.data.expiresInMs) > previousReportedExpiry + 1000
+      )
+        this.note('info', '设备报告调试会话已续期。');
+    }
   }
 
   private note(level: 'info' | 'warn' | 'error', message: string): void {
@@ -367,13 +383,18 @@ export class BridgeController {
     }
     const transport = this.transport;
     if (!transport) throw new BridgeError('串口不可用。', 409);
-    if (['device.restart', 'config.set', 'gpio.write'].includes(command.command)) {
+    if (['debug.renew', 'device.restart', 'config.set', 'gpio.write'].includes(command.command)) {
       const bootId = this.state.hello?.bootId ?? this.state.status?.bootId;
       if (!bootId || command.bootId !== bootId) {
         throw new BridgeError('设备已重启或尚未就绪，请刷新快照后重试。', 409);
       }
       if (this.state.debug?.data.enabled !== true || Date.now() >= this.debugExpiresAt) {
         throw new BridgeError('调试会话未开启或已过期，请重新开启调试。', 403);
+      }
+      if (command.command === 'debug.renew') {
+        const capabilities = this.state.hello?.data.capabilities;
+        if (!Array.isArray(capabilities) || !capabilities.includes('debug-renew'))
+          throw new BridgeError('当前固件不支持安全续期，请先更新固件。', 409);
       }
       if (command.command === 'gpio.write') {
         const pins = this.state.pins?.data.pins;

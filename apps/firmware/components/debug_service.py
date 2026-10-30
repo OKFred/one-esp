@@ -120,7 +120,7 @@ class DebugService:
 
     def hello(self, priority=True):
         capabilities = ['usb', 'oled', 'pins', 'logs', 'debug', 'snapshot',
-                        'config', 'restart', 'gpio-allowlist']
+                        'config', 'restart', 'gpio-allowlist', 'debug-renew']
         if self.metrics_provider:
             capabilities.append('metrics')
         return self.emit('hello', {
@@ -309,6 +309,13 @@ class DebugService:
                 else:
                     self.stop()
                     self.acknowledge(command_id, True, self.debug_state())
+            elif name == 'debug.renew':
+                # The protected-command gate above requires the current boot
+                # and an active lease. A delayed renewal cannot restart debug.
+                ttl = self._number(args.get('ttlSeconds'), 'TTL', 1, 1800)
+                self.expires_at = self.now() + int(ttl * 1000)
+                self.acknowledge(command_id, True, self.debug_state())
+                self._debug_pending = True
             elif name == 'snapshot.get':
                 self.snapshot()
                 self.acknowledge(command_id, True, {'stage': 'queued'})

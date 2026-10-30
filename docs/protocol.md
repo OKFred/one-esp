@@ -53,16 +53,19 @@
 }
 ```
 
-| 命令           | 参数 / 约束                                                           |
-| -------------- | --------------------------------------------------------------------- |
-| debug.set      | enabled、可选 profile / ttlSeconds / oledFps / gpioHz                 |
-| snapshot.get   | hello/status/debug/可选 metrics/全量 pins/最新 oled，debug 关闭也可用 |
-| config.get     | revision、公开 values、secrets 布尔配置状态、生效时机；无密码         |
-| config.set     | revision、values；当前 bootId 和有效 debug 会话                       |
-| device.restart | 当前 bootId 和有效 debug 会话；ACK 后重启                             |
-| gpio.write     | gpio/value，另需设备输出白名单，目前为空                              |
+| 命令           | 参数 / 约束                                                                    |
+| -------------- | ------------------------------------------------------------------------------ |
+| debug.set      | enabled、可选 profile / ttlSeconds / oledFps / gpioHz                          |
+| debug.renew    | ttlSeconds（1–1800 秒）；当前 bootId、已开启且未到期的会话，保持现有档位和频率 |
+| snapshot.get   | hello/status/debug/可选 metrics/全量 pins/最新 oled，debug 关闭也可用          |
+| config.get     | revision、公开 values、secrets 布尔配置状态、生效时机；无密码                  |
+| config.set     | revision、values；当前 bootId 和有效 debug 会话                                |
+| device.restart | 当前 bootId 和有效 debug 会话；ACK 后重启                                      |
+| gpio.write     | gpio/value，另需设备输出白名单，目前为空                                       |
 
 POST `/api/command` 返回 `{id,accepted:true}` 后，通过 `/ws` 等待同 id ACK。Wi-Fi 修改先回 `stage=testing`，需继续等 `applied` 或 `rolled-back`。重启 ACK 表示准备重启，之后新 bootId 才说明重新上线。超时后不要自动重发写操作。
+
+支持安全续期的固件在 hello.capabilities 中声明 `debug-renew`。`debug.renew` 只延长当前有效会话，不能开启已停止或到期的采集；手动关闭后延迟到达的续期会被拒绝，重启后的旧 bootId 也会被拒绝。成功 ACK 返回实际 debug 状态，并立即更新 debug 事件；续期不触发全量快照，不改变现有档位或采样频率。旧固件没有该能力时不能退回使用 `debug.set enabled=true` 自动重开。Bridge 根据设备报告记录开启、续期与停止，不推测停止原因。
 
 设备缓存最近 16 条回执去重，不构成跨重启持久化幂等。USB 使用 UART0/stdin/stdout，禁止同时用 mpremote / Thonny 占用，上传前应释放 bridge 连接。
 

@@ -125,6 +125,7 @@ export const DeviceEventSchema = z
 export type DeviceEvent = z.infer<typeof DeviceEventSchema>;
 
 const commandArgs = {
+  'debug.renew': z.object({ ttlSeconds: z.number().int().min(1).max(1800) }).strict(),
   'debug.set': z
     .object({
       enabled: z.boolean(),
@@ -163,6 +164,7 @@ export const DeviceCommandSchema = z
     id: z.string().min(1).max(100),
     command: z.enum([
       'debug.set',
+      'debug.renew',
       'snapshot.get',
       'device.restart',
       'config.get',
@@ -176,7 +178,10 @@ export const DeviceCommandSchema = z
   .superRefine((command, ctx) => {
     if (!commandArgs[command.command].safeParse(command.args).success)
       ctx.addIssue({ code: 'custom', path: ['args'], message: 'Invalid command arguments' });
-    if (['config.set', 'device.restart', 'gpio.write'].includes(command.command) && !command.bootId)
+    if (
+      ['debug.renew', 'config.set', 'device.restart', 'gpio.write'].includes(command.command) &&
+      !command.bootId
+    )
       ctx.addIssue({ code: 'custom', path: ['bootId'], message: 'Current bootId is required' });
   });
 export type DeviceCommand = z.infer<typeof DeviceCommandSchema>;

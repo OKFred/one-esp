@@ -74,6 +74,26 @@ describe('portable device protocol', () => {
     expect(pixels[128 * 9]).toBe(1);
     expect(() => decodeOledPixels({ ...frame, buffer: 'AA==' })).toThrow();
   });
+  it('requires a current boot and bounded renewal duration without enable/rate fields', () => {
+    const renew = {
+      v: 1,
+      id: 'renew',
+      command: 'debug.renew',
+      bootId: 'boot-1',
+      args: { ttlSeconds: 600 },
+    };
+    expect(DeviceCommandSchema.safeParse(renew).success).toBe(true);
+    expect(DeviceCommandSchema.safeParse({ ...renew, bootId: undefined }).success).toBe(false);
+    for (const ttlSeconds of [0, 1801, 1.5, NaN, Infinity])
+      expect(DeviceCommandSchema.safeParse({ ...renew, args: { ttlSeconds } }).success).toBe(false);
+    expect(
+      DeviceCommandSchema.safeParse({ ...renew, args: { ttlSeconds: 600, enabled: true } }).success,
+    ).toBe(false);
+    expect(
+      DeviceCommandSchema.safeParse({ ...renew, args: { ttlSeconds: 600, profile: 'full' } })
+        .success,
+    ).toBe(false);
+  });
   it('bounds logs and redacts secrets', () => {
     let state = createBridgeState();
     for (let n = 0; n < 250; n++)

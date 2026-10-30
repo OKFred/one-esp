@@ -138,6 +138,49 @@ class DebugServiceTests(unittest.TestCase):
             self.service.tick()
         self.assertEqual(calls, [5000])
 
+    def test_renew_extends_active_lease_without_changing_rates_or_dumping_snapshot(self):
+        self.enable(profile='lite', ttlSeconds=30, oledFps=0.5, gpioHz=0.4)
+        self.drain_snapshot()
+        previous_expiry = self.service.expires_at
+        self.frames.clear()
+        self.clock.advance(1000)
+        self.service.handle(self.command('debug.renew', {'ttlSeconds': 60}, 'renew-once'))
+        expiry = self.service.expires_at
+        self.assertGreater(expiry, previous_expiry)
+        ack = self.ack()
+        self.assertTrue(ack['ok'])
+        self.assertEqual(ack['result']['profile'], 'lite')
+        self.assertEqual(ack['result']['oledFps'], 0.5)
+        self.assertEqual(ack['result']['gpioHz'], 0.4)
+        self.assertFalse(self.service._snapshot_pending)
+        self.service.tick()
+        self.assertEqual([frame['type'] for frame in self.events()], ['ack', 'debug'])
+        self.clock.advance(2000)
+        self.service.handle(self.command('debug.renew', {'ttlSeconds': 60}, 'renew-once'))
+        self.assertTrue(self.ack()['ok'])
+        self.assertEqual(self.service.expires_at, expiry, 'A duplicate ID must not extend twice')
+
+    def test_renew_rejects_disabled_expired_stopped_or_different_boot_sessions(self):
+        for state in ('disabled', 'expired', 'stopped', 'wrong-boot', 'missing-boot'):
+            with self.subTest(state=state):
+                self.service.stop()
+                if state != 'disabled':
+                    self.enable(ttlSeconds=1)
+                    self.drain_snapshot()
+                if state == 'expired':
+                    self.clock.advance(1500)
+                elif state == 'stopped':
+                    self.service.handle(self.command('debug.set', {'enabled': False}, 'stop-' + state))
+                    self.assertTrue(self.ack()['ok'])
+                command = self.command('debug.renew', {'ttlSeconds': 600}, 'renew-' + state,
+                                       boot='other-boot' if state == 'wrong-boot' else 'boot-a')
+                if state == 'missing-boot':
+                    command.pop('bootId')
+                self.service.handle(command)
+                self.assertFalse(self.ack()['ok'])
+                if state in ('disabled', 'expired', 'stopped'):
+                    self.assertFalse(self.service.enabled)
+                    self.assertEqual(self.service.expires_at, 0)
     def test_metrics_are_low_frequency_and_stop_at_session_expiry(self):
         self.service.metrics_provider = self.metrics
         for profile, interval in (('full', 5000), ('lite', 15000)):
