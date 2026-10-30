@@ -24,6 +24,7 @@ export interface StatusData {
   wifi: { connected: boolean; status: number | string; ssid?: string; ip?: string; rssi?: number };
   sensorEnabled: boolean;
   environment?: EnvironmentData;
+  mqtt?: MqttStatusData;
   maintenance?: { tcpMs?: number | null; tcpOk?: boolean | null };
   clock?: {
     synced: boolean;
@@ -35,6 +36,15 @@ export interface StatusData {
     intervalMs: number;
     nextInMs: number;
   };
+}
+
+export interface MqttStatusData {
+  enabled?: boolean;
+  state?: string;
+  samples?: number;
+  acknowledged?: number;
+  pending?: boolean;
+  transport?: { connected?: boolean; phase?: string };
 }
 
 export interface DebugData {

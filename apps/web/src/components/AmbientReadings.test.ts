@@ -122,3 +122,66 @@ it('preserves valid zero humidity and negative temperatures', () => {
   expect(wrapper.text()).toContain('-4.2 °C');
   expect(wrapper.text()).toContain('0.0 %RH');
 });
+
+it('keeps local sampling health separate from disconnected MQTT delivery', async () => {
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      mqtt: {
+        enabled: true,
+        samples: 7,
+        acknowledged: 6,
+        pending: true,
+        transport: { connected: false, phase: 'backoff' },
+      },
+    },
+  });
+  expect(wrapper.find('.ambient-freshness').text()).toBe('定时采集中');
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 重连中 · 待发送');
+  expect(wrapper.find('.ambient-delivery').classes()).toContain('tone-warning');
+  await wrapper.setProps({
+    mqtt: { enabled: true, acknowledged: 7, pending: false, transport: { connected: true } },
+  });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 已确认 7 条');
+  expect(wrapper.find('.ambient-delivery').classes()).not.toContain('tone-warning');
+});
+
+it('labels paused, disconnected or stale MQTT evidence as the last known status', async () => {
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      mqtt: { enabled: true, acknowledged: 6, transport: { connected: true } },
+      telemetryActive: false,
+    },
+  });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('上次MQTT状态：MQTT 已连接 · 已确认 6 条');
+  await wrapper.setProps({ telemetryActive: true, connected: false });
+  expect(wrapper.find('.ambient-delivery').text()).toContain('上次MQTT状态');
+  await wrapper.setProps({ connected: true, deviceStale: true });
+  expect(wrapper.find('.ambient-delivery').text()).toContain('上次MQTT状态');
+  await wrapper.setProps({ deviceStale: false, uptimeMs: 42000 });
+  expect(wrapper.find('.ambient-delivery').text()).toContain('上次MQTT状态');
+});
+
+it('does not fabricate confirmation counts for old firmware or incomplete MQTT fields', async () => {
+  const wrapper = mount(AmbientReadings, { props });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT状态未提供');
+  await wrapper.setProps({ mqtt: { enabled: true, transport: { connected: true } } });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 确认数未提供');
+  expect(wrapper.find('.ambient-delivery').text()).not.toContain('已确认 0 条');
+  await wrapper.setProps({
+    mqtt: { enabled: true, acknowledged: 0, transport: { connected: true } },
+  });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 已确认 0 条');
+});
+
+it('distinguishes disabled MQTT, waiting on prerequisites and invalid configuration', async () => {
+  const wrapper = mount(AmbientReadings, { props: { ...props, mqtt: { state: 'disabled' } } });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('未开启MQTT');
+  for (const state of ['waiting_network', 'waiting_clock']) {
+    await wrapper.setProps({ mqtt: { state } });
+    expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 等待网络或时钟');
+  }
+  await wrapper.setProps({ mqtt: { state: 'configuration_error' } });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 配置异常');
+});

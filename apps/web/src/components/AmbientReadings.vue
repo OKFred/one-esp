@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { EnvironmentData } from '@one-esp/protocol';
+import type { MqttStatusData } from '../types';
 
 const props = defineProps<{
   environment?: EnvironmentData;
+  mqtt?: MqttStatusData;
   connected: boolean;
   telemetryActive: boolean;
   deviceStale: boolean;
@@ -50,6 +52,42 @@ const freshness = computed(() => {
   return '定时采集中';
 });
 const healthy = computed(() => freshness.value === '定时采集中');
+const mqttCached = computed(
+  () =>
+    !props.connected ||
+    !props.telemetryActive ||
+    props.deviceStale ||
+    statusAgeMs.value === null ||
+    statusAgeMs.value > 10000,
+);
+const mqttDelivery = computed(() => {
+  const mqtt = props.mqtt;
+  if (!mqtt) return 'MQTT状态未提供';
+  let label: string;
+  if (mqtt.enabled === false || mqtt.state === 'disabled') {
+    label = '未开启MQTT';
+  } else if (
+    mqtt.state === 'waiting_network' ||
+    mqtt.state === 'waiting_clock' ||
+    mqtt.transport?.phase === 'waiting_network' ||
+    mqtt.transport?.phase === 'waiting_clock'
+  ) {
+    label = 'MQTT 等待网络或时钟';
+  } else if (mqtt.state === 'configuration_error') {
+    label = 'MQTT 配置异常';
+  } else if (mqtt.transport?.connected === true) {
+    const count = mqtt.acknowledged;
+    const knownCount = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
+    label = `MQTT 已连接 · ${knownCount ? `已确认 ${count} 条` : '确认数未提供'}`;
+    if (mqtt.pending === true) label += ' · 等待确认';
+  } else if (mqtt.enabled === true || mqtt.state || mqtt.transport?.phase) {
+    label = `MQTT 重连中${mqtt.pending === true ? ' · 待发送' : ''}`;
+  } else {
+    return 'MQTT状态未提供';
+  }
+  return mqttCached.value ? `上次MQTT状态：${label}` : label;
+});
+const mqttWarning = computed(() => mqttCached.value || props.mqtt?.transport?.connected !== true);
 const ageLabel = computed(() =>
   ageMs.value === null ? '读取时间未知' : `${Math.floor(ageMs.value / 1000)} 秒前读取`,
 );
@@ -81,6 +119,9 @@ function value(number: number | null | undefined) {
         <strong>{{ value(environment?.relativeHumidityPercent) }} <small>%RH</small></strong>
       </div>
     </div>
+    <p class="ambient-delivery" :class="{ 'tone-warning': mqttWarning }" aria-label="MQTT 投递状态">
+      {{ mqttDelivery }}
+    </p>
     <p class="ambient-note">
       <template v-if="environment?.enabled">
         每 {{ environment.intervalMs / 1000 }} 秒读取 · {{ ageLabel }}。
@@ -142,6 +183,18 @@ function value(number: number | null | undefined) {
   font-size: 11px;
   line-height: 1.8;
   overflow-wrap: anywhere;
+}
+.ambient-delivery {
+  margin: 0;
+  padding: 10px 18px;
+  border-top: 1px solid #27343d;
+  color: #7ca497;
+  font-size: 11px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.ambient-delivery.tone-warning {
+  color: #e1bc70;
 }
 @media (max-width: 360px) {
   .ambient-grid {

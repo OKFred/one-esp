@@ -540,6 +540,7 @@ function clearVisibleLogs() {
 
             <AmbientReadings
               :environment="status?.environment"
+              :mqtt="status?.mqtt"
               :connected="state.connection.connected && channelConnected"
               :telemetry-active="!!debug?.enabled"
               :device-stale="stale"
