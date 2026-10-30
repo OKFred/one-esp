@@ -4,6 +4,7 @@ import binascii
 import builtins
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -216,13 +217,23 @@ class UploadPlanTests(unittest.TestCase):
     def test_precompiled_upload_compiles_then_backs_up_before_executing_shadow_plan(self):
         calls = []
         mapping = {"boot.py": Path("boot.py"), "components/test.mpy": Path("test.mpy")}
-        with patch.object(device, "precompile_firmware", side_effect=lambda: calls.append("compile") or mapping), \
+        with patch.object(device, "precompile_firmware", side_effect=lambda **kwargs: calls.append("compile") or mapping) as compile_firmware, \
                 patch.object(device, "backup", side_effect=lambda *a, **k: calls.append("backup") or self.backup), \
                 patch.object(device, "build_upload_plan", side_effect=lambda **k: calls.append("plan") or ["exec", "verified plan"]) as plan, \
                 patch.object(device, "mpremote", side_effect=lambda *a: calls.append(a[-1])):
             device.upload("COM-test", precompile=True)
         self.assertEqual(calls, ["compile", "backup", "plan", "verified plan", "reset"])
+        compile_firmware.assert_called_once_with(mpy_version=device.DEFAULT_MPY_VERSION)
         plan.assert_called_once_with(compiled=mapping)
+
+    def test_explicit_legacy_compiler_reaches_precompiled_upload(self):
+        mapping = {"boot.py": Path("boot.py"), "components/test.mpy": Path("test.mpy")}
+        with patch.object(device, "precompile_firmware", return_value=mapping) as compile_firmware, \
+                patch.object(device, "backup", return_value=self.backup), \
+                patch.object(device, "build_upload_plan", return_value=["exec", "verified plan"]), \
+                patch.object(device, "mpremote"):
+            device.upload("COM-test", precompile=True, mpy_version="1.22.2")
+        compile_firmware.assert_called_once_with(mpy_version="1.22.2")
 
     def test_host_precompile_failure_does_not_interrupt_the_device(self):
         with patch.object(device, "precompile_firmware", side_effect=RuntimeError("compiler failed")), \
@@ -232,15 +243,19 @@ class UploadPlanTests(unittest.TestCase):
         backup.assert_not_called()
         transport.assert_not_called()
 
-    def compiler(self, header=None, version=None):
+    def compiler(self, header=None, version=None, mpy_version="1.29.0.post2"):
         calls = []
+        target, mpy_format = {"1.22.2": ("1.22.2", "6.2"),
+                              "1.29.0.post2": ("1.29.0", "6.3")}[mpy_version]
+        prefix = ["uv", "tool", "run", "--from", "mpy-cross==" + mpy_version, "mpy-cross"]
 
         def run(command, **options):
             calls.append((command, options))
-            self.assertEqual(command[:len(device.MPY_CROSS_COMMAND)], list(device.MPY_CROSS_COMMAND))
+            self.assertEqual(command[:len(prefix)], prefix)
             self.assertFalse(any(value.startswith("-march") or value.startswith("-O") for value in command))
             if command[-1] == "--version":
-                return SimpleNamespace(stdout=version or "MicroPython v1.22.2 on 2024-02-24; mpy-cross emitting mpy v6.2\n")
+                return SimpleNamespace(stdout=version or "MicroPython v" + target +
+                                       " on 2026-08-29; mpy-cross emitting mpy v" + mpy_format + "\n")
             output = Path(command[command.index("-o") + 1])
             source_name = command[command.index("-s") + 1]
             self.assertFalse(Path(source_name).is_absolute())
@@ -252,33 +267,83 @@ class UploadPlanTests(unittest.TestCase):
         return Mock(side_effect=run), calls
 
     def test_precompile_pins_version_compiles_all_sources_and_keeps_boot_entrypoint(self):
-        compiler, calls = self.compiler()
-        with patch.object(device.subprocess, "run", compiler):
-            mapping = device.precompile_firmware(self.firmware, self.root / "cache")
-        self.assertEqual(set(mapping), {"boot.py", "components/runtime.mpy"})
-        self.assertEqual([command[-1] for command, _ in calls], ["--version", "boot.py", "components/runtime.py"])
-        self.assertEqual(mapping["boot.py"].read_bytes(), (self.firmware / "boot.py").read_bytes())
-        self.assertEqual(mapping["components/runtime.mpy"].read_bytes()[:4], b"M\x06\x00\x1f")
-        manifest = json.loads((mapping["boot.py"].parent / "build-manifest.json").read_text())
-        self.assertEqual(manifest["compiler"], "mpy-cross==1.22.2")
-        self.assertEqual(manifest["format"], "6.2")
-        self.assertFalse(manifest["native"])
-        self.assertEqual(set(manifest["sources"]), {"boot.py", "components/runtime.py"})
-        self.assertNotIn(str(self.root), json.dumps(manifest))
-        self.assertNotIn("private MQTT fixture", json.dumps(manifest))
+        for selector, target, mpy_format in (("1.22.2", "1.22.2", "6.2"),
+                                             ("1.29.0.post2", "1.29.0", "6.3")):
+            with self.subTest(compiler=selector):
+                compiler, calls = self.compiler(mpy_version=selector)
+                with patch.object(device.subprocess, "run", compiler):
+                    mapping = device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+                self.assertEqual(set(mapping), {"boot.py", "components/runtime.mpy"})
+                self.assertEqual([command[-1] for command, _ in calls], ["--version", "boot.py", "components/runtime.py"])
+                self.assertEqual(mapping["boot.py"].read_bytes(), (self.firmware / "boot.py").read_bytes())
+                self.assertEqual(mapping["components/runtime.mpy"].read_bytes()[:4], b"M\x06\x00\x1f")
+                manifest = json.loads((mapping["boot.py"].parent / "build-manifest.json").read_text())
+                self.assertEqual(manifest["compiler"], "mpy-cross==" + selector)
+                self.assertEqual(manifest["micropython"], target)
+                self.assertEqual(manifest["format"], mpy_format)
+                self.assertFalse(manifest["native"])
+                self.assertEqual(set(manifest["sources"]), {"boot.py", "components/runtime.py"})
+                self.assertNotIn(str(self.root), json.dumps(manifest))
+                self.assertNotIn("private MQTT fixture", json.dumps(manifest))
 
     def test_precompile_rejects_wrong_compiler_or_mpy_format_before_upload(self):
-        for version in ("MicroPython v1.23.0; mpy-cross emitting mpy v6.2", "MicroPython v1.22.2; mpy-cross emitting mpy v6.1"):
-            compiler, calls = self.compiler(version=version)
-            with self.subTest(version=version), patch.object(device.subprocess, "run", compiler):
-                with self.assertRaisesRegex(RuntimeError, "Expected mpy-cross"):
-                    device.precompile_firmware(self.firmware, self.root / "cache")
-            self.assertEqual(len(calls), 1)
-        for header in (b"X\x06\x00\x1f", b"M\x05\x00\x1f", b"M\x06\x02\x1f", b"M\x06\x28\x1f", b"M\x06\x00\x1e"):
-            compiler, _ = self.compiler(header=header)
-            with self.subTest(header=header), patch.object(device.subprocess, "run", compiler):
-                with self.assertRaisesRegex(RuntimeError, "pure bytecode"):
-                    device.precompile_firmware(self.firmware, self.root / "cache")
+        invalid = {
+            "1.22.2": ("MicroPython v1.29.0 on 2026-08-24; mpy-cross emitting mpy v6.2",
+                       "MicroPython v1.22.2 on 2024-02-22; mpy-cross emitting mpy v6.3"),
+            "1.29.0.post2": ("MicroPython v1.22.2 on 2024-02-22; mpy-cross emitting mpy v6.3",
+                             "MicroPython v1.29.0 on 2026-08-24; mpy-cross emitting mpy v6.2",
+                             "MicroPython v1.29.0-preview on 2026-08-24; mpy-cross emitting mpy v6.3"),
+        }
+        for selector, versions in invalid.items():
+            for version in versions:
+                compiler, calls = self.compiler(version=version, mpy_version=selector)
+                with self.subTest(compiler=selector, version=version), patch.object(device.subprocess, "run", compiler):
+                    with self.assertRaisesRegex(RuntimeError, "Expected mpy-cross"):
+                        device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+                self.assertEqual(len(calls), 1)
+        for selector in ("1.22.2", "1.29.0.post2"):
+            for header in (b"X\x06\x00\x1f", b"M\x05\x00\x1f", b"M\x06\x02\x1f", b"M\x06\x28\x1f", b"M\x06\x00\x1e"):
+                compiler, _ = self.compiler(header=header, mpy_version=selector)
+                with self.subTest(compiler=selector, header=header), patch.object(device.subprocess, "run", compiler):
+                    with self.assertRaisesRegex(RuntimeError, "pure bytecode"):
+                        device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+
+    def test_unsupported_compiler_selection_is_rejected_before_tools_or_device_access(self):
+        for selector in ("1.29.0", "1.23.0", "latest", None, {}):
+            with self.subTest(compiler=selector), patch.object(device.subprocess, "run") as compiler, \
+                    patch.object(device, "backup") as backup, patch.object(device, "mpremote") as transport:
+                with self.assertRaisesRegex(RuntimeError, "Unsupported mpy-cross version"):
+                    device.upload("COM-test", precompile=True, mpy_version=selector)
+                compiler.assert_not_called()
+                backup.assert_not_called()
+                transport.assert_not_called()
+
+    def test_cli_selects_explicit_compilers_and_documents_the_new_default(self):
+        self.assertEqual(device.DEFAULT_MPY_VERSION, "1.29.0.post2")
+        for selector in (None, "1.22.2", "1.29.0.post2"):
+            arguments = ["device.py", "upload", "--precompile", "--port", "COM-test"]
+            if selector is not None:
+                arguments.extend(["--mpy-version", selector])
+            with self.subTest(compiler=selector), patch("sys.argv", arguments), \
+                    patch.object(device, "release_bridge") as release, patch.object(device, "upload") as upload:
+                device.main()
+                release.assert_called_once()
+                upload.assert_called_once_with("COM-test", precompile=True,
+                                               mpy_version=selector or "1.29.0.post2")
+
+    def test_cli_rejects_invalid_or_unused_compiler_flags_before_releasing_bridge(self):
+        for arguments in (("upload", "--precompile", "--mpy-version", "1.29.0"),
+                          ("upload", "--mpy-version", "1.22.2"),
+                          ("status", "--mpy-version", "1.22.2"),
+                          ("backup", "--precompile")):
+            with self.subTest(arguments=arguments), patch("sys.argv", ["device.py", *arguments]), \
+                    patch("sys.stderr", io.StringIO()), patch.object(device, "release_bridge") as release, \
+                    patch.object(device, "upload") as upload:
+                with self.assertRaises(SystemExit) as error:
+                    device.main()
+                self.assertEqual(error.exception.code, 2)
+                release.assert_not_called()
+                upload.assert_not_called()
 
     def test_precompile_relative_names_produce_reproducible_artifacts(self):
         compiler, _ = self.compiler()
