@@ -466,6 +466,169 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.clock_tick()
         self.assertIn('TCP: 51ms', self.display.screen_display.call_args.args[0])
 
+    def test_each_failed_stage_leaves_other_stages_running_and_retries_after_backoff(self):
+        stages = [('usb', self.runtime, 'poll_commands'),
+                  ('network', self.runtime, 'network_tick'),
+                  ('maintenance', self.runtime, 'maintenance_tick'),
+                  ('clock', self.runtime, 'clock_tick'),
+                  ('telemetry', self.runtime.service, 'tick'),
+                  ('restart', self.runtime, '_restart_step')]
+        for failed, target, method in stages:
+            with self.subTest(stage=failed), contextlib.ExitStack() as stack:
+                self.clock.value = 0
+                self.runtime._stage_retry_at.clear()
+                self.runtime._stage_log_at.clear()
+                calls = []
+                mocks = {}
+                for name, owner, attribute in stages:
+                    def operation(stage=name):
+                        calls.append(stage)
+                        if stage == failed and calls.count(stage) == 1:
+                            raise ValueError('original-private new-private')
+                    mocks[name] = stack.enter_context(patch.object(owner, attribute, side_effect=operation))
+                self.runtime.tick_once()
+                self.assertEqual(calls, [stage[0] for stage in stages])
+                self.clock.value = 500
+                self.runtime.tick_once()
+                self.assertEqual(mocks[failed].call_count, 1)
+                self.assertTrue(all(mock.call_count == 2 for name, mock in mocks.items() if name != failed))
+                self.clock.value = 1000
+                self.runtime.tick_once()
+                self.assertEqual(mocks[failed].call_count, 2)
+                self.assertNotIn(failed, self.runtime._stage_retry_at)
+                message = self.runtime.service.logs[-1]['message']
+                self.assertIn('Runtime ' + failed + ' failed (ValueError)', message)
+                self.assertNotIn('private', message)
+
+    def test_persistent_stage_failure_has_bounded_retries_and_logs(self):
+        self.runtime.service.logs.clear()
+        self.runtime.service.log_bytes = 0
+        with patch.object(self.runtime, 'poll_commands'), \
+                patch.object(self.runtime, 'network_tick'), \
+                patch.object(self.runtime, 'maintenance_tick', side_effect=MemoryError('private')) as failing, \
+                patch.object(self.runtime, 'clock_tick') as clock, \
+                patch.object(self.runtime.service, 'tick'), \
+                patch.object(self.runtime, '_restart_step'):
+            for now in range(0, 30000, 100):
+                self.clock.value = now
+                self.runtime.tick_once()
+            self.assertEqual(failing.call_count, 30)
+            self.assertEqual(clock.call_count, 300)
+            self.assertEqual(len(self.runtime.service.logs), 1)
+            self.clock.value = 30000
+            self.runtime.tick_once()
+            self.assertEqual(len(self.runtime.service.logs), 2)
+            self.assertTrue(all('private' not in entry['message'] for entry in self.runtime.service.logs))
+
+    def test_maintenance_exception_does_not_stop_real_clock_or_telemetry_progress(self):
+        self.wlan.connected = True
+        self.runtime.network_state = 'connected'
+        self.runtime.service.enabled = True
+        self.runtime.service.expires_at = 600000
+        self.local_time.side_effect = lambda _: {
+            'formatted_simple_date_time': '10-30 12:34:%02d' % (self.clock.time() % 60),
+            'formatted_time': '12:34:%02d' % (self.clock.time() % 60),
+        }
+        with patch.object(self.runtime, 'poll_commands'), \
+                patch.object(self.runtime, 'maintenance_tick', side_effect=RuntimeError('private')):
+            self.runtime.tick_once()
+            first_seq = self.runtime.service.seq
+            self.clock.value = 1000
+            self.runtime.tick_once()
+        shown = [call.args[0] for call in self.display.screen_display.call_args_list]
+        self.assertIn('RTC 12:34:00', shown[0])
+        self.assertIn('RTC 12:34:01', shown[1])
+        self.assertGreater(self.runtime.service.seq, first_seq)
+        self.assertTrue(self.runtime.service.enabled)
+
+    def test_failed_display_does_not_commit_clock_view_or_retry_every_loop(self):
+        self.wlan.connected = True
+        self.runtime.network_state = 'connected'
+        self.clock.time = lambda: 846127200
+        self.display.screen_display.side_effect = [OSError('private'), True]
+        self.runtime.clock_tick()
+        self.assertIsNone(self.runtime._last_clock_view)
+        for now in range(100, 1000, 100):
+            self.clock.value = now
+            self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 1)
+        self.clock.value = 1000
+        self.runtime.clock_tick()
+        self.assertIsNotNone(self.runtime._last_clock_view)
+        self.assertEqual(self.display.screen_display.call_count, 2)
+        self.clock.value = 1100
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 2)
+        self.assertNotIn('private', self.runtime.service.logs[-1]['message'])
+
+    def test_display_unavailable_return_is_retried_without_committing_clock_view(self):
+        self.wlan.connected = True
+        self.runtime.network_state = 'connected'
+        self.display.screen_display.return_value = False
+        self.runtime.clock_tick()
+        self.assertIsNone(self.runtime._last_clock_view)
+        self.clock.value = 100
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_count, 1)
+
+    def test_network_oserror_preserves_connection_failure_handling(self):
+        with patch.object(self.runtime, 'network_tick', side_effect=OSError('private')), \
+                patch.object(self.runtime, 'network_failure') as failure:
+            self.runtime._network_step()
+        failure.assert_called_once_with('Connect failed')
+
+    def test_deliberate_interrupts_are_not_swallowed(self):
+        for exception in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exception=exception), \
+                    patch.object(self.runtime, 'poll_commands', side_effect=exception):
+                with self.assertRaises(exception):
+                    self.runtime.tick_once()
+
+    def test_initialization_failure_does_not_trigger_automatic_hardware_reset(self):
+        with patch.object(self.module, 'DiagnosticRuntime', side_effect=RuntimeError('private')):
+            with self.assertRaises(RuntimeError):
+                self.module.run()
+        self.machine.reset.assert_not_called()
+
+    def test_failed_display_import_retries_every_thirty_seconds_and_recovers(self):
+        self.runtime.display = None
+
+        def load():
+            if loader.call_count == 1:
+                raise ImportError('private-path')
+            self.runtime.display = self.display
+
+        with patch.object(self.runtime, '_load_display', side_effect=load) as loader:
+            self.assertFalse(self.runtime.show('waiting'))
+            for now in range(1000, 30000, 1000):
+                self.clock.value = now
+                self.assertFalse(self.runtime.show('waiting'))
+            self.assertEqual(loader.call_count, 1)
+            self.clock.value = 30000
+            self.assertTrue(self.runtime.show('recovered'))
+            self.assertEqual(loader.call_count, 2)
+            self.display.screen_display.assert_called_once_with('recovered')
+            self.assertNotIn('private', self.runtime.service.logs[-1]['message'])
+
+    def test_initial_wifi_start_exception_retries_without_stopping_other_stages(self):
+        self.runtime._wifi_initializing = True
+        with patch.object(self.runtime, 'start_wifi', side_effect=[ValueError('private'), None]) as start, \
+                patch.object(self.runtime, 'poll_commands') as commands, \
+                patch.object(self.runtime, 'maintenance_tick'), \
+                patch.object(self.runtime, 'clock_tick') as clock, \
+                patch.object(self.runtime.service, 'tick'):
+            self.runtime.tick_once()
+            self.assertTrue(self.runtime._wifi_initializing)
+            self.clock.value = 500
+            self.runtime.tick_once()
+            self.assertEqual(start.call_count, 1)
+            self.clock.value = 1000
+            self.runtime.tick_once()
+            self.assertEqual(start.call_count, 2)
+            self.assertFalse(self.runtime._wifi_initializing)
+            self.assertEqual(commands.call_count, 3)
+            self.assertEqual(clock.call_count, 3)
+
     def test_trial_cannot_commit_an_old_asynchronously_disconnecting_connection(self):
         self.wlan.connected = True
         self.wlan.delay_disconnect = True

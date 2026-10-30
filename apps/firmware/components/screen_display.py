@@ -6,6 +6,7 @@
 
 from machine import Pin, I2C
 from lib.ssd1306 import SSD1306_I2C
+import time
 
 """ 假设你使用的是I2C接口的SSD1306 OLED显示屏：
 ESP32 -> OLED Display
@@ -14,16 +15,19 @@ VCC -> VCC
 SCL -> GPIO4 (默认I2C时钟引脚)
 SDA -> GPIO5 (默认I2C数据引脚) """
 # 根据设备的引脚设置进行调整
-i2c = I2C(0, scl=Pin(4), sda=Pin(5))
+i2c = None
 max_width = 128  # oled_width
 max_height = 64  # oled_height
 
 def init_oled():
+    global i2c
     try:
+        if i2c is None:
+            i2c = I2C(0, scl=Pin(4), sda=Pin(5))
         oled = SSD1306_I2C(max_width, max_height, i2c)
         return oled
-    except OSError as e:
-        print(f"OLED initialization failed--显示屏初始化失败: {e}")
+    except OSError:
+        print('OLED initialization failed; retrying in 30 seconds')
         return False
       
 def is_chinese(char):
@@ -39,13 +43,18 @@ def get_text_width(text):
             width += 8  # 英文字符宽度为8像素
     return width
 
+OLED_RETRY_MS = 30000
+_last_init_attempt = time.ticks_ms()
 oled = init_oled()
 _observer = None
 _last_text = ''
+_last_buffer = bytes(oled.buffer) if oled else b''
 
 
 def display_state():
-    return {'available': bool(oled), 'buffer': bytes(oled.buffer) if oled else b'',
+    # Rendering mutates oled.buffer before I2C succeeds. Keep the last completed
+    # physical write, so a failed write never appears as a fresh mirror frame.
+    return {'available': bool(oled), 'buffer': _last_buffer,
             'width': max_width, 'height': max_height, 'format': 'MONO_VLSB',
             'text': _last_text}
 
@@ -57,10 +66,15 @@ def set_observer(observer):
         _observer(display_state())
 
 def screen_display(text):
-    global _last_text
+    global _last_text, _last_buffer, oled, _last_init_attempt
     if not oled:
-        print("OLED display not initialized--显示屏未初始化")
-        return False
+        now = time.ticks_ms()
+        if time.ticks_diff(now, _last_init_attempt) < OLED_RETRY_MS:
+            return False
+        _last_init_attempt = now
+        oled = init_oled()
+        if not oled:
+            return False
     oled.fill(0)  # 清空显示屏
     lines = text.split('\n')  # 根据换行符"\n"分割文本
 
@@ -93,6 +107,7 @@ def screen_display(text):
         oled.text(truncated_text + "...", 0, (max_height // 16 - 1) * 16)
         
     oled.show()
+    _last_buffer = bytes(oled.buffer)
     _last_text = text
     if _observer:
         _observer(display_state())

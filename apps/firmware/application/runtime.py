@@ -25,6 +25,9 @@ from components.system_metrics import SystemMetrics
 
 
 TCP_INTERVAL_MS = 60000
+STAGE_RETRY_MS = 1000
+STAGE_LOG_INTERVAL_MS = 30000
+DISPLAY_INIT_RETRY_MS = 30000
 
 
 class DiagnosticRuntime:
@@ -67,6 +70,10 @@ class DiagnosticRuntime:
         self.tcp_last_started_ms = None
         self.last_clock = -1000
         self._last_clock_view = None
+        self._stage_retry_at = {}
+        self._stage_log_at = {}
+        self._display_import_at = 0
+        self._wifi_initializing = False
         self.service.hello()
 
     def status(self):
@@ -98,11 +105,55 @@ class DiagnosticRuntime:
                                 'tcpInFlight': self.probe.busy}}
 
     def show(self, text):
-        if self.display:
+        now = self.service.now()
+        if now < self._stage_retry_at.get('display', 0):
+            return False
+        if not self.display:
+            if now < self._display_import_at:
+                return False
+            self._display_import_at = now + DISPLAY_INIT_RETRY_MS
             try:
-                self.display.screen_display(text)
-            except OSError:
-                self.service.log('error', 'OLED update failed')
+                self._load_display()
+            except Exception as error:
+                self._stage_failed('display', type(error).__name__)
+                return False
+        try:
+            if self.display.screen_display(text) is False:
+                self._stage_failed('display', 'Unavailable')
+                return False
+        except Exception as error:
+            self._stage_failed('display', type(error).__name__)
+            return False
+        self._stage_retry_at.pop('display', None)
+        return True
+
+    def _load_display(self):
+        from components import screen_display
+        screen_display.set_observer(self.service.capture_oled)
+        self.display = screen_display
+
+    def _stage_failed(self, name, error_type):
+        now = self.service.now()
+        self._stage_retry_at[name] = now + STAGE_RETRY_MS
+        if now - self._stage_log_at.get(name, -STAGE_LOG_INTERVAL_MS) >= STAGE_LOG_INTERVAL_MS:
+            self._stage_log_at[name] = now
+            # Exception messages may contain credentials, endpoints or input.
+            # Fixed stage names and the exception class are sufficient to locate
+            # a failed stage; failures in optional logging must not end the loop.
+            try:
+                self.service.log('error', 'Runtime ' + name + ' failed (' + error_type + '); retrying')
+            except Exception:
+                pass
+
+    def _run_stage(self, name, operation):
+        if self.service.now() < self._stage_retry_at.get(name, 0):
+            return
+        try:
+            operation()
+        except Exception as error:
+            self._stage_failed(name, type(error).__name__)
+        else:
+            self._stage_retry_at.pop(name, None)
 
     def start_wifi(self, values, timeout_ms=20000):
         self.cancel_network_jobs()
@@ -223,6 +274,8 @@ class DiagnosticRuntime:
         if self.network_state != 'connected' or now - self.last_clock < 100:
             return
         self.last_clock = now
+        if now < self._stage_retry_at.get('display', 0):
+            return
         # Observe the RTC second boundary cheaply instead of refreshing at an
         # arbitrary one-second phase, which could leave displayed seconds late.
         # Formatting/I2C still occur only when the visible second/state changes.
@@ -231,12 +284,12 @@ class DiagnosticRuntime:
                 self.config.values['TIMEZONE_HOURS'], ip)
         if view == self._last_clock_view:
             return
-        self._last_clock_view = view
         local = get_local_time(float(self.config.values['TIMEZONE_HOURS']))
         stamp = local['formatted_simple_date_time'] if self.ntp_synced else 'RTC ' + local['formatted_time']
         tcp = ('TCP: ' + str(self.tcp_ms) + 'ms') if self.tcp_ok else (
             'TCP: failed' if self.tcp_ok is False else 'TCP: pending')
-        self.show('WiFi Connected!\n' + ip + '\n' + stamp + '\n' + tcp)
+        if self.show('WiFi Connected!\n' + ip + '\n' + stamp + '\n' + tcp):
+            self._last_clock_view = view
 
     def maintenance_tick(self):
         now = self.service.now()
@@ -317,30 +370,43 @@ class DiagnosticRuntime:
                 break
             self.service.feed(char)
 
-    def run(self):
-        # Construct the receiver and emit hello before importing display code.
+    def _network_step(self):
         try:
-            from components import screen_display
-            self.display = screen_display
-            screen_display.set_observer(self.service.capture_oled)
-        except (OSError, ImportError):
-            self.service.log('error', 'OLED unavailable; USB diagnostics remain available')
-        self.show('One ESP\nUSB debug ready\nSensors disabled')
-        self.service.log('info', 'Diagnostics ready; MQTT transport is reserved for a later release')
-        self.start_wifi(self.config.values)
-        while True:
-            self.poll_commands()
-            try:
+            if self._wifi_initializing:
+                self.start_wifi(self.config.values)
+                self._wifi_initializing = False
+            else:
                 self.network_tick()
-            except OSError:
-                self.network_failure('Connect failed')
+        except OSError:
+            self.network_failure('Connect failed')
+
+    def _restart_step(self):
+        if self.restart_at is not None and self.service.now() >= self.restart_at and not self.service._pending_acks:
+            self.pins.restore_safe_values()
+            machine.reset()
+
+    def tick_once(self):
+        # Optional network work, serial decoding and display errors must not
+        # stop one another or drop the runtime into the REPL. Each failed stage
+        # has a bounded retry cadence. KeyboardInterrupt/SystemExit still pass
+        # through for mpremote and deliberate maintenance.
+        self._run_stage('usb', self.poll_commands)
+        self._run_stage('network', self._network_step)
+        self._run_stage('maintenance', self.maintenance_tick)
+        self._run_stage('clock', self.clock_tick)
+        self._run_stage('telemetry', self.service.tick)
+        self._run_stage('restart', self._restart_step)
+
+    def run(self):
+        # The receiver/hello exist before optional display initialization. A
+        # failed display import retries at most once per 30 seconds via show().
+        self.show('One ESP\nUSB debug ready\nSensors disabled')
+        self._run_stage('startup', lambda: self.service.log(
+            'info', 'Diagnostics ready; MQTT transport is reserved for a later release'))
+        self._wifi_initializing = True
+        while True:
             # Receive network timestamps before I2C/USB output adds latency.
-            self.maintenance_tick()
-            self.clock_tick()
-            self.service.tick()
-            if self.restart_at is not None and self.service.now() >= self.restart_at and not self.service._pending_acks:
-                self.pins.restore_safe_values()
-                machine.reset()
+            self.tick_once()
             time.sleep_ms(10)
 
 
