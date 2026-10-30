@@ -1,6 +1,6 @@
 # 直接依赖清单
 
-版本与用途按工作区清单组织；Node.js 依赖的传递版本和完整性哈希见 `pnpm-lock.yaml`，主机 Python 依赖见 `uv.lock`。运行时 Node.js 26.13.0 / pnpm 11.5.0；主机 CPython 3.14.2 由 `.python-version` 固定，uv 按根目录 `pyproject.toml` 和锁文件管理项目 `.venv/`。固件使用 MicroPython 1.22.2 内置模块和仓库 SSD1306 驱动。
+版本与用途按工作区清单组织；Node.js 依赖的传递版本和完整性哈希见 `pnpm-lock.yaml`，主机 Python 依赖见 `uv.lock`。运行时 Node.js 26.13.0 / pnpm 11.5.0；主机 CPython 3.14.2 由 `.python-version` 固定，uv 按根目录 `pyproject.toml` 和锁文件管理项目 `.venv/`。固件当前使用 MicroPython 1.22.2 内置模块和仓库 SSD1306 驱动；1.29.0 升级尚未刷写或验收，现有编译器固定项不代表已支持新版本。
 
 ## 主机 Python 工具
 
