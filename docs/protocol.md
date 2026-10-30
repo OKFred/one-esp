@@ -71,4 +71,6 @@ POST `/api/command` 返回 `{id,accepted:true}` 后，通过 `/ws` 等待同 id 
 
 WebSocket 首包为 `snapshot`（BridgeState），随后为 `event`（DeviceEvent）或 `connection`。归并器保留最新 OLED / pins / status / metrics 和最多 200 条日志。慢客户端超过缓冲上限会断开，重连获取新快照。
 
+WebSocket 另每 5 秒发送 `{"type":"heartbeat","data":{"ts":1793330000000}}`（ts 为 bridge 的 Unix 毫秒），用于网页通道活性检测，不代表设备有新数据，也不更新设备 `lastSeen`。网页通道持续静默时重连；服务端通过原生 ping/pong 清理无响应客户端。OLED 时钟进度与其他遥测独立检查，恢复时仅限频请求 `snapshot.get`；不会重发写操作或以本机时间生成设备画面。
+
 固件 GPIO 快照按 6 项分片，每片均为 `partial=true`。主机在 bootId / 会话变化时清空，再按 GPIO 合并；同次启动刷新时保留此前已知记录，避免坏片使完整引脚表被首片清空。
