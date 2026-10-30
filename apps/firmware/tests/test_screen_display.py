@@ -88,6 +88,30 @@ class ScreenDisplayTests(unittest.TestCase):
             self.assertEqual(initialize.call_count, 2)
             self.assertEqual(self.module.display_state()['text'], '12:34:58')
 
+    def test_observer_memory_failure_cannot_turn_physical_success_into_a_failed_write(self):
+        observer = Mock(side_effect=MemoryError('optional mirror allocation'))
+        self.module.set_observer(observer)
+        self.assertTrue(self.module.screen_display('12:34:56'))
+        self.assertEqual(self.module.display_state()['text'], '12:34:56')
+        recovered = []
+        self.module.set_observer(recovered.append)
+        self.assertEqual(recovered[-1]['text'], '12:34:56')
+        self.assertTrue(self.module.screen_display('12:34:57'))
+        self.assertEqual(recovered[-1]['text'], '12:34:57')
+
+    def test_snapshot_allocation_failure_happens_before_any_physical_commit(self):
+        self.assertTrue(self.module.screen_display('12:34:56'))
+        previous = self.module.display_state()
+        self.oled.show = Mock(wraps=self.oled.show)
+        with patch.object(self.module, 'bytes', side_effect=MemoryError, create=True), self.assertRaises(MemoryError):
+            self.module.screen_display('12:34:57')
+        self.oled.show.assert_not_called()
+        self.assertEqual(self.module.display_state(), previous)
+
+    def test_observer_maintenance_interrupt_still_propagates(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.module.set_observer(Mock(side_effect=KeyboardInterrupt))
+
 
 if __name__ == '__main__':
     unittest.main()

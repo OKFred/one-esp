@@ -63,7 +63,10 @@ def set_observer(observer):
     global _observer
     _observer = observer
     if _observer:
-        _observer(display_state())
+        try:
+            _observer(display_state())
+        except MemoryError:
+            pass  # A mirror cannot prevent physical display initialization.
 
 def screen_display(text):
     global _last_text, _last_buffer, oled, _last_init_attempt
@@ -106,11 +109,17 @@ def screen_display(text):
                 break
         oled.text(truncated_text + "...", 0, (max_height // 16 - 1) * 16)
         
+    # Allocate the immutable snapshot before committing the physical write. If
+    # this allocation fails, the old mirror is still a truthful last-success.
+    completed_buffer = bytes(oled.buffer)
     oled.show()
-    _last_buffer = bytes(oled.buffer)
+    _last_buffer = completed_buffer
     _last_text = text
     if _observer:
-        _observer(display_state())
+        try:
+            _observer(display_state())
+        except MemoryError:
+            pass  # The physical write succeeded; USB mirroring may retry later.
     return True
 
 def screen_clear():
