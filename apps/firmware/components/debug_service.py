@@ -23,6 +23,7 @@ PRIORITY_BYTES_PER_SECOND = 2048
 SNAPSHOT_PIN_CHUNK = 6
 SNAPSHOT_INTERVAL_MS = 2000
 PROFILES = {'full': (2, 10), 'lite': (1, 1)}
+OLED_ENCODING_BYTES = 48  # Multiple of three: only the final chunk has padding.
 
 
 def _utf8_size(value):
@@ -116,11 +117,17 @@ class DebugService:
             raise OSError('Incomplete debug frame write')
 
     def _oled_wire_data(self, data):
-        # Only encoded while actually sending. The permanent cache is the same
-        # immutable successful raw buffer owned by screen_display, not base64.
-        encoded = binascii.b2a_base64(data['buffer'], newline=False).decode('utf-8') if data['available'] else ''
+        # Keep buffer last so its empty JSON value can be filled by a small
+        # base64 stream. No complete encoded framebuffer or large JSON exists.
         return {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
-                'buffer': encoded, 'available': data['available'], 'text': data['text']}
+                'available': data['available'], 'text': data['text'], 'buffer': ''}
+
+    def _write_slice(self, value, start, end):
+        # Also bound metadata writes when text contains multi-byte characters.
+        while start < end:
+            stop = min(start + 64, end)
+            self._write_part(value[start:stop])
+            start = stop
 
     def emit(self, event_type, data, priority=False):
         now = self.now()
@@ -128,12 +135,29 @@ class DebugService:
             self._budget_started, self._budget_bytes = now, 0
             self._priority_bytes = 0
         try:
-            wire_data = self._oled_wire_data(data) if event_type == 'oled' else data
+            raw = None
+            if event_type == 'oled':
+                available = data.get('available')
+                raw = data.get('buffer') if available is True else b''
+                if (type(available) is not bool or not isinstance(data.get('text'), str) or
+                        not isinstance(raw, bytes) or (available and len(raw) != 1024)):
+                    self.dropped_events += 1
+                    return False
+                wire_data = self._oled_wire_data(data)
+            else:
+                wire_data = data
             event = {'v': 1, 'deviceId': self.device_id, 'bootId': self.boot_id,
                      'seq': self.seq + 1, 'ts': now, 'type': event_type, 'data': wire_data}
             encoded = json.dumps(event)
             del event, wire_data
             body_size = _utf8_size(encoded)
+            marker = None
+            if raw is not None:
+                marker = encoded.rfind('""')
+                if marker < 0:
+                    self.dropped_events += 1
+                    return False
+                body_size += 4 * ((len(raw) + 2) // 3)
             size = len(WIRE_PREFIX) + body_size + 1
             used = self._priority_bytes if priority else self._budget_bytes
             limit = PRIORITY_BYTES_PER_SECOND if priority else NORMAL_BYTES_PER_SECOND
@@ -152,10 +176,17 @@ class DebugService:
                 self._output_dirty = False
             self._output_dirty = True
             self._write_part(WIRE_PREFIX, len(WIRE_PREFIX))
-            self._write_part(encoded, body_size)
+            if raw is None:
+                self._write_part(encoded, body_size)
+            else:
+                self._write_slice(encoded, 0, marker + 1)
+                for start in range(0, len(raw), OLED_ENCODING_BYTES):
+                    chunk = binascii.b2a_base64(raw[start:start + OLED_ENCODING_BYTES], newline=False).decode('ascii')
+                    self._write_part(chunk, len(chunk))
+                self._write_slice(encoded, marker + 1, len(encoded))
             self._write_part('\n', 1)
             self._output_dirty = False
-        except (OSError, MemoryError):
+        except Exception:
             self.dropped_events += 1
             return False
         self.seq += 1

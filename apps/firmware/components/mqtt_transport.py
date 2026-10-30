@@ -226,6 +226,10 @@ class MqttTransport:
         return acknowledged
 
     @property
+    def connected(self):
+        return self._state == 'connected'
+
+    @property
     def handshaking(self):
         return self._state in ('resolving', 'connecting', 'mqtt_connect')
 

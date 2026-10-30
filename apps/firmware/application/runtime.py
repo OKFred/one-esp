@@ -91,6 +91,9 @@ class DiagnosticRuntime:
         self._sensor_state = 'disabled'
         self._sensor_retry_at = 0
         self._sensor_observation = None
+        self._sensor_interval_ms = 60000
+        self._sensor_gate_until = self.service.now() + 20000
+        self._mqtt_init_stage = 'not_started'
         self.service.hello()
 
     def status(self):
@@ -107,16 +110,21 @@ class DiagnosticRuntime:
             except OSError:
                 pass
         clock_status = self.clock_sync.status()
+        mqtt_status = self.mqtt.status() if self.mqtt else {
+            'state': self._mqtt_state, 'initializationStage': self._mqtt_init_stage}
+        # The ACK already carries the original UUID/time/hash. Avoid duplicating
+        # two large summaries in every one-second USB status frame.
+        mqtt_status.pop('lastSample', None)
         return {'uptimeMs': self.service.now(), 'memFree': gc.mem_free(),
                 'wifi': wifi, 'sensorEnabled': self.sensor is not None,
                 'environment': self.sensor.status() if self.sensor else {
-                    'enabled': False, 'phase': self._sensor_state,
+                    'enabled': self._sensor_requested is True, 'phase': self._sensor_state,
                     'samples': 0, 'failures': 0, 'lastError': None,
                     'readAtMs': None, 'ageMs': None, 'stale': True,
                     'intervalMs': 60000, 'nextReadInMs': 0,
                     'temperatureC': None, 'relativeHumidityPercent': None},
                 'clock': clock_status,
-                'mqtt': self.mqtt.status() if self.mqtt else {'state': self._mqtt_state},
+                'mqtt': mqtt_status,
                 'maintenancePaused': False,
                 'maintenance': {'busy': self.maintenance_busy, 'clockSynced': clock_status['synced'],
                                 'ntpPaused': False,
@@ -410,38 +418,61 @@ class DiagnosticRuntime:
             self.pins.restore_safe_values()
             machine.reset()
 
+    def _load_sensor_options(self):
+        try:
+            import ujson as json
+        except ImportError:
+            import json
+        try:
+            with open(self._sensor_config_path) as stream:
+                raw = stream.read(513)
+        except OSError as error:
+            if error.args and error.args[0] == 2:
+                self._sensor_requested = False
+                return
+            raise
+        if len(raw) > 512:
+            raise ValueError('Sensor configuration is too large')
+        settings = json.loads(raw)
+        if (type(settings) is not dict or any(key not in ('enabled', 'interval_seconds') for key in settings)
+                or type(settings.get('enabled', False)) is not bool):
+            raise ValueError('Invalid sensor configuration')
+        enabled, interval = settings.get('enabled', False), settings.get('interval_seconds', 60)
+        if enabled and (type(interval) is not int or not 5 <= interval <= 3600):
+            raise ValueError('Invalid sensor interval')
+        self._sensor_interval_ms = interval * 1000 if enabled else 60000
+        self._sensor_requested = enabled
+
+    def _sensor_wait_for_mqtt(self):
+        if self.network_state == 'failed' or self.service.now() >= self._sensor_gate_until:
+            return False
+        if self._mqtt_enabled is None:
+            try:
+                self._mqtt_enabled = self._mqtt_enabled_flag()
+            except Exception:
+                return False  # A bad MQTT config must not disable local reads.
+        if not self._mqtt_enabled:
+            return False
+        client = getattr(self.mqtt, 'client', None)
+        if getattr(client, 'connected', False):
+            return False
+        self._sensor_state = 'waiting_resources'
+        return True
+
     def sensor_tick(self):
         if not self.sensor:
             if self._sensor_requested is False or self.service.now() < self._sensor_retry_at:
                 return
-            self._sensor_retry_at = self.service.now() + 30000
             try:
-                try:
-                    import ujson as json
-                except ImportError:
-                    import json
-                try:
-                    with open(self._sensor_config_path) as stream:
-                        raw = stream.read(513)
-                except OSError as error:
-                    if error.args and error.args[0] == 2:
-                        self._sensor_requested = False
-                        return
-                    raise
-                if len(raw) > 512:
-                    raise ValueError('Sensor configuration is too large')
-                settings = json.loads(raw)
-                if (type(settings) is not dict or any(key not in ('enabled', 'interval_seconds') for key in settings)
-                        or type(settings.get('enabled', False)) is not bool):
-                    raise ValueError('Invalid sensor configuration')
-                self._sensor_requested = settings.get('enabled', False)
-                if not self._sensor_requested:
+                if self._sensor_requested is None:
+                    self._load_sensor_options()
+                if not self._sensor_requested or self._sensor_wait_for_mqtt():
                     return
-                interval = settings.get('interval_seconds', 60)
-                if type(interval) is not int or not 5 <= interval <= 3600:
-                    raise ValueError('Invalid sensor interval')
+                # Wi-Fi/TLS reserve native heap first. Config parse temporaries
+                # have left their helper scope before importing the driver.
+                gc.collect()
                 from components.temperature_humidity import TemperatureHumidityReader
-                self.sensor = TemperatureHumidityReader(self.service.now, interval_ms=interval * 1000)
+                self.sensor = TemperatureHumidityReader(self.service.now, interval_ms=self._sensor_interval_ms)
                 for gpio in (14, 15):
                     self.pins.descriptions[gpio].update(
                         mode='uart', owner='RS485 temperature/humidity', source='configured',
@@ -452,6 +483,10 @@ class DiagnosticRuntime:
             except ValueError:
                 self._sensor_requested = False
                 self._sensor_state = 'configuration_error'
+                raise
+            except Exception:
+                self._sensor_retry_at = self.service.now() + 30000
+                self._sensor_state = 'initialization_retry'
                 raise
         observation = self.sensor.tick()
         self.pins.descriptions[13]['value'] = 1 if self.sensor.phase == 'tx' else 0
@@ -482,13 +517,12 @@ class DiagnosticRuntime:
         return self._sensor_observation
 
     def close_sensor(self):
-        if self.sensor is not None:
-            try:
-                self.sensor.close()
-            finally:
-                self.sensor = None
-                self._sensor_requested = False
-                self._sensor_observation = None
+        sensor, self.sensor = self.sensor, None
+        self._sensor_requested = False
+        self._sensor_observation = None
+        self._sensor_state = 'disabled'
+        if sensor is not None:
+            sensor.close()
 
     def _mqtt_enabled_flag(self):
         # ConfigStore already needs JSON. This short-lived parse retains only
@@ -615,7 +649,9 @@ class DiagnosticRuntime:
             client = None
             try:
                 gc.collect()
+                self._mqtt_init_stage = 'import_telemetry'
                 from components.mqtt_telemetry import load_config, TemperatureTelemetry
+                self._mqtt_init_stage = 'load_config'
                 config = load_config(self._mqtt_config_path)
                 if not config or not config.get('enabled'):
                     self._mqtt_enabled = False
@@ -624,15 +660,19 @@ class DiagnosticRuntime:
                     self._restore_mqtt_gc_threshold()
                     gc.collect()
                     return
+                self._mqtt_init_stage = 'import_transport'
                 from components.mqtt_transport import MqttTransport
+                self._mqtt_init_stage = 'construct_client'
                 client = MqttTransport(config, self.service.now)
                 publisher_args = {'logger': self.service.log}
                 if self._sensor_requested:
                     publisher_args['sample_provider'] = self._sensor_sample
+                self._mqtt_init_stage = 'construct_publisher'
                 publisher = TemperatureTelemetry(config, client, self.service.now, **publisher_args)
                 del config
                 gc.collect()
                 self.mqtt = publisher
+                self._mqtt_init_stage = 'ready'
                 self._mqtt_initialized = True
                 self._mqtt_retry_delay = MQTT_INIT_RETRY_MS
                 self._set_mqtt_gc_threshold()
@@ -659,7 +699,7 @@ class DiagnosticRuntime:
         # through for mpremote and deliberate maintenance.
         self._run_stage('usb', self.poll_commands)
         self._run_stage('sensor', self.sensor_tick)
-        if self.sensor is not None and self.sensor.phase == 'tx':
+        if self.sensor is not None and self.sensor.phase in ('draining', 'tx'):
             # Four UART bytes take about 4.2ms. Receive before a fast reply;
             # OLED and TLS wait at most the driver's 100ms TX deadline.
             self._run_stage('restart', self._restart_step)
@@ -681,7 +721,7 @@ class DiagnosticRuntime:
         while True:
             # Receive network timestamps before I2C/USB output adds latency.
             self.tick_once()
-            time.sleep_ms(1 if self.sensor is not None and self.sensor.phase == 'tx' else 10)
+            time.sleep_ms(1 if self.sensor is not None and self.sensor.phase in ('draining', 'tx') else 10)
 
 
 def run():

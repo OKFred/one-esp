@@ -285,6 +285,171 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.runtime.pins.write(gpio, 1)
 
+    def test_sensor_preload_reserves_mqtt_first_without_waiting_for_environment_ack(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        reader = self.sensor_reader()
+        module_patch, constructor = self.enable_sensor(reader)
+        client = types.SimpleNamespace(connected=False)
+        publisher = Mock()
+        publisher.client = client
+        sampler = Mock(return_value=publisher)
+        with module_patch, patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                                                                  TemperatureTelemetry=sampler),
+                'components.mqtt_transport': types.SimpleNamespace(MqttTransport=Mock(return_value=client))}), \
+                patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
+            self.runtime.sensor_tick()
+            self.assertTrue(self.runtime._sensor_requested)
+            self.assertIsNone(self.runtime.sensor)
+            self.assertEqual(self.runtime.status()['environment']['phase'], 'waiting_resources')
+            self.assertTrue(self.runtime.status()['environment']['enabled'])
+            constructor.assert_not_called()
+            self.module.gc.collect.assert_not_called()
+            self.wlan.connected = True
+            self.runtime.mqtt_tick()
+            self.assertEqual(sampler.call_args.kwargs['sample_provider'], self.runtime._sensor_sample)
+            self.assertIsNone(self.runtime._sensor_sample())
+            self.runtime.sensor_tick()
+            constructor.assert_not_called()
+            # Connection readiness, not a temperature PUBACK, releases the gate.
+            client.connected = True
+            self.runtime.sensor_tick()
+        constructor.assert_called_once()
+        reader.tick.assert_called_once()
+        publisher.tick.assert_called_once_with(True, True)
+
+    def test_sensor_resource_gate_expires_at_twenty_seconds_without_thirty_second_retry_delay(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        reader = self.sensor_reader()
+        module_patch, constructor = self.enable_sensor(reader)
+        with module_patch:
+            for self.clock.value in (0, 1000, 19999):
+                self.runtime.sensor_tick()
+                self.assertIsNone(self.runtime.sensor)
+                self.assertEqual(self.runtime._sensor_retry_at, 0)
+            constructor.assert_not_called()
+            self.clock.value = 20000
+            self.runtime.sensor_tick()
+            constructor.assert_called_once_with(self.runtime.service.now, interval_ms=60000)
+            self.clock.value = 20001
+            self.runtime.sensor_tick()
+        self.assertIs(self.runtime.sensor, reader)
+        constructor.assert_called_once()
+        self.assertEqual(reader.tick.call_count, 2)
+
+    def test_sensor_local_start_is_immediate_without_mqtt_or_after_explicit_network_failure(self):
+        mqtt_path = Path(self.runtime._mqtt_config_path)
+        for case in ('missing', 'disabled', 'network_failed'):
+            with self.subTest(case=case):
+                self.runtime.sensor = None
+                self.runtime._sensor_requested = None
+                self.runtime._sensor_retry_at = 0
+                self.runtime._mqtt_enabled = None
+                self.runtime.network_state = 'failed' if case == 'network_failed' else 'idle'
+                self.clock.value = 0
+                if case == 'missing':
+                    mqtt_path.unlink(missing_ok=True)
+                else:
+                    mqtt_path.write_text(json.dumps({'enabled': case == 'network_failed'}), encoding='utf-8')
+                reader = self.sensor_reader()
+                module_patch, constructor = self.enable_sensor(reader)
+                with module_patch:
+                    self.runtime.sensor_tick()
+                constructor.assert_called_once()
+                reader.tick.assert_called_once()
+                self.assertIs(self.runtime.sensor, reader)
+
+    def test_sensor_close_while_waiting_cancels_future_driver_initialization(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        reader = self.sensor_reader()
+        module_patch, constructor = self.enable_sensor(reader)
+        with module_patch:
+            self.runtime.sensor_tick()
+            self.assertEqual(self.runtime._sensor_state, 'waiting_resources')
+            self.runtime.close_sensor()
+            self.runtime.mqtt = types.SimpleNamespace(client=types.SimpleNamespace(connected=True))
+            self.clock.value = 20000
+            self.runtime.sensor_tick()
+            self.clock.value = 30000
+            self.runtime.sensor_tick()
+        constructor.assert_not_called()
+        self.assertFalse(self.runtime._sensor_requested)
+        self.assertEqual(self.runtime._sensor_state, 'disabled')
+        self.assertIsNone(self.runtime.sensor)
+
+    def test_bad_mqtt_flag_config_does_not_disable_local_environment_collection(self):
+        for raw in ('{bad-json}', '{"enabled":"true"}', '[]'):
+            with self.subTest(raw=raw):
+                self.runtime.sensor = None
+                self.runtime._sensor_requested = None
+                self.runtime._sensor_retry_at = 0
+                self.runtime._mqtt_enabled = None
+                self.clock.value = 0
+                Path(self.runtime._mqtt_config_path).write_text(raw, encoding='utf-8')
+                reader = self.sensor_reader()
+                module_patch, constructor = self.enable_sensor(reader)
+                with module_patch:
+                    self.runtime.sensor_tick()
+                constructor.assert_called_once()
+                reader.tick.assert_called_once()
+                self.assertTrue(self.runtime._sensor_requested)
+                self.assertIs(self.runtime.sensor, reader)
+
+    def test_sensor_config_parse_scope_ends_before_gc_and_heavy_driver_import(self):
+        import inspect
+
+        reader = self.sensor_reader()
+        module_patch, constructor = self.enable_sensor(reader)
+        phases = []
+
+        def parsed_options():
+            phases.append('parse-start')
+            original()
+            phases.append('parse-end')
+
+        def collect():
+            phases.append('collect')
+            self.assertNotIn('_load_sensor_options', [frame.function for frame in inspect.stack()])
+
+        original = self.runtime._load_sensor_options
+        constructor.side_effect = lambda *args, **kwargs: (phases.append('construct') or reader)
+        with module_patch, patch.object(self.runtime, '_load_sensor_options', side_effect=parsed_options), \
+                patch.object(self.module.gc, 'collect', side_effect=collect):
+            self.runtime.sensor_tick()
+        self.assertEqual(phases, ['parse-start', 'parse-end', 'collect', 'construct'])
+
+    def test_runtime_status_keeps_ack_summary_and_safe_initialization_stage_without_duplicate_sample(self):
+        sample = {'messageId': 'example-message', 'readTimeUtc': '2026-10-31T01:02:03Z',
+                  'temperatureC': 28.8, 'relativeHumidityPercent': 48.4,
+                  'payloadSha256': 'a' * 64}
+        original = {'enabled': True, 'samples': 1, 'acknowledged': 1,
+                    'lastSample': dict(sample), 'lastAcknowledged': dict(sample)}
+        publisher = Mock()
+        publisher.status.side_effect = lambda: dict(original)
+        self.runtime.mqtt = publisher
+        first = self.runtime.status()['mqtt']
+        second = self.runtime.status()['mqtt']
+        self.assertNotIn('lastSample', first)
+        self.assertNotIn('lastSample', second)
+        self.assertEqual(first['lastAcknowledged'], sample)
+        self.assertEqual(original['lastSample'], sample)
+        self.assertEqual(publisher.status()['lastSample'], sample)
+        self.runtime.mqtt = None
+        self.wlan.connected = True
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        with patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                                                                  TemperatureTelemetry=Mock()),
+                'components.mqtt_transport': types.SimpleNamespace(
+                    MqttTransport=Mock(side_effect=MemoryError('private-account-and-host')))}), \
+                patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
+            with self.assertRaises(MemoryError):
+                self.runtime.mqtt_tick()
+        state = self.runtime.status()['mqtt']
+        self.assertEqual(state['state'], 'initialization_retry')
+        self.assertEqual(state['initializationStage'], 'construct_client')
+        self.assertNotIn('private', repr(state))
+
     def test_sensor_continues_with_debug_off_and_does_not_force_debug_on(self):
         reader = self.sensor_reader()
         module_patch, _ = self.enable_sensor(reader)
