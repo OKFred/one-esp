@@ -1,3 +1,15 @@
 .env
 __pycache__/
 *.py[cod]
+node_modules/
+dist/
+.venv/
+.env.*
+!.env.example
+coverage/
+playwright-report/
+test-results/
+.vitest/
+*.tsbuildinfo
+*.before-*
+.device-backups/
