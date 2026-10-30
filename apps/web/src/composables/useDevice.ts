@@ -61,12 +61,46 @@ export function useDevice() {
   const age = computed(() =>
     state.value.lastSeen === null ? null : Math.max(0, now.value - state.value.lastSeen),
   );
+  const oledAge = computed(() =>
+    state.value.oled ? Math.max(0, now.value - eventReceivedAt(state.value.oled)) : null,
+  );
+  const samplingPaused = computed(
+    () =>
+      channelConnected.value && state.value.connection.connected && debug.value?.enabled === false,
+  );
   const stale = computed(
-    () => !state.value.connection.connected || (age.value !== null && age.value > 10000),
+    () =>
+      !channelConnected.value ||
+      !state.value.connection.connected ||
+      (!samplingPaused.value && age.value !== null && age.value > 10000),
   );
   const received = new Map<string, number>();
   function eventReceivedAt(event: DeviceEvent) {
     return received.get(event.type) ?? state.value.lastSeen ?? now.value;
+  }
+
+  function acceptSnapshot(snapshot: BridgeState) {
+    received.clear();
+    const events = [
+      snapshot.hello,
+      snapshot.status,
+      snapshot.oled,
+      snapshot.pins,
+      snapshot.debug,
+      snapshot.metrics,
+    ].filter((event): event is DeviceEvent => !!event);
+    const currentBoot =
+      snapshot.hello?.bootId ?? snapshot.status?.bootId ?? snapshot.metrics?.bootId;
+    const current = events.filter((event) => !currentBoot || event.bootId === currentBoot);
+    const latestTick = Math.max(0, ...current.map((event) => event.ts));
+    // A cached bridge snapshot may contain an older OLED frame than its latest
+    // status/metrics event. Preserve that age rather than restarting it at zero.
+    for (const event of current)
+      received.set(
+        event.type,
+        (snapshot.lastSeen ?? Date.now()) - Math.max(0, latestTick - event.ts),
+      );
+    state.value = { ...snapshot, metrics: snapshot.metrics ?? null };
   }
 
   function rejectPending(reason: string) {
@@ -131,8 +165,7 @@ export function useDevice() {
           if (bootId.value && snapshot.hello?.bootId && snapshot.hello.bootId !== bootId.value) {
             rejectPending('设备会话已变化，请重新操作');
           }
-          state.value = { ...snapshot, metrics: snapshot.metrics ?? null };
-          received.clear();
+          acceptSnapshot(snapshot);
         } else if (packet.type === 'event') acceptEvent(packet.data as DeviceEvent);
         else if (packet.type === 'connection') {
           const connection = packet.data as BridgeState['connection'];
@@ -140,6 +173,7 @@ export function useDevice() {
             connection.port !== state.value.connection.port ||
             connection.mode !== state.value.connection.mode;
           if (!connection.connected || changed) rejectPending('设备连接已变化，命令已取消');
+          if (changed) received.clear();
           state.value = changed
             ? { ...createBridgeState(), connection }
             : { ...state.value, connection, ...(!connection.connected ? { metrics: null } : {}) };
@@ -190,7 +224,7 @@ export function useDevice() {
     error.value = '';
     try {
       await request(path, body);
-      state.value = await request<BridgeState>('/state');
+      acceptSnapshot(await request<BridgeState>('/state'));
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : '连接操作失败';
     } finally {
@@ -281,6 +315,8 @@ export function useDevice() {
     bootId,
     deviceId,
     age,
+    oledAge,
+    samplingPaused,
     stale,
     refreshPorts,
     command,

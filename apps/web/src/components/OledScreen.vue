@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { decodeOledPixels } from '@one-esp/protocol';
 import type { OledData } from '../types';
 
-const props = defineProps<{ frame?: OledData; stale?: boolean }>();
+const props = defineProps<{ frame?: OledData; stale?: boolean; paused?: boolean }>();
 const canvas = ref<HTMLCanvasElement>();
 const decodeError = ref('');
 const description = computed(
@@ -40,7 +40,7 @@ watch(() => props.frame, draw);
 </script>
 
 <template>
-  <div class="oled-assembly" :class="{ 'oled-stale': stale }">
+  <div class="oled-assembly" :class="{ 'oled-stale': stale && !paused }">
     <div class="oled-mount oled-mount-top"><i></i><span>SSD1306 · 0.96″ OLED</span><i></i></div>
     <div class="oled-glass">
       <canvas ref="canvas" width="128" height="64" role="img" :aria-label="description"></canvas>
@@ -55,6 +55,7 @@ watch(() => props.frame, draw);
   </div>
   <p class="oled-caption" aria-live="polite">
     <span v-if="decodeError" class="tone-warning">{{ decodeError }}</span>
+    <span v-else-if="paused && frame">采集已暂停 · 显示最后快照，可开启调试或获取快照</span>
     <span v-else-if="stale && frame">最后一帧 · 当前数据已过期</span>
     <span v-else>同步固件帧缓冲 · 像素原样显示</span>
   </p>

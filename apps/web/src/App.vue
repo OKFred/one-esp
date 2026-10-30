@@ -33,6 +33,7 @@ import ClockQuality from './components/ClockQuality.vue';
 import SystemMetrics from './components/SystemMetrics.vue';
 import { useDevice } from './composables/useDevice';
 import { configValuesForSave, createConfigForm, readConfigValues } from './config';
+import { debugCommandArgs, debugProfileLimits, normalizeDebugSettings } from './debug-settings';
 import type { PinData } from './types';
 
 const {
@@ -50,7 +51,8 @@ const {
   deviceUptimeMs,
   pins,
   deviceId,
-  age,
+  oledAge,
+  samplingPaused,
   stale,
   refreshPorts,
   connect,
@@ -66,6 +68,7 @@ const profile = ref<'full' | 'lite'>('full');
 const ttl = ref(600);
 const oledFps = ref(2);
 const gpioHz = ref(10);
+const profileLimits = computed(() => debugProfileLimits[profile.value]);
 const logLevel = ref('all');
 const paused = ref(false);
 const pausedLogs = shallowRef<DeviceEvent[]>([]);
@@ -171,11 +174,15 @@ const visibleLogs = computed(() =>
   ),
 );
 const screenAge = computed(() =>
-  age.value === null
-    ? '尚无数据'
-    : age.value < 1000
-      ? '刚刚更新'
-      : `${Math.floor(age.value / 1000)} 秒前更新`,
+  !state.value.connection.connected || !channelConnected.value
+    ? '设备未连接'
+    : samplingPaused.value
+      ? '采集已暂停'
+      : oledAge.value === null
+        ? '尚无数据'
+        : oledAge.value < 1000
+          ? '刚刚更新'
+          : `${Math.floor(oledAge.value / 1000)} 秒前更新`,
 );
 const firmwareVersion = computed(() => String(state.value.hello?.data.firmware ?? '等待识别'));
 const formatUptime = (milliseconds: number | undefined) => {
@@ -189,10 +196,15 @@ watch(ports, (value) => {
   if (!selectedPort.value && value[0]) selectedPort.value = value[0].path;
 });
 watch(
-  () => debug.value?.profile,
-  (value) => {
-    if (value) profile.value = value;
+  [() => debug.value?.profile, () => debug.value?.oledFps, () => debug.value?.gpioHz],
+  ([value, fps, hz]) => {
+    if (!value) return;
+    const settings = normalizeDebugSettings(value, fps, hz);
+    profile.value = settings.profile;
+    oledFps.value = settings.oledFps;
+    gpioHz.value = settings.gpioHz;
   },
+  { immediate: true },
 );
 watch(paused, (value) => {
   if (value) pausedLogs.value = [...state.value.logs];
@@ -214,19 +226,21 @@ watch(configOpen, (value) => {
 });
 
 function changeProfile(value: unknown) {
-  profile.value = value === 'lite' ? 'lite' : 'full';
-  oledFps.value = profile.value === 'full' ? 2 : 1;
-  gpioHz.value = profile.value === 'full' ? 10 : 1;
+  const settings = normalizeDebugSettings(value);
+  profile.value = settings.profile;
+  oledFps.value = settings.oledFps;
+  gpioHz.value = settings.gpioHz;
 }
 
 async function setDebug(enabled: boolean | string | number) {
-  await perform('debug.set', {
-    enabled: !!enabled,
-    profile: profile.value,
-    ttlSeconds: ttl.value,
-    oledFps: oledFps.value,
-    gpioHz: gpioHz.value,
-  });
+  const args = debugCommandArgs(!!enabled, profile.value, oledFps.value, gpioHz.value, ttl.value);
+  if (args.enabled) {
+    profile.value = args.profile;
+    oledFps.value = args.oledFps;
+    gpioHz.value = args.gpioHz;
+    ttl.value = args.ttlSeconds;
+  }
+  await perform('debug.set', args);
 }
 
 async function openConfig() {
@@ -468,13 +482,19 @@ function clearVisibleLogs() {
                 <span :class="['freshness', { expired: stale }]"><i></i>{{ screenAge }}</span>
               </div>
               <div class="display-content">
-                <OledScreen :frame="oled" :stale="stale" />
+                <OledScreen :frame="oled" :stale="stale" :paused="samplingPaused" />
                 <ClockQuality v-if="status?.clock" :clock="status.clock" />
               </div>
               <div class="display-toolbar">
                 <span class="mono"
                   >{{ debug?.oledFps ?? '—' }} FPS LIMIT <span class="toolbar-dot">·</span> 128 × 64
                   PX</span
+                ><AButton
+                  v-if="samplingPaused"
+                  size="small"
+                  :disabled="!clientReady || pendingCount > 0"
+                  @click="setDebug(true)"
+                  >开启实时采集</AButton
                 ><AButton
                   size="small"
                   :disabled="!clientReady || pendingCount > 0"
@@ -618,7 +638,7 @@ function clearVisibleLogs() {
                       id="oled-fps"
                       v-model:value="oledFps"
                       :min="0.2"
-                      :max="2"
+                      :max="profileLimits.oledFps"
                       :step="0.5"
                       aria-label="屏幕帧率"
                     />
@@ -628,8 +648,9 @@ function clearVisibleLogs() {
                     ><AInputNumber
                       id="gpio-hz"
                       v-model:value="gpioHz"
-                      :min="1"
-                      :max="10"
+                      :min="0.2"
+                      :max="profileLimits.gpioHz"
+                      :step="0.2"
                       aria-label="GPIO 采样频率"
                     />
                   </div>

@@ -13,7 +13,7 @@ describe('OLED display', () => {
     wrapper.unmount();
   });
 
-  it('renders received pixels at native resolution and marks stale data', () => {
+  it('renders pixels and distinguishes paused snapshots from stale telemetry', async () => {
     let output: ImageData | undefined;
     const context = {
       createImageData: (width: number, height: number) => ({
@@ -50,6 +50,10 @@ describe('OLED display', () => {
     expect(output?.data.slice(0, 4)).toEqual(new Uint8ClampedArray([235, 224, 73, 255]));
     expect(output?.data.slice(4, 8)).toEqual(new Uint8ClampedArray([3, 8, 10, 255]));
     expect(wrapper.text()).toContain('当前数据已过期');
+    await wrapper.setProps({ paused: true });
+    expect(wrapper.text()).toContain('采集已暂停 · 显示最后快照');
+    expect(wrapper.text()).not.toContain('当前数据已过期');
+    expect(wrapper.find('.oled-assembly').classes()).not.toContain('oled-stale');
     expect(wrapper.find('canvas').attributes('aria-label')).toBe('Check password');
     wrapper.unmount();
   });

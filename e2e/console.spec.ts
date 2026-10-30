@@ -138,3 +138,51 @@ for (const viewport of [
     expect(errors, 'browser console and uncaught errors').toEqual([]);
   });
 }
+
+test('restores a paused LITE session and resumes from the screen action', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectScenario(page, '正常启动');
+  const profile = page.getByRole('combobox', { name: '采集档位', exact: true });
+  await profile.focus();
+  await profile.press('ArrowDown');
+  await page
+    .locator('.ant-select-item-option-content')
+    .getByText('LITE · 轻量采集', { exact: true })
+    .click();
+  await page.getByRole('button', { name: '应用参数 / 续期', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('设备已确认操作');
+  const debugSwitch = page.getByRole('switch', { name: '开启调试采集', exact: true });
+  await debugSwitch.click();
+  await expect(debugSwitch).not.toBeChecked();
+  await page.reload();
+  await expect(page.getByRole('spinbutton', { name: '屏幕帧率', exact: true })).toHaveAttribute(
+    'aria-valuenow',
+    '1',
+  );
+  await expect(
+    page.getByRole('spinbutton', { name: 'GPIO 采样频率', exact: true }),
+  ).toHaveAttribute('aria-valuenow', '1');
+  await expect(page.getByRole('spinbutton', { name: '屏幕帧率', exact: true })).toHaveAttribute(
+    'aria-valuemax',
+    '1',
+  );
+  await expect(
+    page.getByText('采集已暂停 · 显示最后快照，可开启调试或获取快照', { exact: true }),
+  ).toBeVisible();
+  const outgoing = page.waitForRequest(
+    (request) =>
+      request.url().endsWith('/api/command') && request.postDataJSON()?.command === 'debug.set',
+  );
+  await page.getByRole('button', { name: '开启实时采集', exact: true }).click();
+  expect((await outgoing).postDataJSON().args).toMatchObject({
+    enabled: true,
+    profile: 'lite',
+    oledFps: 1,
+    gpioHz: 1,
+  });
+  await expect(debugSwitch).toBeChecked();
+  await expect(page.getByRole('region', { name: '设备资源指标' })).toContainText('低频采集中');
+  await expect(page.getByRole('button', { name: '开启实时采集', exact: true })).toHaveCount(0);
+  await assertNoPageOverflow(page);
+});
