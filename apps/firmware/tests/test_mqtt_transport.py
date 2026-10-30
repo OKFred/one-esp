@@ -140,6 +140,95 @@ class MqttTransportTests(unittest.TestCase):
         self.client.tick(True, True)
         return payload
 
+    def configure_context(self):
+        context = types.SimpleNamespace(verify_mode=None, load_verify_locations=Mock(),
+                                        wrap_socket=Mock())
+        context.wrap_socket.side_effect = lambda *args, **kwargs: self.streams[
+            len(context.wrap_socket.call_args_list) - 1]
+        self.ssl.SSLContext = Mock(return_value=context)
+        self.ssl.PROTOCOL_TLS_CLIENT = 0
+        self.client = MqttTransport(self.config, self.clock.now, self.sockets, self.ssl,
+                                    self.resolver, lambda: self.poll, collect=self.collect)
+        return context
+
+    def test_context_parses_ca_once_and_keeps_strict_options_across_reconnect(self):
+        context = self.configure_context()
+        self.ssl.SSLContext.assert_called_once_with(0)
+        context.load_verify_locations.assert_called_once_with(cadata=b'unit-ca-der')
+        self.assertEqual(context.verify_mode, self.ssl.CERT_REQUIRED)
+        self.connect()
+        payload = self.publish(b'{"sample":"original bytes"}')
+        original = self.streams[0].writes[-1]
+        self.client.close()
+        self.assertIs(self.client._ssl_context, context)
+        self.assertIs(self.client._pending[1], payload)
+        _, stream = self.add_connection()
+        self.connect(stream)
+        self.client.tick(True, True)
+        retry = stream.writes[-1]
+        self.assertEqual(retry[0], 0x3A)
+        self.assertEqual(retry[1:], original[1:])
+        self.assertEqual(context.wrap_socket.call_count, 2)
+        for call in context.wrap_socket.call_args_list:
+            self.assertEqual(call.kwargs, {'server_hostname': 'broker.example.test',
+                                           'do_handshake_on_connect': False})
+        context.load_verify_locations.assert_called_once()
+        self.ssl.SSLContext.assert_called_once()
+        self.ssl.wrap_socket.assert_not_called()
+        stream.reads = [PUBACK]
+        self.client.tick(True, True)
+        self.assertTrue(self.client.take_ack())
+
+    def test_supported_context_needs_no_global_wrap_function(self):
+        context = self.configure_context()
+        del self.ssl.wrap_socket
+        self.client = MqttTransport(self.config, self.clock.now, self.sockets, self.ssl,
+                                    self.resolver, lambda: self.poll, collect=self.collect)
+        self.connect()
+        self.assertEqual(context.verify_mode, 2)
+        self.assertTrue(self.client.connected)
+
+    def test_context_setup_or_ca_errors_never_fall_back_to_legacy_wrap(self):
+        for failure_at in ('construction', 'ca', 'verification'):
+            with self.subTest(failure_at=failure_at):
+                self.setUp()
+                context = types.SimpleNamespace(verify_mode=None, load_verify_locations=Mock(),
+                                                wrap_socket=Mock())
+                self.ssl.SSLContext = Mock(return_value=context)
+                self.ssl.PROTOCOL_TLS_CLIENT = 0
+                if failure_at == 'construction':
+                    self.ssl.SSLContext.side_effect = OSError(errno.ENOMEM, 'private-unit-secret')
+                elif failure_at == 'ca':
+                    context.load_verify_locations.side_effect = ValueError('private-unit-secret')
+                else:
+                    class IgnoredVerification:
+                        load_verify_locations = Mock()
+                        wrap_socket = Mock()
+                        @property
+                        def verify_mode(self):
+                            return 0
+                        @verify_mode.setter
+                        def verify_mode(self, value):
+                            pass
+                    context = IgnoredVerification()
+                    self.ssl.SSLContext.return_value = context
+                with self.assertRaises((OSError, ValueError)):
+                    MqttTransport(self.config, self.clock.now, self.sockets, self.ssl,
+                                  self.resolver, lambda: self.poll, collect=self.collect)
+                self.ssl.wrap_socket.assert_not_called()
+                self.sockets.socket.assert_not_called()
+
+    def test_session_wrap_failure_keeps_context_and_never_uses_legacy_path(self):
+        context = self.configure_context()
+        context.wrap_socket.side_effect = ValueError('private-unit-secret')
+        self.client.tick(True, True)
+        self.assertEqual(self.client.status()['phase'], 'backoff')
+        self.assertIs(self.client._ssl_context, context)
+        context.load_verify_locations.assert_called_once()
+        self.ssl.wrap_socket.assert_not_called()
+        self.assertTrue(self.raws[0].closed)
+        self.assertNotIn('private-unit-secret', repr(self.client.status()))
+
     def test_waits_for_network_and_valid_time_without_creating_a_socket(self):
         self.client.tick(False, False)
         self.assertEqual(self.client.status()['phase'], 'waiting_network')
@@ -428,7 +517,35 @@ class MqttTransportTests(unittest.TestCase):
         self.client.tick(True, True)
         self.assertEqual(self.client.status()['lastFailure'], {
             'phase': 'mqtt_connect', 'operation': 'write', 'errorType': 'ValueError',
-            'errno': None, 'reason': 'certificate_verify'})
+            'errno': None, 'reason': 'certificate_verify_other'})
+        self.assertNotIn('private-unit-secret', repr(self.client.status()))
+
+    def test_fixed_certificate_reasons_are_distinct_and_never_include_free_text(self):
+        cases = (
+            ('The certificate validity has expired', 'expired'),
+            ('The certificate validity starts in the future', 'future'),
+            ('The certificate Common Name (CN) does not match with the expected CN', 'cn_mismatch'),
+            ('The certificate is not correctly signed by the trusted CA', 'not_trusted'),
+            ('Certificate was missing', 'missing'),
+            ('The certificate has been revoked (is on a CRL)', 'other'),
+            ('The CRL is expired', 'expired'),
+            ('The CRL is from the future', 'future'),
+        )
+        for message, suffix in cases:
+            with self.subTest(suffix=suffix, message=message):
+                self.setUp()
+                self.client.tick(True, True)
+                self.streams[0].reads = [ValueError('\n' + message + '\nprivate-unit-secret')]
+                self.client.tick(True, True)
+                self.assertEqual(self.client.status()['lastFailure']['reason'], 'certificate_verify_' + suffix)
+                self.assertNotIn('private-unit-secret', repr(self.client.status()))
+                self.assertNotIn(message, repr(self.client.status()))
+
+    def test_modified_known_certificate_text_is_not_misclassified_as_exact_reason(self):
+        self.client.tick(True, True)
+        self.streams[0].reads = [ValueError('The certificate validity has expired for private-unit-secret')]
+        self.client.tick(True, True)
+        self.assertEqual(self.client.status()['lastFailure']['reason'], 'certificate_verify_other')
         self.assertNotIn('private-unit-secret', repr(self.client.status()))
 
     def test_read_failure_preserves_only_numeric_errno(self):

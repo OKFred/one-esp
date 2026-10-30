@@ -44,6 +44,32 @@ def _error_number(error):
     return number if number is not None else (error.args[0] if error.args else None)
 
 
+def _certificate_reason(message):
+    # Only recognize fixed mbedTLS verify-info text. Never retain subjects,
+    # hostnames or any other free-form exception content in diagnostics.
+    certificate = False
+    for line in message.split('\n'):
+        line = line.strip()
+        if line in ('The certificate validity has expired', 'The CRL is expired'):
+            return 'certificate_verify_expired'
+        if line in ('The certificate validity starts in the future', 'The CRL is from the future'):
+            return 'certificate_verify_future'
+        if line == 'The certificate Common Name (CN) does not match with the expected CN':
+            return 'certificate_verify_cn_mismatch'
+        if line in ('The certificate is not correctly signed by the trusted CA',
+                    'The CRL is not correctly signed by the trusted CA'):
+            return 'certificate_verify_not_trusted'
+        if line == 'Certificate was missing':
+            return 'certificate_verify_missing'
+        if (line.startswith('The certificate ') or line.startswith('The CRL ') or
+                line.startswith('Usage does not match the ') or
+                line in ('Certificate verification was skipped',
+                         'Other reason (can be used by verify callback)',
+                         'Unknown reason (this should not happen)')):
+            certificate = True
+    return 'certificate_verify_other' if certificate else None
+
+
 def _failure_details(phase, operation, reason, error):
     # Exception messages may include private values. Retain only fixed labels
     # and a numeric errno; even an exception's class name needs an allowlist.
@@ -62,11 +88,6 @@ def _failure_details(phase, operation, reason, error):
             if isinstance(message, str):
                 if message == 'invalid cert':
                     reason = 'invalid_cert'
-                elif (message.startswith('\nThe certificate ') or
-                      message.startswith('The certificate ') or
-                      message.startswith('\nThe CRL ') or
-                      message.startswith('The CRL ')):
-                    reason = 'certificate_verify'
                 elif message == 'MQTT connection refused':
                     reason = 'connack_refused'
                 elif message in ('Unexpected MQTT CONNACK', 'Unexpected MQTT PINGRESP',
@@ -75,6 +96,10 @@ def _failure_details(phase, operation, reason, error):
                                   'Invalid MQTT remaining length', 'MQTT packet is too large',
                                   'Invalid MQTT packet length', 'MQTT receive flood'):
                     reason = 'malformed_packet'
+                else:
+                    certificate_reason = _certificate_reason(message)
+                    if certificate_reason is not None:
+                        reason = certificate_reason
     return {'phase': phase, 'operation': operation, 'errorType': error_type,
             'errno': number, 'reason': reason}
 
@@ -162,7 +187,11 @@ class MqttTransport:
                 import ussl as ssl
             ssl_module = ssl
         self._ssl = ssl_module
-        if not hasattr(ssl_module, 'CERT_REQUIRED') or not callable(getattr(ssl_module, 'wrap_socket', None)):
+        context_type = getattr(ssl_module, 'SSLContext', None)
+        context_protocol = getattr(ssl_module, 'PROTOCOL_TLS_CLIENT', None)
+        use_context = callable(context_type) and context_protocol is not None
+        if (not hasattr(ssl_module, 'CERT_REQUIRED') or
+                (not use_context and not callable(getattr(ssl_module, 'wrap_socket', None)))):
             raise ValueError('Verified nonblocking TLS is unavailable')
         host = config.get('server_hostname') or config.get('host')
         ca_data = config.get('ca_data')
@@ -207,6 +236,17 @@ class MqttTransport:
         self._acked = False
         self._ack_count = 0
         self._publish_count = 0
+        self._ssl_context = None
+        if use_context:
+            # Keep the parsed trust chain across sessions. Re-parsing it while
+            # reconnecting would create another certificate allocation peak.
+            # Advertised context support must succeed; errors never downgrade.
+            context = context_type(context_protocol)
+            context.verify_mode = self._ssl.CERT_REQUIRED
+            if context.verify_mode != self._ssl.CERT_REQUIRED:
+                raise ValueError('Verified TLS context is unavailable')
+            context.load_verify_locations(cadata=ca_data)
+            self._ssl_context = context
 
     def publish(self, topic, payload):
         """Accept one immutable payload; keep it through reconnect until PUBACK."""
@@ -311,10 +351,15 @@ class MqttTransport:
         # MicroPython mbedTLS advances the handshake through read/write EAGAIN.
         self._collect_once()
         self._operation = 'wrap'
-        self._stream = self._ssl.wrap_socket(
-            self._raw, cert_reqs=self._ssl.CERT_REQUIRED,
-            cadata=self._config['ca_data'], server_hostname=self._server_hostname,
-            do_handshake=False)
+        if self._ssl_context is not None:
+            self._stream = self._ssl_context.wrap_socket(
+                self._raw, server_hostname=self._server_hostname,
+                do_handshake_on_connect=False)
+        else:
+            self._stream = self._ssl.wrap_socket(
+                self._raw, cert_reqs=self._ssl.CERT_REQUIRED,
+                cadata=self._config['ca_data'], server_hostname=self._server_hostname,
+                do_handshake=False)
         self._stream.setblocking(False)
         self._state = 'mqtt_connect'
         self._deadline = self._now() + SESSION_TIMEOUT_MS

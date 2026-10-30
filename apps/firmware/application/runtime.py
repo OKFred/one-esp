@@ -35,6 +35,10 @@ MQTT_GC_THRESHOLD_BYTES = 8192
 
 class DiagnosticRuntime:
     def __init__(self, mqtt_config_path='.mqtt.json', sensor_config_path='.sensor.json'):
+        self._mqtt_gc_previous = None
+        # Collect temporary diagnostics before split heaps grow into memory
+        # needed by Wi-Fi/TLS. Waiting until MQTT construction is too late.
+        self._set_mqtt_gc_threshold()
         self.config = ConfigStore()
         self.wlan = network.WLAN(network.STA_IF)
         # No Pin.IN/Pin.OUT initialization here: 36 and 39 are input-only pads.
@@ -84,7 +88,6 @@ class DiagnosticRuntime:
         self._mqtt_retry_at = 0
         self._mqtt_retry_delay = MQTT_INIT_RETRY_MS
         self._mqtt_state = 'disabled'
-        self._mqtt_gc_previous = None
         self.sensor = None
         self._sensor_config_path = sensor_config_path
         self._sensor_requested = None
