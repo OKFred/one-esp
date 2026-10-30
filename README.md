@@ -18,7 +18,7 @@ Host Python tools and regression tests use CPython 3.14.2 from `.python-version`
 uv sync --locked
 pnpm test:firmware
 uv run --locked python tools/device.py backup --port COM3
-uv run --locked python tools/device.py upload --port COM3
+uv run --locked python tools/device.py upload --precompile --port COM3
 ```
 
 `pnpm test:firmware` and `pnpm device` run through `uv run --locked`; no virtual-environment activation or global Python packages are needed. The ESP32 continues to run MicroPython 1.22.2.
@@ -28,4 +28,4 @@ uv run --locked python tools/device.py upload --port COM3
 - `apps/web`: Vue 3, Ant Design Vue, offline Iconify, Canvas OLED and SVG pin map.
 - `packages/protocol`: shared validators and state reduction.
 
-Debug defaults off and expires automatically. Sensor acquisition and GPIO outputs are disabled. MQTT / Cloudflare remote debugging are planned, not deployed. Credentials and device backups stay outside Git. See the Chinese guide for hardware upload, checks, and current limits.
+Debug defaults off and expires automatically. Sensor acquisition and GPIO outputs are disabled. Optional [MCU-temperature MQTT telemetry](docs/mqtt-telemetry.md) uses private configuration and runs independently of debug; remote debugging and Cloudflare deployment remain planned. Credentials and device backups stay outside Git. See the Chinese guide for hardware upload, checks, and current limits.
