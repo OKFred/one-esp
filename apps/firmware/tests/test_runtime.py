@@ -193,7 +193,8 @@ class RuntimeTests(unittest.TestCase):
             spec.loader.exec_module(self.module)
         self.output = io.StringIO()
         with patch.object(self.module, 'ConfigStore', return_value=self.config), contextlib.redirect_stdout(self.output):
-            self.runtime = self.module.DiagnosticRuntime(mqtt_config_path=str(path.with_name('.mqtt.json')))
+            self.runtime = self.module.DiagnosticRuntime(mqtt_config_path=str(path.with_name('.mqtt.json')),
+                                                         sensor_config_path=str(path.with_name('.sensor.json')))
         self.display = Mock()
         self.runtime.display = self.display
 
@@ -206,6 +207,260 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual([call.args for call in self.machine.Pin.call_args_list], [(36,), (39,)])
         self.machine.UART.assert_not_called()
         self.assertFalse(self.runtime.status()['sensorEnabled'])
+
+    def sensor_reader(self, observation=None, phase='idle'):
+        reader = Mock()
+        reader.phase = phase
+        reader.tick.return_value = observation
+        reader.reading.return_value = observation
+        reader.status.return_value = {'enabled': True, 'phase': phase, 'stale': observation is None}
+        return reader
+
+    def enable_sensor(self, reader, interval=60):
+        Path(self.runtime._sensor_config_path).write_text(
+            json.dumps({'enabled': True, 'interval_seconds': interval}), encoding='utf-8')
+        constructor = Mock(return_value=reader)
+        return patch.dict(sys.modules, {'components.temperature_humidity':
+                                       types.SimpleNamespace(TemperatureHumidityReader=constructor)}), constructor
+
+    def test_sensor_missing_or_disabled_config_never_imports_or_claims_uart(self):
+        for config in (None, {'enabled': False}):
+            with self.subTest(config=config):
+                path = Path(self.runtime._sensor_config_path)
+                if config is not None:
+                    path.write_text(json.dumps(config), encoding='utf-8')
+                self.runtime._sensor_requested = None
+                self.runtime._sensor_retry_at = 0
+                self.clock.value += 40000
+                with patch.dict(sys.modules, {'components.temperature_humidity': None}):
+                    self.runtime.sensor_tick()
+                    self.clock.value += 60000
+                    self.runtime.sensor_tick()
+                self.assertFalse(self.runtime._sensor_requested)
+                self.assertIsNone(self.runtime.sensor)
+                self.assertFalse(self.runtime.status()['sensorEnabled'])
+                self.assertTrue(self.runtime.status()['environment']['stale'])
+                self.assertNotEqual(self.runtime.pins.descriptions[14]['mode'], 'uart')
+        self.machine.UART.assert_not_called()
+        self.assertEqual([call.args for call in self.machine.Pin.call_args_list], [(36,), (39,)])
+
+    def test_sensor_invalid_or_oversized_configuration_is_fail_closed(self):
+        for raw in ('{bad', '[]', '{"enabled":"true"}', '{"enabled":true,"extra":1}',
+                    '{"enabled":true,"interval_seconds":4}',
+                    '{"enabled":true,"interval_seconds":3601}',
+                    '{"enabled":true,"interval_seconds":true}',
+                    '{"enabled":true,"interval_seconds":5.0}',
+                    '{"enabled":true}' + ' ' * 513):
+            with self.subTest(raw=raw):
+                self.runtime._sensor_requested = None
+                self.runtime._sensor_retry_at = 0
+                self.clock.value += 40000
+                Path(self.runtime._sensor_config_path).write_text(raw, encoding='utf-8')
+                with patch.dict(sys.modules, {'components.temperature_humidity': None}):
+                    with self.assertRaises(ValueError):
+                        self.runtime.sensor_tick()
+                    self.clock.value += 60000
+                    self.runtime.sensor_tick()
+                self.assertFalse(self.runtime._sensor_requested)
+                self.assertIsNone(self.runtime.sensor)
+                self.assertEqual(self.runtime.status()['environment']['phase'], 'configuration_error')
+        self.machine.UART.assert_not_called()
+
+    def test_sensor_enabled_config_constructs_once_and_keeps_output_allowlist_empty(self):
+        reader = self.sensor_reader()
+        module_patch, constructor = self.enable_sensor(reader, interval=15)
+        with module_patch:
+            self.runtime.sensor_tick()
+            self.clock.value += 1000
+            self.runtime.sensor_tick()
+        constructor.assert_called_once_with(self.runtime.service.now, interval_ms=15000)
+        self.assertEqual(reader.tick.call_count, 2)
+        self.assertTrue(self.runtime.status()['sensorEnabled'])
+        self.assertEqual(self.runtime.pins.descriptions[14]['mode'], 'uart')
+        self.assertEqual(self.runtime.pins.descriptions[15]['mode'], 'uart')
+        self.assertEqual(self.runtime.pins.descriptions[13]['mode'], 'output')
+        self.assertEqual(self.runtime.pins.outputs, {})
+        for gpio in (13, 14, 15):
+            self.assertFalse(self.runtime.pins.descriptions[gpio]['writable'])
+            with self.assertRaises(ValueError):
+                self.runtime.pins.write(gpio, 1)
+
+    def test_sensor_continues_with_debug_off_and_does_not_force_debug_on(self):
+        reader = self.sensor_reader()
+        module_patch, _ = self.enable_sensor(reader)
+        self.assertFalse(self.runtime.service.enabled)
+        with module_patch, patch.object(self.runtime, 'poll_commands'), \
+                patch.object(self.runtime, '_network_step'), patch.object(self.runtime, 'maintenance_tick'), \
+                patch.object(self.runtime, 'clock_tick'), patch.object(self.runtime, 'mqtt_tick'), \
+                patch.object(self.runtime, '_restart_step'):
+            self.runtime.tick_once()
+            self.clock.value += 60000
+            self.runtime.tick_once()
+        self.assertEqual(reader.tick.call_count, 2)
+        self.assertFalse(self.runtime.service.enabled)
+
+    def test_sensor_tx_fast_path_keeps_usb_and_restart_but_defers_oled_tls_and_network(self):
+        reader = self.sensor_reader(phase='tx')
+        self.runtime.sensor = reader
+        with patch.object(self.runtime, 'poll_commands') as usb, \
+                patch.object(self.runtime, '_network_step') as network, \
+                patch.object(self.runtime, 'maintenance_tick') as maintenance, \
+                patch.object(self.runtime, 'clock_tick') as oled, \
+                patch.object(self.runtime.service, 'tick') as telemetry, \
+                patch.object(self.runtime, 'mqtt_tick') as mqtt, \
+                patch.object(self.runtime, '_restart_step') as restart:
+            self.runtime.tick_once()
+            usb.assert_called_once()
+            reader.tick.assert_called_once()
+            restart.assert_called_once()
+            for operation in (network, maintenance, oled, telemetry, mqtt):
+                operation.assert_not_called()
+        self.assertEqual(self.runtime.pins.descriptions[13]['value'], 1)
+
+    def test_sensor_rx_phase_does_not_block_other_runtime_stages(self):
+        self.runtime.sensor = self.sensor_reader(phase='rx')
+        with patch.object(self.runtime, 'poll_commands'), \
+                patch.object(self.runtime, '_network_step') as network, \
+                patch.object(self.runtime, 'maintenance_tick') as maintenance, \
+                patch.object(self.runtime, 'clock_tick') as oled, \
+                patch.object(self.runtime.service, 'tick') as telemetry, \
+                patch.object(self.runtime, 'mqtt_tick') as mqtt, \
+                patch.object(self.runtime, '_restart_step'):
+            self.runtime.tick_once()
+            for operation in (network, maintenance, oled, telemetry, mqtt):
+                operation.assert_called_once()
+        self.assertEqual(self.runtime.pins.descriptions[13]['value'], 0)
+
+    def test_sensor_tx_loop_uses_one_millisecond_sleep_then_normal_cadence(self):
+        reader = self.sensor_reader(phase='tx')
+        self.runtime.sensor = reader
+        delays = []
+
+        def sleep(delay):
+            delays.append(delay)
+            if len(delays) == 1:
+                reader.phase = 'rx'
+            else:
+                raise KeyboardInterrupt()
+
+        with patch.object(self.runtime, 'show'), patch.object(self.runtime, 'tick_once'), \
+                patch.object(self.module.time, 'sleep_ms', side_effect=sleep, create=True):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runtime.run()
+        self.assertEqual(delays, [1, 10])
+
+    def test_sensor_without_ntp_captures_real_cpu_but_never_fabricates_utc(self):
+        observation = {'sample': 1, 'readAtMs': 1234, 'temperatureC': 28.8,
+                       'relativeHumidityPercent': 48.4}
+        reader = self.sensor_reader(observation)
+        self.runtime.sensor = reader
+        self.runtime._sensor_observation = {'sample': 0, 'readTimeUtc': 'old'}
+        with patch.object(self.runtime, '_mqtt_clock_ready', return_value=False), \
+                patch.object(self.runtime.metrics, 'capture_temperature', return_value=53.3) as capture, \
+                patch.object(self.module.time, 'gmtime', create=True) as utc:
+            self.runtime.sensor_tick()
+        capture.assert_called_once()
+        utc.assert_not_called()
+        self.assertIsNone(self.runtime._sensor_observation)
+        self.assertIsNone(self.runtime._sensor_sample())
+
+    def test_sensor_observation_keeps_physical_read_time_and_same_read_metrics(self):
+        self.clock.value = 1234
+        observation = {'sample': 7, 'readAtMs': 1234, 'temperatureC': 28.8,
+                       'relativeHumidityPercent': 48.4}
+        reader = self.sensor_reader(observation)
+        self.runtime.sensor = reader
+        with patch.object(self.runtime, '_mqtt_clock_ready', return_value=True), \
+                patch.object(self.runtime.metrics, 'capture_temperature', return_value=53.3) as capture, \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 31, 1, 2, 3), create=True):
+            self.runtime.sensor_tick()
+        expected = {'sample': 7, 'readAtMs': 1234, 'readTimeUtc': '2026-10-31T01:02:03Z',
+                    'metrics': {'temperature_c': 28.8, 'humidity_pct': 48.4,
+                                'cpu_temperature_c': 53.3},
+                    'source': {'driver': 'rs485.ascii.READ'}}
+        self.assertEqual(self.runtime._sensor_sample(), expected)
+        capture.assert_called_once()
+        self.clock.value = 11234
+        with patch.object(self.module.time, 'gmtime', side_effect=AssertionError('must preserve original UTC'), create=True):
+            self.assertEqual(self.runtime._sensor_sample(), expected)
+        reader.tick.return_value = None
+        self.runtime.sensor_tick()
+        capture.assert_called_once()
+
+    def test_sensor_unavailable_cpu_is_omitted_without_fabricating_zero(self):
+        self.runtime.sensor = self.sensor_reader({'sample': 1, 'readAtMs': 0,
+                                                  'temperatureC': 28.8, 'relativeHumidityPercent': 48.4})
+        with patch.object(self.runtime, '_mqtt_clock_ready', return_value=True), \
+                patch.object(self.runtime.metrics, 'capture_temperature', return_value=None), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 31, 1, 2, 3), create=True):
+            self.runtime.sensor_tick()
+        self.assertNotIn('cpu_temperature_c', self.runtime._sensor_sample()['metrics'])
+
+    def test_sensor_failure_or_staleness_never_offers_previous_good_sample(self):
+        self.runtime.sensor = self.sensor_reader()
+        self.runtime._sensor_observation = {'sample': 1, 'readTimeUtc': '2026-10-31T01:02:03Z'}
+        self.assertIsNone(self.runtime._sensor_sample())
+        self.runtime.sensor = None
+        self.assertIsNone(self.runtime._sensor_sample())
+
+    def test_sensor_new_read_processing_failure_does_not_reuse_previous_observation(self):
+        old = {'sample': 1, 'readAtMs': 0, 'readTimeUtc': '2026-10-31T01:02:03Z'}
+        self.runtime._sensor_observation = old
+        self.runtime.sensor = self.sensor_reader({'sample': 2, 'readAtMs': 60000,
+                                                  'temperatureC': 29.1, 'relativeHumidityPercent': 49.0})
+        with patch.object(self.runtime.metrics, 'capture_temperature', side_effect=MemoryError('private')):
+            self.runtime._run_stage('sensor', self.runtime.sensor_tick)
+        self.assertIsNone(self.runtime._sensor_sample())
+
+    def test_sensor_provider_is_installed_when_mqtt_is_enabled_for_sensor_mode(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        self.runtime._sensor_requested = True
+        self.wlan.connected = True
+        publisher = Mock()
+        sampler = Mock(return_value=publisher)
+        with patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                                                                  TemperatureTelemetry=sampler),
+                'components.mqtt_transport': types.SimpleNamespace(MqttTransport=Mock())}), \
+                patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
+            self.runtime.mqtt_tick()
+        self.assertEqual(sampler.call_args.kwargs['sample_provider'], self.runtime._sensor_sample)
+        publisher.tick.assert_called_once_with(True, True)
+
+    def test_sensor_close_clears_provider_even_if_peripheral_cleanup_raises(self):
+        reader = self.sensor_reader()
+        reader.close.side_effect = OSError('private')
+        self.runtime.sensor = reader
+        self.runtime._sensor_observation = {'sample': 1}
+        with self.assertRaises(OSError):
+            self.runtime.close_sensor()
+        self.assertIsNone(self.runtime.sensor)
+        self.assertFalse(self.runtime._sensor_requested)
+        self.assertIsNone(self.runtime._sensor_observation)
+        self.assertIsNone(self.runtime._sensor_sample())
+
+    def test_maintenance_exit_closes_sensor_and_stops_debug_even_if_mqtt_cleanup_fails(self):
+        sensor = self.sensor_reader()
+        self.runtime.sensor = sensor
+        self.runtime.mqtt = Mock()
+        self.runtime.mqtt.close.side_effect = OSError('private')
+        with patch.object(self.module, 'DiagnosticRuntime', return_value=self.runtime), \
+                patch.object(self.runtime, 'run', side_effect=KeyboardInterrupt), \
+                patch.object(self.runtime.service, 'stop') as stop:
+            with self.assertRaises(OSError):
+                self.module.run()
+        sensor.close.assert_called_once()
+        stop.assert_called_once()
+        self.assertIsNone(self.runtime.sensor)
+
+    def test_planned_restart_releases_sensor_before_hardware_reset(self):
+        order = []
+        self.runtime.sensor = self.sensor_reader()
+        self.runtime.sensor.close.side_effect = lambda: order.append('sensor-close')
+        self.machine.reset.side_effect = lambda: order.append('reset')
+        self.runtime.restart_at = 0
+        self.runtime._restart_step()
+        self.assertEqual(order, ['sensor-close', 'reset'])
 
     def test_wifi_password_failure_keeps_usb_commands_alive(self):
         self.runtime.start_wifi(self.config.values)

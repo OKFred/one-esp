@@ -34,7 +34,7 @@ MQTT_GC_THRESHOLD_BYTES = 8192
 
 
 class DiagnosticRuntime:
-    def __init__(self, mqtt_config_path='.mqtt.json'):
+    def __init__(self, mqtt_config_path='.mqtt.json', sensor_config_path='.sensor.json'):
         self.config = ConfigStore()
         self.wlan = network.WLAN(network.STA_IF)
         # No Pin.IN/Pin.OUT initialization here: 36 and 39 are input-only pads.
@@ -85,6 +85,12 @@ class DiagnosticRuntime:
         self._mqtt_retry_delay = MQTT_INIT_RETRY_MS
         self._mqtt_state = 'disabled'
         self._mqtt_gc_previous = None
+        self.sensor = None
+        self._sensor_config_path = sensor_config_path
+        self._sensor_requested = None
+        self._sensor_state = 'disabled'
+        self._sensor_retry_at = 0
+        self._sensor_observation = None
         self.service.hello()
 
     def status(self):
@@ -102,7 +108,13 @@ class DiagnosticRuntime:
                 pass
         clock_status = self.clock_sync.status()
         return {'uptimeMs': self.service.now(), 'memFree': gc.mem_free(),
-                'wifi': wifi, 'sensorEnabled': False,
+                'wifi': wifi, 'sensorEnabled': self.sensor is not None,
+                'environment': self.sensor.status() if self.sensor else {
+                    'enabled': False, 'phase': self._sensor_state,
+                    'samples': 0, 'failures': 0, 'lastError': None,
+                    'readAtMs': None, 'ageMs': None, 'stale': True,
+                    'intervalMs': 60000, 'nextReadInMs': 0,
+                    'temperatureC': None, 'relativeHumidityPercent': None},
                 'clock': clock_status,
                 'mqtt': self.mqtt.status() if self.mqtt else {'state': self._mqtt_state},
                 'maintenancePaused': False,
@@ -243,9 +255,9 @@ class DiagnosticRuntime:
                                                  error='Configuration save failed; reconnecting previous network')
                         self.start_wifi(self.config.values)
                         return
-                self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nSensors disabled')
+                self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nDiagnostics ready')
                 self.schedule_network_jobs()
-                self.service.log('info', 'WiFi connected; sensor acquisition remains disabled')
+                self.service.log('info', 'WiFi connected; diagnostics ready')
                 self.service.emit('status', self.status(), True)
             elif self.service.now() - self.wifi_started >= self.wifi_timeout:
                 status = self.wlan.status()
@@ -266,7 +278,7 @@ class DiagnosticRuntime:
             self.service.log('warn', 'WiFi disconnected; USB diagnostics remain available')
         elif self.network_state == 'reconnecting' and connected:
             self.network_state = 'connected'
-            self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nSensors disabled')
+            self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nDiagnostics ready')
             self.service.log('info', 'WiFi connection restored')
             self.schedule_network_jobs()
 
@@ -394,8 +406,89 @@ class DiagnosticRuntime:
 
     def _restart_step(self):
         if self.restart_at is not None and self.service.now() >= self.restart_at and not self.service._pending_acks:
+            self.close_sensor()
             self.pins.restore_safe_values()
             machine.reset()
+
+    def sensor_tick(self):
+        if not self.sensor:
+            if self._sensor_requested is False or self.service.now() < self._sensor_retry_at:
+                return
+            self._sensor_retry_at = self.service.now() + 30000
+            try:
+                try:
+                    import ujson as json
+                except ImportError:
+                    import json
+                try:
+                    with open(self._sensor_config_path) as stream:
+                        raw = stream.read(513)
+                except OSError as error:
+                    if error.args and error.args[0] == 2:
+                        self._sensor_requested = False
+                        return
+                    raise
+                if len(raw) > 512:
+                    raise ValueError('Sensor configuration is too large')
+                settings = json.loads(raw)
+                if (type(settings) is not dict or any(key not in ('enabled', 'interval_seconds') for key in settings)
+                        or type(settings.get('enabled', False)) is not bool):
+                    raise ValueError('Invalid sensor configuration')
+                self._sensor_requested = settings.get('enabled', False)
+                if not self._sensor_requested:
+                    return
+                interval = settings.get('interval_seconds', 60)
+                if type(interval) is not int or not 5 <= interval <= 3600:
+                    raise ValueError('Invalid sensor interval')
+                from components.temperature_humidity import TemperatureHumidityReader
+                self.sensor = TemperatureHumidityReader(self.service.now, interval_ms=interval * 1000)
+                for gpio in (14, 15):
+                    self.pins.descriptions[gpio].update(
+                        mode='uart', owner='RS485 temperature/humidity', source='configured',
+                        reason='UART1 RX' if gpio == 14 else 'UART1 TX; strapping pin at reset')
+                self.pins.descriptions[13].update(
+                    mode='output', owner='RS485 direction', source='commanded', value=0,
+                    reason='DE and /RE share GPIO13; low receives; no user GPIO writes')
+            except ValueError:
+                self._sensor_requested = False
+                self._sensor_state = 'configuration_error'
+                raise
+        observation = self.sensor.tick()
+        self.pins.descriptions[13]['value'] = 1 if self.sensor.phase == 'tx' else 0
+        if observation is None:
+            return
+        # Timestamp and capture at the physical read, never at a later retry.
+        metrics = {'temperature_c': observation['temperatureC'],
+                   'humidity_pct': observation['relativeHumidityPercent']}
+        cpu = self.metrics.capture_temperature()
+        if cpu is not None:
+            metrics['cpu_temperature_c'] = cpu
+        if not self._mqtt_clock_ready():
+            self._sensor_observation = None
+            return
+        parts = time.gmtime()
+        stamp = '%04d-%02d-%02dT%02d:%02d:%02dZ' % parts[:6]
+        self._sensor_observation = {
+            'sample': observation['sample'], 'readAtMs': observation['readAtMs'],
+            'readTimeUtc': stamp, 'metrics': metrics, 'source': {'driver': 'rs485.ascii.READ'}}
+
+    def _sensor_sample(self):
+        if self.sensor is None or self._sensor_observation is None:
+            return None
+        reading = self.sensor.reading()
+        if (reading is None or reading['sample'] != self._sensor_observation['sample']
+                or reading['readAtMs'] != self._sensor_observation['readAtMs']):
+            return None
+        return self._sensor_observation
+
+    def close_sensor(self):
+        if self.sensor is not None:
+            try:
+                self.sensor.close()
+            finally:
+                self.sensor = None
+                self._sensor_requested = False
+                self._sensor_observation = None
 
     def _mqtt_enabled_flag(self):
         # ConfigStore already needs JSON. This short-lived parse retains only
@@ -533,8 +626,10 @@ class DiagnosticRuntime:
                     return
                 from components.mqtt_transport import MqttTransport
                 client = MqttTransport(config, self.service.now)
-                publisher = TemperatureTelemetry(config, client, self.service.now,
-                                                   logger=self.service.log)
+                publisher_args = {'logger': self.service.log}
+                if self._sensor_requested:
+                    publisher_args['sample_provider'] = self._sensor_sample
+                publisher = TemperatureTelemetry(config, client, self.service.now, **publisher_args)
                 del config
                 gc.collect()
                 self.mqtt = publisher
@@ -550,30 +645,43 @@ class DiagnosticRuntime:
         connected = self.wlan.isconnected()
         self.mqtt.tick(connected, self._mqtt_clock_ready() if connected else False)
 
+    def debug_telemetry_tick(self):
+        client = getattr(self.mqtt, 'client', None)
+        if getattr(client, 'handshaking', False):
+            self.service.tick(quiet=True)
+        else:
+            self.service.tick()
+
     def tick_once(self):
         # Optional network work, serial decoding and display errors must not
         # stop one another or drop the runtime into the REPL. Each failed stage
         # has a bounded retry cadence. KeyboardInterrupt/SystemExit still pass
         # through for mpremote and deliberate maintenance.
         self._run_stage('usb', self.poll_commands)
+        self._run_stage('sensor', self.sensor_tick)
+        if self.sensor is not None and self.sensor.phase == 'tx':
+            # Four UART bytes take about 4.2ms. Receive before a fast reply;
+            # OLED and TLS wait at most the driver's 100ms TX deadline.
+            self._run_stage('restart', self._restart_step)
+            return
         self._run_stage('network', self._network_step)
         self._run_stage('maintenance', self.maintenance_tick)
         self._run_stage('clock', self.clock_tick)
-        self._run_stage('telemetry', self.service.tick)
+        self._run_stage('telemetry', self.debug_telemetry_tick)
         self._run_stage('mqtt', self.mqtt_tick)
         self._run_stage('restart', self._restart_step)
 
     def run(self):
         # The receiver/hello exist before optional display initialization. A
         # failed display import retries at most once per 30 seconds via show().
-        self.show('One ESP\nUSB debug ready\nSensors disabled')
+        self.show('One ESP\nUSB debug ready\nDiagnostics ready')
         self._run_stage('startup', lambda: self.service.log(
             'info', 'Diagnostics ready; private MQTT telemetry is optional'))
         self._wifi_initializing = True
         while True:
             # Receive network timestamps before I2C/USB output adds latency.
             self.tick_once()
-            time.sleep_ms(10)
+            time.sleep_ms(1 if self.sensor is not None and self.sensor.phase == 'tx' else 10)
 
 
 def run():
@@ -591,4 +699,7 @@ def run():
                 try:
                     runtime._restore_mqtt_gc_threshold()
                 finally:
-                    runtime.service.stop()
+                    try:
+                        runtime.close_sensor()
+                    finally:
+                        runtime.service.stop()

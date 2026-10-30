@@ -17,3 +17,5 @@ test-results/
 .mqtt.json.*
 .mqtt-ca.der
 .mqtt-ca.pem
+.sensor.json
+.sensor.json.*

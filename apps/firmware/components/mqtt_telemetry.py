@@ -1,7 +1,8 @@
-"""One bounded MCU-temperature sample, independent of the debug session.
+"""One bounded direct-read temperature sample, independent of debug.
 
 The transport owns QoS 1 retransmission. This sampler retains the original
-envelope until PUBACK and does not claim an environmental temperature reading.
+envelope until PUBACK. The default reads MCU temperature; an optional provider
+supplies fresh environment observations with their original UTC read time.
 Private MQTT configuration is separate from the USB-editable Wi-Fi settings.
 """
 
@@ -169,18 +170,50 @@ def _uuid4(random_bytes):
             text[16:20] + '-' + text[20:])
 
 
-def _utc_stamp(clock):
-    parts = clock.gmtime()
+def _utc_parts_valid(parts):
+    if len(parts) < 6:
+        return False
     year, month, day, hour, minute, second = parts[:6]
     if not all(isinstance(value, int) and not isinstance(value, bool) for value in parts[:6]):
-        raise ValueError('UTC clock unavailable')
+        return False
     if not 2020 <= year <= 9999 or not 1 <= month <= 12:
-        raise ValueError('UTC clock unavailable')
+        return False
     leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
     month_days = (31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-    if not 1 <= day <= month_days[month - 1] or not 0 <= hour < 24 or not 0 <= minute < 60 or not 0 <= second < 60:
+    return (1 <= day <= month_days[month - 1] and 0 <= hour < 24 and
+            0 <= minute < 60 and 0 <= second < 60)
+
+
+def _utc_stamp(clock):
+    parts = clock.gmtime()
+    if not _utc_parts_valid(parts):
         raise ValueError('UTC clock unavailable')
-    return '%04d-%02d-%02dT%02d:%02d:%02dZ' % (year, month, day, hour, minute, second)
+    return '%04d-%02d-%02dT%02d:%02d:%02dZ' % tuple(parts[:6])
+
+
+def _utc_text_valid(value):
+    if not isinstance(value, str) or len(value) not in (20, 22, 23, 24) or value[-1] != 'Z':
+        return False
+    if (value[4] != '-' or value[7] != '-' or value[10] != 'T' or
+            value[13] != ':' or value[16] != ':'):
+        return False
+    if len(value) > 20 and (value[19] != '.' or not all('0' <= char <= '9' for char in value[20:-1])):
+        return False
+    digits = value[:4] + value[5:7] + value[8:10] + value[11:13] + value[14:16] + value[17:19]
+    if not all('0' <= char <= '9' for char in digits):
+        return False
+    return _utc_parts_valid((int(value[:4]), int(value[5:7]), int(value[8:10]),
+                             int(value[11:13]), int(value[14:16]), int(value[17:19])))
+
+
+def _finite(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+        return numeric == numeric and numeric - numeric == 0
+    except (OverflowError, ValueError):
+        return False
 
 
 def _temperature(esp32):
@@ -196,12 +229,18 @@ def _temperature(esp32):
 
 class TemperatureTelemetry:
     def __init__(self, config, client, now_ms, time_module=None,
-                 esp32_module=None, random_bytes=None, logger=None):
+                 esp32_module=None, random_bytes=None, logger=None, sample_provider=None):
         self.config = validate_config(config)
         self.client = client
         self._now = now_ms
         self._clock = time_module or time
-        if esp32_module is None:
+        if sample_provider is not None and not callable(sample_provider):
+            raise ValueError('Invalid MQTT sample provider')
+        self._sample_provider = sample_provider
+        self._provider_last_sample = -1
+        self._provider_last_read_at = -1
+        self._provider_poll_at = 0
+        if esp32_module is None and sample_provider is None:
             try:
                 import esp32
                 esp32_module = esp32
@@ -237,36 +276,81 @@ class TemperatureTelemetry:
         except Exception:
             pass
 
+    def _provider_observation(self, now):
+        observation = self._sample_provider()
+        if type(observation) is not dict:
+            return None
+        sequence, read_at = observation.get('sample'), observation.get('readAtMs')
+        if (type(sequence) is not int or sequence < 0 or type(read_at) is not int or read_at < 0 or
+                sequence <= self._provider_last_sample or read_at <= self._provider_last_read_at or
+                read_at > now or now - read_at > 2 * self._interval_ms):
+            return None
+        stamp = observation.get('readTimeUtc')
+        if not _utc_text_valid(stamp):
+            return None
+        metrics, source = observation.get('metrics'), observation.get('source')
+        if type(metrics) is not dict or type(source) is not dict or source.get('driver') != 'rs485.ascii.READ':
+            return None
+        temperature, humidity = metrics.get('temperature_c'), metrics.get('humidity_pct')
+        if (not _finite(temperature) or not -40 <= temperature <= 125 or
+                not _finite(humidity) or not 0 <= humidity <= 100):
+            return None
+        # Copy only known numeric metrics and fixed provenance. Provider-owned
+        # latest observations may change while one original MQTT payload waits.
+        copied = {'temperature_c': temperature, 'humidity_pct': humidity}
+        origins = {'temperature_c': 'rs485.ascii.READ', 'humidity_pct': 'rs485.ascii.READ'}
+        cpu = metrics.get('cpu_temperature_c')
+        if _finite(cpu):
+            copied['cpu_temperature_c'] = cpu
+            origins['cpu_temperature_c'] = 'esp32.raw_temperature'
+        return (copied, stamp, {'driver': 'rs485.ascii.READ', 'metric_sources': origins}, read_at, sequence)
+
     def _sample(self, now):
-        self._next_sample_at = now + self._interval_ms
+        if self._sample_provider is None:
+            self._next_sample_at = now + self._interval_ms
         try:
-            celsius = _temperature(self._esp32)
-            stamp = _utc_stamp(self._clock)
+            sequence = None
+            if self._sample_provider is None:
+                metrics = {'cpu_temperature_c': _temperature(self._esp32)}
+                stamp, read_at = _utc_stamp(self._clock), now
+                source = {'driver': 'esp32.raw_temperature', 'sensor_location': 'mcu_internal'}
+            else:
+                observation = self._provider_observation(now)
+                if observation is None:
+                    return
+                metrics, stamp, source, read_at, sequence = observation
             envelope = {
                 'schema_version': 2, 'message_id': _uuid4(self._random),
                 'site_id': self.config['site_id'], 'gateway_id': self.config['gateway_id'],
                 'device_id': self.config['device_id'], 'read_time_utc': stamp,
                 'sample_time_utc': None, 'observation_kind': 'direct_read',
-                'quality': 'ok', 'metrics': {'cpu_temperature_c': celsius},
-                'source': {'driver': 'esp32.raw_temperature', 'sensor_location': 'mcu_internal'},
+                'quality': 'ok', 'metrics': metrics, 'source': source,
             }
             payload = json.dumps(envelope).encode('utf-8')
             if len(payload) > MAX_PAYLOAD_BYTES:
                 raise ValueError('Telemetry envelope too large')
             summary = {
                 'messageId': envelope['message_id'], 'readTimeUtc': stamp,
-                'cpuTemperatureC': celsius,
+                'cpuTemperatureC': metrics.get('cpu_temperature_c'),
                 'payloadSha256': binascii.hexlify(hashlib.sha256(payload).digest()).decode(),
             }
+            if sequence is not None:
+                summary['temperatureC'] = metrics['temperature_c']
+                summary['relativeHumidityPercent'] = metrics['humidity_pct']
         except Exception:
             self._read_failures += 1
-            self._warn('read', 'MQTT MCU temperature sample unavailable; no telemetry fabricated')
+            self._warn('read', 'MQTT direct-read sample unavailable; no telemetry fabricated')
             return
         self._pending = payload
         self._accepted = False
         self._read_count += 1
-        self._last_read_at = now
+        self._last_read_at = read_at
         self._last_sample = summary
+        if sequence is not None:
+            self._provider_last_sample, self._provider_last_read_at = sequence, read_at
+            # A delayed latest observation retains its original read time, but
+            # must not shorten the configured interval between new envelopes.
+            self._next_sample_at = now + self._interval_ms
 
     def tick(self, connected, time_ready):
         if not self.config['enabled']:
@@ -281,12 +365,18 @@ class TemperatureTelemetry:
                 self._pending = None
                 self._accepted = False
                 self._ack_count += 1
+                self._provider_poll_at = 0
         except Exception:
             self._transport_failures += 1
             self._warn('transport', 'MQTT transport unavailable; pending sample retained')
         now = self._now()
-        if self._pending is None and self._clock_ready and now >= self._next_sample_at:
-            self._sample(now)
+        if self._pending is None and self._clock_ready:
+            if self._sample_provider is not None:
+                if now >= self._next_sample_at and now >= self._provider_poll_at:
+                    self._provider_poll_at = now + PUBLISH_RETRY_MS
+                    self._sample(now)
+            elif now >= self._next_sample_at:
+                self._sample(now)
         if self._pending is not None and not self._accepted and now - self._last_publish_attempt >= PUBLISH_RETRY_MS:
             self._last_publish_attempt = now
             try:
