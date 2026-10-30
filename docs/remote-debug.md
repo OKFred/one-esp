@@ -1,6 +1,6 @@
 # 后续：MQTT 与 Cloudflare
 
-下一期设计，当前没有 MQTT 客户端、Worker 部署或远程鉴权。串口 bridge 使用 Node.js 原生模块；Worker 可复用 Hono 与纯 TypeScript 协议包，不能部署本机串口代码。
+远程调试仍为后续设计。固件已实现独立的 [MCU 温度 MQTT 遥测](mqtt-telemetry.md)，Worker 部署和远程鉴权尚未实现。串口 bridge 使用 Node.js 原生模块；Worker 可复用 Hono 与纯 TypeScript 协议包，不能部署本机串口代码。
 
 ```mermaid
 flowchart LR

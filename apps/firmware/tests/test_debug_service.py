@@ -1,6 +1,8 @@
 """Protocol, session, GPIO and configuration regressions without hardware."""
 
 import json
+import binascii
+import io
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +17,7 @@ from components.debug_service import (DebugService, MAX_LINE_BYTES, MAX_LOG_BYTE
                                       MAX_LOGS, NORMAL_BYTES_PER_SECOND, WIRE_PREFIX)
 from components.device_config import ConfigStore
 from components import device_config
+from components import debug_service
 from components.env_reader import env_reader
 
 
@@ -80,11 +83,15 @@ class DebugServiceTests(unittest.TestCase):
         self.trials.append((command_id, dict(candidate)))
 
     def command(self, name, args=None, identifier=None, boot='boot-a'):
-        return {'v': 1, 'id': identifier or str(len(self.frames)) + name,
+        return {'v': 1, 'id': identifier or str(len(self.wire_frames())) + name,
                 'command': name, 'bootId': boot, 'args': args or {}}
 
+    def wire_frames(self):
+        # Parse the joined UART stream; one frame may use several writer calls.
+        return ''.join(self.frames).splitlines(keepends=True)
+
     def events(self, kind=None):
-        events = [json.loads(line[len(WIRE_PREFIX):]) for line in self.frames]
+        events = [json.loads(line[len(WIRE_PREFIX):]) for line in self.wire_frames()]
         return [event for event in events if kind is None or event['type'] == kind]
 
     def ack(self):
@@ -118,7 +125,7 @@ class DebugServiceTests(unittest.TestCase):
         pin_events = self.events('pins')
         self.assertTrue(all(event['data']['partial'] for event in pin_events))
         self.assertGreater(sum(len(event['data']['pins']) for event in pin_events), 20)
-        self.assertTrue(all(len(line.encode()) <= MAX_LINE_BYTES for line in self.frames))
+        self.assertTrue(all(len(line.encode()) <= MAX_LINE_BYTES for line in self.wire_frames()))
 
     def test_idle_metrics_only_sample_on_explicit_snapshot(self):
         calls = []
@@ -190,9 +197,9 @@ class DebugServiceTests(unittest.TestCase):
                 initial = len(self.events('metrics'))
                 started = self.clock.value
                 for _ in range(1000):
-                    before = len(self.frames)
+                    before = len(self.wire_frames())
                     self.service.tick()
-                    self.assertLessEqual(len(self.frames) - before, 1)
+                    self.assertLessEqual(len(self.wire_frames()) - before, 1)
                     self.clock.advance(50)
                 metrics = self.events('metrics')[initial - 1:]
                 self.assertGreaterEqual(len(metrics), 3)
@@ -388,10 +395,148 @@ class DebugServiceTests(unittest.TestCase):
         for _ in range(5):
             self.service.tick()
         self.assertEqual(len(self.events('oled')), 1)
+
         self.assertEqual(self.events('oled')[0]['data']['text'], 'latest')
         self.clock.advance(1000)
         self.service.tick()
         self.assertEqual(len(self.events('oled')), 1)
+
+    def test_idle_oled_capture_retains_raw_bytes_without_base64_work(self):
+        raw = bytes(range(256)) * 4
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=AssertionError('idle encoding')) as encode:
+            for second in range(20):
+                self.service.capture_oled({'available': True, 'buffer': raw, 'text': '12:34:' + str(second)})
+                self.clock.advance(1000)
+                self.service.tick()
+            encode.assert_not_called()
+        self.assertIs(self.service._oled['buffer'], raw)
+        self.assertEqual(self.frames, [])
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        event = self.events('oled')[-1]
+        self.assertEqual(binascii.a2b_base64(event['data']['buffer']), raw)
+        self.assertIs(self.service._oled['buffer'], raw, 'Wire encoding must not become a retained cache')
+
+    def test_mutable_capture_is_frozen_before_later_rendering_changes(self):
+        raw = bytearray(1024)
+        self.assertTrue(self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'before'}))
+        raw[0] = 255
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        self.assertEqual(binascii.a2b_base64(self.events('oled')[-1]['data']['buffer']), bytes(1024))
+
+    def test_capture_allocation_failure_is_optional_and_recovers_latest_frame(self):
+        raw = bytes(1024)
+        original = self.service._oled
+        with patch.object(self.service, '_redact', side_effect=MemoryError):
+            self.assertFalse(self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'failed'}))
+        self.assertIs(self.service._oled, original)
+        self.assertEqual(self.service.dropped_events, 1)
+        self.assertTrue(self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'recovered'}))
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        self.assertEqual(self.events('oled')[-1]['data']['text'], 'recovered')
+
+    def test_emit_allocation_failures_write_nothing_and_keep_oled_retryable(self):
+        raw = bytes(1024)
+        self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'latest'})
+        for target, attribute in ((debug_service.binascii, 'b2a_base64'), (debug_service.json, 'dumps')):
+            with patch.object(target, attribute, side_effect=MemoryError):
+                self.assertFalse(self.service.emit('oled', self.service._oled))
+            self.assertEqual(self.frames, [])
+            self.assertEqual(self.service.seq, 0)
+            self.assertIs(self.service._oled['buffer'], raw)
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        self.assertEqual(binascii.a2b_base64(self.events('oled')[-1]['data']['buffer']), raw)
+
+    def test_utf8_budget_and_full_writer_counts_match_real_wire_bytes(self):
+        original_dumps = json.dumps
+        for byte_counts in (False, True):
+            for kind, data in (('log', {'level': 'info', 'message': '\u6e29\u5ea6\U0001f600' * 30}),
+                               ('status', {'wifi': {'ssid': '\u5bb6\u5ead\u7f51\u7edc\U0001f600'}})):
+                with self.subTest(byte_counts=byte_counts, kind=kind):
+                    stream = io.StringIO()
+                    def write(part):
+                        stream.write(part)
+                        return len(part.encode('utf-8')) if byte_counts else len(part)
+                    service = DebugService(write, 'test-device', 'boot-a', lambda: {}, self.pins,
+                                           self.config, clock=self.clock, writer_counts_bytes=byte_counts)
+                    event = {'v': 1, 'deviceId': 'test-device', 'bootId': 'boot-a',
+                             'seq': 1, 'ts': 0, 'type': kind, 'data': data}
+                    character_count = len(WIRE_PREFIX) + len(original_dumps(event, ensure_ascii=False)) + 1
+                    service._budget_bytes = NORMAL_BYTES_PER_SECOND - character_count
+                    with patch.object(debug_service.json, 'dumps', side_effect=lambda value: original_dumps(value, ensure_ascii=False)):
+                        self.assertFalse(service.emit(kind, data), 'UTF-8 bytes must not be counted as characters')
+                        self.assertEqual(stream.getvalue(), '')
+                        service._budget_bytes = 0
+                        self.assertTrue(service.emit(kind, data))
+                    line = stream.getvalue()
+                    self.assertEqual(json.loads(line[len(WIRE_PREFIX):])['data'], data)
+                    self.assertEqual(service._budget_bytes, len(line.encode('utf-8')))
+                    self.assertEqual(line.count('\n'), 1)
+
+    def test_short_unicode_byte_write_aborts_without_offsets_and_resynchronizes_next_frame(self):
+        wire, calls = bytearray(), []
+        fail_body = True
+        def write(part):
+            nonlocal fail_body
+            calls.append(part)
+            encoded = part.encode('utf-8')
+            if part.startswith('{') and fail_body:
+                fail_body = False
+                # Native write counts bytes, even if that number happens to
+                # equal the full string's Unicode character count.
+                count = len(part)
+                wire.extend(encoded[:count])
+                return count
+            wire.extend(encoded)
+            return len(encoded)
+        service = DebugService(write, 'test-device', 'boot-a', lambda: {}, self.pins,
+                               self.config, clock=self.clock, writer_counts_bytes=True)
+        original_dumps = json.dumps
+        with patch.object(debug_service.json, 'dumps', side_effect=lambda value: original_dumps(value, ensure_ascii=False)):
+            self.assertFalse(service.emit('log', {'level': 'info', 'message': '\u6e29\u5ea6\U0001f600' * 20}))
+            self.assertEqual(service.seq, 0)
+            self.assertTrue(service.emit('log', {'level': 'info', 'message': 'recovered \u6062\u590d'}))
+        self.assertEqual(calls[2], '\n', 'The next attempt must terminate the damaged line before any new prefix')
+        lines = bytes(wire).splitlines()
+        with self.assertRaises((ValueError, UnicodeError)):
+            json.loads(lines[0][len(WIRE_PREFIX):])
+        self.assertEqual(json.loads(lines[1][len(WIRE_PREFIX):])['data']['message'], 'recovered \u6062\u590d')
+        self.assertEqual(service.seq, 1)
+        self.assertEqual(service.dropped_events, 1)
+        self.assertEqual(sum(part == WIRE_PREFIX for part in calls), 2)
+
+    def test_writer_exception_resynchronizes_and_failed_attempts_still_consume_budget(self):
+        fail_body = True
+        def write(part):
+            nonlocal fail_body
+            if part.startswith('{') and fail_body:
+                fail_body = False
+                self.frames.append(part[:5])
+                raise OSError('partial UART failure')
+            self.frames.append(part)
+        self.service.writer = write
+        self.assertFalse(self.service.emit('status', {'value': 1}))
+        reserved = self.service._budget_bytes
+        self.assertGreater(reserved, 0)
+        self.assertTrue(self.service.emit('status', {'value': 2}))
+        lines = self.wire_frames()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[1][len(WIRE_PREFIX):])['data']['value'], 2)
+        self.assertGreater(self.service._budget_bytes, reserved)
+
+    def test_memory_failure_does_not_poison_snapshot_progress_or_swallow_maintenance_interrupt(self):
+        self.service.snapshot()
+        self.service._snapshot_stage = 3
+        with patch.object(debug_service.json, 'dumps', side_effect=MemoryError):
+            self.service.tick()
+        self.assertTrue(self.service._snapshot_pending)
+        self.drain_snapshot()
+        self.assertIsNone(self.service._snapshot_rows)
+        self.assertEqual(sum(len(event['data']['pins']) for event in self.events('pins')), 34)
+        with patch.object(self.service, '_redact', side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': 'interrupt'})
+        self.service.writer = lambda part: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.service.emit('status', {})
 
     def test_uart_cost_and_noisy_inputs_do_not_starve_the_one_hertz_screen(self):
         class NoisyInput(Pin):
@@ -416,9 +561,9 @@ class DebugServiceTests(unittest.TestCase):
         self.frames.clear()
         last_second = -1
         while self.clock.value < 12000:
-            previous = len(self.frames)
+            previous = len(self.wire_frames())
             self.service.tick()
-            self.assertLessEqual(len(self.frames) - previous, 1)
+            self.assertLessEqual(len(self.wire_frames()) - previous, 1)
             second = self.clock.value // 1000
             if second != last_second:
                 last_second = second
@@ -512,9 +657,9 @@ class DebugServiceTests(unittest.TestCase):
         for _ in range(100):
             if not self.service._snapshot_pending:
                 break
-            previous = len(self.frames)
+            previous = len(self.wire_frames())
             self.service.tick()
-            normal = self.frames[previous:]
+            normal = self.wire_frames()[previous:]
             self.assertLessEqual(len(normal), 1)
             for frame in normal:
                 event = json.loads(frame[len(WIRE_PREFIX):])
@@ -533,7 +678,7 @@ class DebugServiceTests(unittest.TestCase):
             self.service.handle(self.command('config.get', identifier='get-' + str(index)))
         self.assertGreater(len(self.service._pending_acks), 0)
         self.assertEqual(self.frames, [])
-        self.assertLessEqual(sum(len(frame.encode()) for frame in self.frames), 2048)
+        self.assertLessEqual(sum(len(frame.encode()) for frame in self.wire_frames()), 2048)
         self.assertLessEqual(len(self.service._pending_acks), 16)
         for _ in range(9):
             self.clock.advance(1000)
@@ -555,12 +700,12 @@ class DebugServiceTests(unittest.TestCase):
                                       'buffer': bytes([index % 256]) * 1024,
                                       'text': str(index)})
             self.service.log('warn', 'queued log ' + str(index))
-            previous = len(self.frames)
+            previous = len(self.wire_frames())
             if index % 20 == 0:
                 self.service.handle(self.command('config.get', identifier='load-' + str(index)))
-                self.assertEqual(len(self.frames), previous, 'Command handling must only enqueue ACKs')
+                self.assertEqual(len(self.wire_frames()), previous, 'Command handling must only enqueue ACKs')
             self.service.tick()
-            emitted = self.frames[previous:]
+            emitted = self.wire_frames()[previous:]
             self.assertLessEqual(len(emitted), 1, 'One tick must never write consecutive frames')
             for line in emitted:
                 seen.add(json.loads(line[len(WIRE_PREFIX):])['type'])
@@ -573,11 +718,11 @@ class DebugServiceTests(unittest.TestCase):
         self.service.handle(self.command('gpio.write', {'gpio': 25, 'value': 1}))
         self.assertEqual(output.current, 1)
         self.clock.advance(1001)
-        previous = len(self.frames)
+        previous = len(self.wire_frames())
         self.service.tick()
         self.assertFalse(self.service.enabled)
         self.assertEqual(output.current, 0)
-        self.assertEqual(len(self.frames) - previous, 1)
+        self.assertEqual(len(self.wire_frames()) - previous, 1)
         self.assertEqual(self.events()[-1]['type'], 'ack')
 
     def test_host_validation_uses_ascii_dns_names_and_ip_addresses(self):

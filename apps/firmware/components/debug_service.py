@@ -9,6 +9,7 @@ try:
 except ImportError:
     import binascii
 import time
+import sys
 
 
 WIRE_PREFIX = '@one-esp '
@@ -24,11 +25,25 @@ SNAPSHOT_INTERVAL_MS = 2000
 PROFILES = {'full': (2, 10), 'lite': (1, 1)}
 
 
+def _utf8_size(value):
+    # A full-frame .encode() temporarily duplicates the entire JSON allocation.
+    # Small slices preserve exact UTF-8 accounting without a second large block.
+    size = 0
+    for start in range(0, len(value), 64):
+        size += len(value[start:start + 64].encode('utf-8'))
+    return size
+
+
 class DebugService:
     def __init__(self, writer, device_id, boot_id, status_provider, pins,
                  config_store, config_apply=None, restart=None, clock=None,
-                 metrics_provider=None):
+                 metrics_provider=None, writer_counts_bytes=None):
         self.writer = writer
+        # MicroPython stream.write reports UTF-8 bytes; CPython TextIO reports
+        # characters. None-returning writers mean the complete part was written.
+        self._writer_counts_bytes = (getattr(sys.implementation, 'name', '') == 'micropython'
+                                     if writer_counts_bytes is None else writer_counts_bytes)
+        self._output_dirty = False
         self.device_id = device_id
         self.boot_id = boot_id
         self.status_provider = status_provider
@@ -57,7 +72,7 @@ class DebugService:
         self._debug_pending = False
         self._last_pin_rows = {}
         self._oled = {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
-                      'buffer': '', 'available': False, 'text': ''}
+                      'buffer': b'', 'available': False, 'text': ''}
         self._oled_revision = 0
         self._sent_oled_revision = -1
         self._acks = {}
@@ -92,29 +107,57 @@ class DebugService:
                 message = message.replace(secret, '[redacted]')
         return message
 
+    def _write_part(self, part, byte_size=None):
+        expected = (_utf8_size(part) if byte_size is None else byte_size) if self._writer_counts_bytes else len(part)
+        written = self.writer(part)
+        if written is not None and (type(written) is not int or written != expected):
+            # The count's unit is explicit. Never slice/retry a Unicode string
+            # by a byte offset; abandon this line and resync with LF next time.
+            raise OSError('Incomplete debug frame write')
+
+    def _oled_wire_data(self, data):
+        # Only encoded while actually sending. The permanent cache is the same
+        # immutable successful raw buffer owned by screen_display, not base64.
+        encoded = binascii.b2a_base64(data['buffer'], newline=False).decode('utf-8') if data['available'] else ''
+        return {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
+                'buffer': encoded, 'available': data['available'], 'text': data['text']}
+
     def emit(self, event_type, data, priority=False):
         now = self.now()
         if now - self._budget_started >= 1000:
             self._budget_started, self._budget_bytes = now, 0
             self._priority_bytes = 0
-        event = {'v': 1, 'deviceId': self.device_id, 'bootId': self.boot_id,
-                 'seq': self.seq + 1, 'ts': now, 'type': event_type, 'data': data}
-        encoded = WIRE_PREFIX + json.dumps(event) + '\n'
-        size = len(encoded.encode())
-        used = self._priority_bytes if priority else self._budget_bytes
-        limit = PRIORITY_BYTES_PER_SECOND if priority else NORMAL_BYTES_PER_SECOND
-        if size > MAX_LINE_BYTES or used + size > limit:
-            self.dropped_events += 1
-            return False
         try:
-            self.writer(encoded)
-        except OSError:
+            wire_data = self._oled_wire_data(data) if event_type == 'oled' else data
+            event = {'v': 1, 'deviceId': self.device_id, 'bootId': self.boot_id,
+                     'seq': self.seq + 1, 'ts': now, 'type': event_type, 'data': wire_data}
+            encoded = json.dumps(event)
+            del event, wire_data
+            body_size = _utf8_size(encoded)
+            size = len(WIRE_PREFIX) + body_size + 1
+            used = self._priority_bytes if priority else self._budget_bytes
+            limit = PRIORITY_BYTES_PER_SECOND if priority else NORMAL_BYTES_PER_SECOND
+            recovery = 1 if self._output_dirty else 0
+            if size > MAX_LINE_BYTES or used + size + recovery > limit:
+                self.dropped_events += 1
+                return False
+            # Reserve before transmission: even a failed partial write used UART
+            # capacity and must not produce an unbounded burst of damaged lines.
+            if priority:
+                self._priority_bytes += size + recovery
+            else:
+                self._budget_bytes += size + recovery
+            if self._output_dirty:
+                self._write_part('\n', 1)
+                self._output_dirty = False
+            self._output_dirty = True
+            self._write_part(WIRE_PREFIX, len(WIRE_PREFIX))
+            self._write_part(encoded, body_size)
+            self._write_part('\n', 1)
+            self._output_dirty = False
+        except (OSError, MemoryError):
             self.dropped_events += 1
             return False
-        if priority:
-            self._priority_bytes += size
-        else:
-            self._budget_bytes += size
         self.seq += 1
         return True
 
@@ -166,14 +209,27 @@ class DebugService:
         self.log_bytes -= len(entry['message'].encode()) + LOG_OVERHEAD_BYTES
 
     def capture_oled(self, state):
-        available = bool(state.get('available'))
-        raw = state.get('buffer', b'')
-        encoded = binascii.b2a_base64(raw).strip().decode() if available else ''
-        text = self._redact(state.get('text', ''))[:256]
-        if encoded != self._oled['buffer'] or text != self._oled['text'] or available != self._oled['available']:
-            self._oled = {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
-                          'buffer': encoded, 'available': available, 'text': text}
-            self._oled_revision += 1
+        try:
+            available = bool(state.get('available'))
+            raw = state.get('buffer', b'') if available else b''
+            # Normal display snapshots are immutable bytes already. Copy only an
+            # external mutable buffer so later rendering cannot alter our frame.
+            if not isinstance(raw, bytes):
+                raw = bytes(raw)
+            if available and len(raw) != 1024:
+                self.dropped_events += 1
+                return False
+            text = self._redact(state.get('text', ''))[:256]
+            if raw != self._oled['buffer'] or text != self._oled['text'] or available != self._oled['available']:
+                self._oled = {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
+                              'buffer': raw, 'available': available, 'text': text}
+                self._oled_revision += 1
+            return True
+        except MemoryError:
+            # Mirroring is optional; its allocation failure must not make the
+            # successful physical OLED write look failed to the clock runtime.
+            self.dropped_events += 1
+            return False
 
     def snapshot(self):
         # Requests coalesce into one paced snapshot. Never synchronously dump

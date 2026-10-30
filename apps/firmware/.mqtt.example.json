@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "host": "mqtt.example.invalid",
+  "port": 8883,
+  "server_hostname": "mqtt.example.invalid",
+  "ca_file": ".mqtt-ca.der",
+  "username": "example-device-account",
+  "password": "replace-with-private-device-password",
+  "client_id": "example-esp32-client",
+  "site_id": "example-site",
+  "gateway_id": "example-gateway",
+  "device_id": "example-esp32-device",
+  "interval_seconds": 60,
+  "keepalive_seconds": 60
+}

@@ -181,7 +181,7 @@ class RuntimeTests(unittest.TestCase):
             'network': types.SimpleNamespace(WLAN=lambda _: self.wlan, STA_IF=0,
                                             STAT_WRONG_PASSWORD=202, STAT_NO_AP_FOUND=201,
                                             STAT_IDLE=1000, STAT_CONNECTING=1001),
-            'time': self.clock, 'gc': types.SimpleNamespace(mem_free=lambda: 200000),
+            'time': self.clock, 'gc': types.SimpleNamespace(mem_free=lambda: 200000, collect=Mock()),
             'uselect': types.SimpleNamespace(poll=lambda: Mock(), POLLIN=1),
             'components.time_sync': types.SimpleNamespace(get_local_time=self.local_time),
             'components.network_probe': types.SimpleNamespace(NetworkProbe=lambda _: self.probe),
@@ -193,7 +193,7 @@ class RuntimeTests(unittest.TestCase):
             spec.loader.exec_module(self.module)
         self.output = io.StringIO()
         with patch.object(self.module, 'ConfigStore', return_value=self.config), contextlib.redirect_stdout(self.output):
-            self.runtime = self.module.DiagnosticRuntime()
+            self.runtime = self.module.DiagnosticRuntime(mqtt_config_path=str(path.with_name('.mqtt.json')))
         self.display = Mock()
         self.runtime.display = self.display
 
@@ -472,6 +472,7 @@ class RuntimeTests(unittest.TestCase):
                   ('maintenance', self.runtime, 'maintenance_tick'),
                   ('clock', self.runtime, 'clock_tick'),
                   ('telemetry', self.runtime.service, 'tick'),
+                  ('mqtt', self.runtime, 'mqtt_tick'),
                   ('restart', self.runtime, '_restart_step')]
         for failed, target, method in stages:
             with self.subTest(stage=failed), contextlib.ExitStack() as stack:
@@ -628,6 +629,278 @@ class RuntimeTests(unittest.TestCase):
             self.assertFalse(self.runtime._wifi_initializing)
             self.assertEqual(commands.call_count, 3)
             self.assertEqual(clock.call_count, 3)
+
+    def test_mqtt_without_private_configuration_is_disabled_without_importing_transport(self):
+        with patch.object(self.runtime, '_mqtt_enabled_flag', wraps=self.runtime._mqtt_enabled_flag) as probe:
+            for self.clock.value in (0, 1000, 60000):
+                self.runtime.mqtt_tick()
+            probe.assert_called_once()
+        self.assertTrue(self.runtime._mqtt_initialized)
+        self.assertIsNone(self.runtime.mqtt)
+        self.assertEqual(self.runtime.status()['mqtt']['state'], 'disabled')
+
+    def test_disabled_private_mqtt_config_does_not_import_tls_or_transport(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":false}', encoding='utf-8')
+        with patch.dict(sys.modules, {'components.mqtt_telemetry': None, 'components.mqtt_transport': None}):
+            self.runtime.mqtt_tick()
+        self.assertIsNone(self.runtime.mqtt)
+        self.assertEqual(self.runtime._mqtt_state, 'disabled')
+        self.module.gc.collect.assert_not_called()
+
+    def test_mqtt_enabled_flag_is_cached_without_heavy_imports_before_wifi_and_ntp(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        quality = {'synced': False, 'lastSyncAgeMs': None}
+        with patch.dict(sys.modules, {'components.mqtt_telemetry': None, 'components.mqtt_transport': None}), \
+                patch.object(self.runtime, '_mqtt_enabled_flag', wraps=self.runtime._mqtt_enabled_flag) as probe, \
+                patch.object(self.runtime.clock_sync, 'status', side_effect=lambda: quality), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True):
+            for self.clock.value in (0, 100, 1000):
+                self.runtime.mqtt_tick()
+                self.assertEqual(self.runtime._mqtt_state, 'waiting_network')
+            self.wlan.connected = True
+            for self.clock.value in (2000, 3000, 4000):
+                self.runtime.mqtt_tick()
+                self.assertEqual(self.runtime._mqtt_state, 'waiting_clock')
+            probe.assert_called_once()
+        self.assertTrue(self.runtime._mqtt_enabled)
+        self.assertFalse(self.runtime._mqtt_initialized)
+        self.assertIsNone(self.runtime.mqtt)
+        self.module.gc.collect.assert_not_called()
+
+    def test_mqtt_constructs_once_only_after_ready_and_gc_is_not_periodic(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        quality = {'synced': True, 'lastSyncAgeMs': 600001}
+        config = {'enabled': True}
+        client, publisher = Mock(), Mock()
+        load, transport = Mock(return_value=config), Mock(return_value=client)
+        sampler = Mock(return_value=publisher)
+        with patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=load, TemperatureTelemetry=sampler),
+                'components.mqtt_transport': types.SimpleNamespace(MqttTransport=transport)}), \
+                patch.object(self.runtime.clock_sync, 'status', side_effect=lambda: quality), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True), \
+                patch.object(self.module.gc, 'threshold', return_value=-1, create=True) as threshold:
+            self.runtime.mqtt_tick()
+            self.wlan.connected = True
+            self.runtime.mqtt_tick()
+            load.assert_not_called()
+            transport.assert_not_called()
+            quality['lastSyncAgeMs'] = 600000
+            self.runtime.mqtt_tick()
+            for self.clock.value in (10, 1000, 60000, 120000):
+                self.runtime.mqtt_tick()
+            self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,)])
+        load.assert_called_once_with(self.runtime._mqtt_config_path)
+        transport.assert_called_once_with(config, self.runtime.service.now)
+        sampler.assert_called_once_with(config, client, self.runtime.service.now, logger=self.runtime.service.log)
+        self.assertIs(self.runtime.mqtt, publisher)
+        self.assertTrue(self.runtime._mqtt_initialized)
+        self.assertEqual(self.module.gc.collect.call_count, 2)
+        self.assertEqual(publisher.tick.call_count, 5)
+
+    def test_mqtt_gc_threshold_preserves_disabled_original_and_restores_once_on_failure(self):
+        with patch.object(self.module.gc, 'threshold', return_value=-1, create=True) as threshold:
+            self.runtime._set_mqtt_gc_threshold()
+            self.runtime._set_mqtt_gc_threshold()
+            self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,)])
+            self.runtime._mqtt_init_failed(None, False)
+            self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,), (-1,)])
+            self.runtime._restore_mqtt_gc_threshold()
+            self.assertEqual(threshold.call_count, 3)
+            self.assertIsNone(self.runtime._mqtt_gc_previous)
+            self.assertEqual(self.runtime._mqtt_state, 'initialization_retry')
+
+    def test_mqtt_disabled_path_restores_owned_gc_threshold_without_periodic_sets(self):
+        with patch.object(self.module.gc, 'threshold', return_value=16384, create=True) as threshold:
+            self.runtime._set_mqtt_gc_threshold()
+            self.runtime._mqtt_enabled = False
+            for self.clock.value in (0, 1000, 60000):
+                self.runtime.mqtt_tick()
+            self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,), (16384,)])
+        self.module.gc.collect.assert_not_called()
+
+    def test_mqtt_gc_threshold_missing_or_faulty_api_never_blocks_runtime(self):
+        self.runtime._set_mqtt_gc_threshold()
+        self.assertIsNone(self.runtime._mqtt_gc_previous)
+        cases = ([OSError('private-get')],
+                 [-1, OSError('private-set'), None],
+                 [-1, OSError('private-set'), OSError('private-restore')],
+                 [None], [True], [-2])
+        for values in cases:
+            with self.subTest(case=len(values)), \
+                    patch.object(self.module.gc, 'threshold', side_effect=values, create=True):
+                self.runtime._set_mqtt_gc_threshold()
+                self.assertIsNone(self.runtime._mqtt_gc_previous)
+        self.assertNotIn('private', repr(self.runtime.service.logs))
+
+    def test_runtime_cleanup_restores_gc_threshold_even_when_mqtt_close_fails(self):
+        self.runtime.mqtt = Mock()
+        self.runtime.mqtt.close.side_effect = OSError('private-close')
+        with patch.object(self.module.gc, 'threshold', return_value=16384, create=True) as threshold, \
+                patch.object(self.module, 'DiagnosticRuntime', return_value=self.runtime), \
+                patch.object(self.runtime, 'run', side_effect=KeyboardInterrupt), \
+                patch.object(self.runtime.service, 'stop') as stop:
+            self.runtime._set_mqtt_gc_threshold()
+            with self.assertRaises(OSError):
+                self.module.run()
+            self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,), (16384,)])
+        stop.assert_called_once()
+
+    def test_runtime_cleanup_survives_gc_threshold_restore_error(self):
+        with patch.object(self.module.gc, 'threshold', side_effect=[-1, None, OSError('private')], create=True), \
+                patch.object(self.module, 'DiagnosticRuntime', return_value=self.runtime), \
+                patch.object(self.runtime, 'run', side_effect=KeyboardInterrupt), \
+                patch.object(self.runtime.service, 'stop') as stop:
+            self.runtime._set_mqtt_gc_threshold()
+            with self.assertRaises(KeyboardInterrupt):
+                self.module.run()
+        stop.assert_called_once()
+
+    def test_mqtt_invalid_rtc_keeps_heavy_modules_unloaded(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        self.wlan.connected = True
+        with patch.dict(sys.modules, {'components.mqtt_telemetry': None, 'components.mqtt_transport': None}), \
+                patch.object(self.runtime.clock_sync, 'status', return_value={'synced': True, 'lastSyncAgeMs': 10}), \
+                patch.object(self.module.time, 'gmtime', create=True) as rtc:
+            for parts in ((2023, 10, 30, 6, 0, 0), (2026, 0, 1, 6, 0, 0),
+                          (2026, 1, 32, 6, 0, 0), (2026, 1, 1, 24, 0, 0), (2026,)):
+                rtc.return_value = parts
+                self.runtime.mqtt_tick()
+                self.assertEqual(self.runtime._mqtt_state, 'waiting_clock')
+            rtc.side_effect = OSError('private')
+            self.runtime.mqtt_tick()
+            self.assertEqual(self.runtime._mqtt_state, 'waiting_clock')
+        self.assertIsNone(self.runtime.mqtt)
+        self.module.gc.collect.assert_not_called()
+
+    def test_mqtt_configuration_error_is_fail_closed_without_repeated_reads(self):
+        for text in ('{"enabled":"true"}', '{bad-json}', '[]'):
+            with self.subTest(text=text):
+                self.runtime._mqtt_enabled = None
+                self.runtime._mqtt_initialized = False
+                self.runtime._mqtt_state = 'disabled'
+                self.clock.value += 40000
+                Path(self.runtime._mqtt_config_path).write_text(text, encoding='utf-8')
+                with patch.object(self.runtime, '_mqtt_enabled_flag', wraps=self.runtime._mqtt_enabled_flag) as probe:
+                    self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+                    self.assertEqual(self.runtime._mqtt_state, 'configuration_error')
+                    for offset in (1000, 60000, 300000):
+                        self.clock.value += offset
+                        self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+                    probe.assert_called_once()
+                self.assertTrue(self.runtime._mqtt_initialized)
+                self.assertFalse(self.runtime._mqtt_enabled)
+
+    def test_mqtt_memory_failure_during_probe_retries_with_bounded_backoff(self):
+        with patch.object(self.runtime, '_mqtt_enabled_flag', side_effect=[MemoryError('private'), False]) as probe:
+            self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+            self.assertFalse(self.runtime._mqtt_initialized)
+            self.assertEqual(self.runtime._mqtt_state, 'initialization_retry')
+            for self.clock.value in (1000, 10000, 29999):
+                self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+            self.assertEqual(probe.call_count, 1)
+            self.clock.value = 30000
+            self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+            self.assertEqual(probe.call_count, 2)
+        self.assertTrue(self.runtime._mqtt_initialized)
+        self.assertEqual(self.runtime._mqtt_state, 'disabled')
+        self.assertEqual(self.module.gc.collect.call_count, 1)
+        self.assertNotIn('private', repr(self.runtime.service.logs))
+
+    def test_mqtt_heavy_oom_closes_partial_client_and_recovers_after_delay(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        self.wlan.connected = True
+        failed_client, good_client, publisher = Mock(), Mock(), Mock()
+        load = Mock(return_value={'enabled': True})
+        transport = Mock(side_effect=[failed_client, good_client])
+        sampler = Mock(side_effect=[MemoryError('private-config'), publisher])
+        with patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=load, TemperatureTelemetry=sampler),
+                'components.mqtt_transport': types.SimpleNamespace(MqttTransport=transport)}), \
+                patch.object(self.runtime.clock_sync, 'status', return_value={'synced': True, 'lastSyncAgeMs': 10}), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True):
+            self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+            failed_client.close.assert_called_once()
+            self.assertIsNone(self.runtime.mqtt)
+            self.assertEqual(self.runtime._mqtt_state, 'initialization_retry')
+            for self.clock.value in (1000, 10000, 29999):
+                self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+            self.assertEqual(load.call_count, 1)
+            self.clock.value = 30000
+            self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+        self.assertIs(self.runtime.mqtt, publisher)
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(self.module.gc.collect.call_count, 4)
+        good_client.close.assert_not_called()
+        self.assertNotIn('private-config', repr(self.runtime.service.logs))
+
+    def test_mqtt_init_retries_increase_to_five_minutes_without_reopening_config_probe(self):
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        self.wlan.connected = True
+        load = Mock(side_effect=MemoryError('private-config'))
+        with patch.dict(sys.modules, {
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=load, TemperatureTelemetry=Mock())}), \
+                patch.object(self.runtime, '_mqtt_enabled_flag', wraps=self.runtime._mqtt_enabled_flag) as probe, \
+                patch.object(self.runtime.clock_sync, 'status', return_value={'synced': True, 'lastSyncAgeMs': 10}), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True):
+            for delay in (30000, 60000, 120000, 240000, 300000, 300000):
+                attempted_at = self.clock.value
+                self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+                self.assertEqual(self.runtime._mqtt_retry_at, attempted_at + delay)
+                self.clock.value += delay - 1
+                calls = load.call_count
+                self.runtime._run_stage('mqtt', self.runtime.mqtt_tick)
+                self.assertEqual(load.call_count, calls)
+                self.clock.value += 1
+            probe.assert_called_once()
+        self.assertEqual(load.call_count, 6)
+
+    def test_mqtt_time_gate_requires_recent_real_sync_and_is_independent_of_debug(self):
+        self.runtime.mqtt = Mock()
+        self.runtime._mqtt_initialized = True
+        self.wlan.connected = True
+        self.assertFalse(self.runtime.service.enabled)
+        quality = {'synced': False, 'lastSyncAgeMs': None}
+        with patch.object(self.runtime.clock_sync, 'status', side_effect=lambda: quality), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True):
+            self.runtime.mqtt_tick()
+            self.runtime.mqtt.tick.assert_called_with(True, False)
+            quality.update(synced=True, lastSyncAgeMs=600000)
+            self.runtime.mqtt_tick()
+            self.runtime.mqtt.tick.assert_called_with(True, True)
+            quality['lastSyncAgeMs'] = 600001
+            self.runtime.mqtt_tick()
+            self.runtime.mqtt.tick.assert_called_with(True, False)
+            quality['lastSyncAgeMs'] = -1
+            self.runtime.mqtt_tick()
+            self.runtime.mqtt.tick.assert_called_with(True, False)
+        self.assertFalse(self.runtime.service.enabled)
+
+    def test_mqtt_setup_failure_does_not_expose_configuration_or_stop_clock(self):
+        self.runtime._mqtt_config_path = str(Path(self.config.path).with_name('.mqtt.json'))
+        Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
+        self.wlan.connected = True
+        with patch.object(self.runtime, 'poll_commands'), patch.object(self.runtime, '_network_step'), \
+                patch.object(self.runtime, 'maintenance_tick'), patch.object(self.runtime, 'clock_tick') as clock, \
+                patch.object(self.runtime.service, 'tick'), \
+                patch.object(self.runtime.clock_sync, 'status', return_value={'synced': True, 'lastSyncAgeMs': 10}), \
+                patch.object(self.module.time, 'gmtime', return_value=(2026, 10, 30, 6, 0, 0), create=True):
+            self.runtime.tick_once()
+            self.assertIsNone(self.runtime.mqtt)
+            self.assertEqual(self.runtime._mqtt_state, 'configuration_error')
+            self.assertEqual(clock.call_count, 1)
+            self.assertTrue(any('Runtime mqtt failed' in entry['message'] for entry in self.runtime.service.logs))
+
+    def test_runtime_stop_closes_mqtt_even_if_cleanup_raises_and_still_stops_debug(self):
+        self.runtime.mqtt = Mock()
+        self.runtime.mqtt.close.side_effect = OSError('private-account')
+        with patch.object(self.module, 'DiagnosticRuntime', return_value=self.runtime), \
+                patch.object(self.runtime, 'run', side_effect=KeyboardInterrupt), \
+                patch.object(self.runtime.service, 'stop') as stop:
+            with self.assertRaises(OSError):
+                self.module.run()
+        self.runtime.mqtt.close.assert_called_once()
+        stop.assert_called_once()
 
     def test_trial_cannot_commit_an_old_asynchronously_disconnecting_connection(self):
         self.wlan.connected = True

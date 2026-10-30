@@ -4,9 +4,10 @@
 
 ## 主机 Python 工具
 
-| 包         | 固定版本 | 用途                       |
-| ---------- | -------- | -------------------------- |
-| `mpremote` | `1.28.0` | MicroPython 设备备份与上传 |
+| 包          | 固定版本 | 用途                                                                                                         |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `mpremote`  | `1.28.0` | MicroPython 设备备份与上传                                                                                   |
+| `mpy-cross` | `1.22.2` | `--precompile` 上传时通过隔离的 `uv tool run --from` 调用；输出与实板匹配的 v6.2 纯字节码，不装入全局 Python |
 
 Python 项目支持 `>=3.14,<3.15`，默认使用固定的 3.14.2；本次迁移使用 uv 0.9.28。`pyserial`、`platformdirs` 等传递依赖的版本与文件哈希由 `uv.lock` 固定。安装执行 `uv sync --locked`，工具和测试执行 `uv run --locked`；依赖保持在项目 `.venv/`，不安装到全局 Python。该环境只服务主机工具与测试，不上传到 ESP32。
 
@@ -71,4 +72,4 @@ Python 项目支持 `>=3.14,<3.15`，默认使用固定的 3.14.2；本次迁移
 - Go 原生 TS7 以 `@typescript/native` 别名安装为默认 tsc；Vue 工具链使用 TS6 兼容包。
 - Oxlint / Oxfmt 使用原生实现，ESLint 只补 Vue 模板规则，不重复承担格式化。
 - Playwright 浏览器、SerialPort bindings 和 Ox 系工具包含平台二进制；安装策略只允许已登记的必要构建脚本。
-- MQTT.js、MQTT 固件库、Wrangler、Workers 类型、数据库、状态库、图表库和 Rust 应用服务尚未引入；远程阶段按实际需要新增。
+- MQTT 使用仓库内的轻量 MQTT 3.1.1 wire / transport / scheduler 和 MicroPython 内置 socket / ssl / _thread，不引入 MQTT.js 或第三方固件库。Wrangler、Workers 类型、数据库、状态库、图表库和 Rust 应用服务尚未引入；远程阶段按实际需要新增。

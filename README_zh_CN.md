@@ -2,7 +2,7 @@
 
 ESP32-WROOM-32 / 0.96″ OLED 的 MicroPython 固件与本地 USB 调试工作台。网页查看真实 OLED 帧缓冲、引脚登记状态、运行日志和 Wi-Fi 信息，也能在没有设备时回放演示场景。
 
-本期提供 USB 实机通道与响应式网页；MQTT、Cloudflare Workers 远程调试和温湿度采集留给下一期。回放明确标记模拟数据。传感器已断开，当前启动路径不会初始化 Modbus UART 或驱动传感器引脚。
+本期提供 USB 实机通道、响应式网页和可选 MCU 温度 MQTT 上报；MQTT 远程调试、Cloudflare Workers 和温湿度采集留给后续。回放明确标记模拟数据。传感器已断开，当前启动路径不会初始化 Modbus UART 或驱动传感器引脚。
 
 ## 目录
 
@@ -33,6 +33,8 @@ pnpm dev
 生产预览运行 `pnpm build`、`pnpm start`，打开 <http://127.0.0.1:8787>。两种方式只监听本机。网页支持手机尺寸；另一台手机实际访问还需要鉴权和远程入口，本期没有默认向局域网暴露设备控制接口。
 
 ## 连接与调试
+
+MCU 内部温度的独立 MQTT 上报配置、投递和缓存边界见 [MQTT 遥测说明](docs/mqtt-telemetry.md)。它不依赖网页或 debug 会话，不代表环境温度；实际账号权限和上报成功须分别验收。
 
 1. 接入 ESP32；当前 CH340 / COM3 使用 **115200、8N1、无流控**。不用改设备管理器的 FIFO 设置。
 2. 关闭其他串口工具，选择串口连接。Bridge 请求一次快照，持续采集默认关闭。
@@ -78,12 +80,12 @@ CPU 主频不代表占用率；当前 MicroPython 没有整机 CPU 使用率或 
 ```powershell
 uv sync --locked
 uv run --locked python tools/device.py backup --port COM3
-uv run --locked python tools/device.py upload --port COM3
+uv run --locked python tools/device.py upload --precompile --port COM3
 ```
 
-也可使用 `pnpm device backup --port COM3`、`pnpm device upload --port COM3`；这两个入口同样使用 `uv run --locked`，按锁文件同步项目环境后调用其中的 Python。
+也可使用 `pnpm device backup --port COM3`、`pnpm device upload --precompile --port COM3`；这两个入口同样使用 `uv run --locked`，按锁文件同步项目环境后调用其中的 Python。
 
-上传中断当前程序，先上传临时 `.py` 文件，逐文件核对 SHA-256 并全部编译通过后再替换、重启。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。
+上传中断当前程序；`--precompile` 使用隔离的固定版本 `mpy-cross==1.22.2` 生成纯字节码，`boot.py` 保留源码入口。先完整备份，再暂存全部文件，逐文件核对 SHA-256 和格式 / 编译校验后才替换、归档会遮蔽字节码的旧源码并重启。跨文件替换不具事务性，中途失败需由完整备份恢复。不上传测试和本地 `.env`，保留设备凭据。仅改网页 / bridge 不需上传固件。
 
 ## 检查
 

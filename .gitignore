@@ -13,3 +13,7 @@ test-results/
 *.tsbuildinfo
 *.before-*
 .device-backups/
+.mqtt.json
+.mqtt.json.*
+.mqtt-ca.der
+.mqtt-ca.pem
