@@ -14,6 +14,8 @@
 
 TLS 固定使用 8883、`CERT_REQUIRED`、单个 DER CA 和 `server_hostname` 校验，失败时关闭连接并退避，不回退到明文或跳过校验。配置中的 `host` 用于解析；可选数值 IPv4 `broker_ip` 只替代连接地址，不取消服务器主机名校验。常规使用后台 DNS，避免固定地址阻碍服务迁移。现有 CA 保留，固件升级不自动更新信任链。
 
+证书维护须分别处理 broker 叶证书续期、设备信任根、TLS 实现和吊销信息。根证书并非签发日期越新越安全；应核验 CA 官方指纹、有效期、安全公告及实际签发链，再做有备份的受控替换。当前仅限制信任根，并非固定叶证书或 SPKI；不要为修复连接失败导入宽泛 CA 包。`CERT_REQUIRED` 与有效期检查也不等于在线吊销检查：当前应用没有自动 CRL / OCSP 或浏览器紧急撤信列表同步，升级 MicroPython 不会自动补齐这些机制。eMudhra 事件表明中间 CA 的交叉签名路径同样需要审查，不能只按根证书名称判断；参见 [Google 事件公告](https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/)与 [Sectigo 交叉证书撤销公告](https://www.sectigo.com/resource-library/advisory-on-compromised-emudhra-intermediate-certificates)。
+
 ## 信封和投递
 
 发布主题为 `iot/v1/<site_id>/<gateway_id>/devices/<device_id>/telemetry`，与信封身份严格一致。MQTT 3.1.1、QoS 1、非 retained、只发布，不订阅命令。示例仅含模拟身份和读数：
