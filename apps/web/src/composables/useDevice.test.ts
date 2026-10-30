@@ -1,7 +1,7 @@
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils';
 import { defineComponent } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createBridgeState, type DeviceEvent } from '@one-esp/protocol';
+import { createBridgeState, type DeviceCommand, type DeviceEvent } from '@one-esp/protocol';
 import { useDevice } from './useDevice';
 
 class FakeSocket {
@@ -30,9 +30,14 @@ const event = (
 ): DeviceEvent => ({ v: 1, deviceId: 'device-test', bootId, seq: 1, ts: 100, type, data });
 
 beforeEach(async () => {
-  vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+  vi.useFakeTimers({
+    toFake: ['Date', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+  });
   vi.stubGlobal('WebSocket', FakeSocket);
-  vi.stubGlobal('crypto', { randomUUID: () => 'command-id' });
+  let commandNumber = 0;
+  vi.stubGlobal('crypto', {
+    randomUUID: () => (++commandNumber === 1 ? 'command-id' : 'command-id-' + commandNumber),
+  });
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string) => ({
@@ -227,4 +232,288 @@ describe('device command lifecycle', () => {
       ),
     ).toBe(false);
   });
+});
+
+const debugState = (remaining: number, enabled = true) => ({
+  enabled,
+  profile: 'full',
+  oledFps: 2,
+  gpioHz: 10,
+  expiresInMs: remaining,
+  droppedLogs: 0,
+});
+
+function enableRenewCapability() {
+  FakeSocket.current.receive(
+    'event',
+    event('hello', {
+      firmware: 'test',
+      board: 'test',
+      capabilities: ['debug-renew'],
+    }),
+  );
+}
+
+function sentCommands(): DeviceCommand[] {
+  return vi
+    .mocked(fetch)
+    .mock.calls.filter(([path]) => String(path).endsWith('/command'))
+    .map(([, options]) => JSON.parse(String(options?.body)) as DeviceCommand);
+}
+
+function acknowledge(command: DeviceCommand, result: Record<string, unknown>, ok = true) {
+  FakeSocket.current.receive(
+    'event',
+    event('ack', {
+      id: command.id,
+      ok,
+      result,
+      ...(!ok ? { error: 'simulated renewal failure' } : {}),
+    }),
+  );
+}
+
+async function applyShortLease(seconds = 10) {
+  enableRenewCapability();
+  const promise = device.command('debug.set', {
+    enabled: true,
+    profile: 'full',
+    ttlSeconds: seconds,
+  });
+  const command = sentCommands().at(-1)!;
+  acknowledge(command, debugState(seconds * 1000));
+  FakeSocket.current.receive('event', event('debug', debugState(seconds * 1000)));
+  await promise;
+  return command;
+}
+
+describe('automatic lease renewal', () => {
+  it.each(['same', 'boot', 'port'] as const)(
+    'preserves the applied TTL only when a reconnect confirms the %s identity',
+    async (change) => {
+      await applyShortLease(10);
+      FakeSocket.current.close();
+      vi.advanceTimersByTime(1000);
+      const newSocket = FakeSocket.current;
+      newSocket.onopen?.(new Event('open'));
+      newSocket.receive('event', event('debug', debugState(8000)));
+      vi.advanceTimersByTime(5000);
+      expect(sentCommands()).toHaveLength(1);
+      const newBoot = change === 'boot' ? 'boot-b' : 'boot-a';
+      const snapshot = createBridgeState();
+      snapshot.connection = {
+        connected: true,
+        mode: 'usb',
+        port: change === 'port' ? 'COM4' : 'COM3',
+        error: null,
+      };
+      snapshot.hello = event(
+        'hello',
+        { firmware: 'test', board: 'test', capabilities: ['debug-renew'] },
+        newBoot,
+      );
+      snapshot.debug = event('debug', debugState(8000), newBoot);
+      snapshot.lastSeen = Date.now();
+      newSocket.receive('snapshot', snapshot);
+      vi.advanceTimersByTime(5000);
+      expect(sentCommands()).toHaveLength(2);
+      expect(sentCommands()[1]).toMatchObject({
+        command: 'debug.renew',
+        bootId: newBoot,
+        args: { ttlSeconds: change === 'same' ? 10 : 600 },
+      });
+    },
+  );
+
+  it('defaults on but never starts an inactive or unsupported device', () => {
+    expect(device.autoRenewEnabled.value).toBe(true);
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(0, false)));
+    vi.advanceTimersByTime(600000);
+    expect(sentCommands()).toHaveLength(0);
+    FakeSocket.current.receive(
+      'event',
+      event('hello', { firmware: 'legacy', board: 'test', capabilities: [] }),
+    );
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    vi.advanceTimersByTime(1000);
+    expect(device.autoRenewStatus.value).toBe('unsupported');
+    expect(sentCommands()).toHaveLength(0);
+  });
+
+  it('renews through repeated TTLs using the applied duration and preserves user feedback', async () => {
+    await applyShortLease();
+    device.notice.value = 'ordinary notice';
+    device.error.value = 'ordinary error';
+    for (let cycle = 0; cycle < 3; cycle++) {
+      vi.advanceTimersByTime(7000);
+      const command = sentCommands().at(-1)!;
+      expect(command).toMatchObject({
+        command: 'debug.renew',
+        bootId: 'boot-a',
+        args: { ttlSeconds: 10 },
+      });
+      expect(Object.keys(command.args)).toEqual(['ttlSeconds']);
+      expect(device.autoRenewStatus.value).toBe('renewing');
+      expect(device.pendingCount.value).toBe(0);
+      acknowledge(command, debugState(10000));
+      FakeSocket.current.receive('event', event('debug', debugState(10000)));
+      await flushPromises();
+      expect(device.autoRenewStatus.value).toBe('waiting');
+      expect(device.lastRenewedAt.value).toBe(Date.now());
+      expect(device.leaseRemainingMs.value).toBe(10000);
+    }
+    expect(sentCommands().filter((command) => command.command === 'debug.renew')).toHaveLength(3);
+    expect(device.notice.value).toBe('ordinary notice');
+    expect(device.error.value).toBe('ordinary error');
+  });
+
+  it('adopts a fresh existing active lease and allows only one renewal in flight', () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    vi.advanceTimersByTime(1000);
+    expect(sentCommands()).toHaveLength(1);
+    expect(sentCommands()[0]?.args).toEqual({ ttlSeconds: 600 });
+    vi.advanceTimersByTime(10000);
+    expect(sentCommands()).toHaveLength(1);
+    expect(device.autoRenewStatus.value).toBe('renewing');
+  });
+
+  it('honors disabled automatic renewal and does not renew stale or expired snapshots', () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    device.autoRenewEnabled.value = false;
+    vi.advanceTimersByTime(5000);
+    expect(sentCommands()).toHaveLength(0);
+    expect(device.autoRenewStatus.value).toBe('idle');
+    device.autoRenewEnabled.value = true;
+    const snapshot = createBridgeState();
+    snapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+    snapshot.lastSeen = Date.now() - 20000;
+    snapshot.hello = event('hello', {
+      firmware: 'test',
+      board: 'test',
+      capabilities: ['debug-renew'],
+    });
+    snapshot.debug = event('debug', debugState(60000));
+    FakeSocket.current.receive('snapshot', snapshot);
+    vi.advanceTimersByTime(1000);
+    expect(sentCommands()).toHaveLength(0);
+    snapshot.lastSeen = Date.now() - 120000;
+    FakeSocket.current.receive('snapshot', snapshot);
+    vi.advanceTimersByTime(1000);
+    expect(device.leaseRemainingMs.value).toBe(0);
+    expect(sentCommands()).toHaveLength(0);
+  });
+
+  it('does not let a late renewal ACK override a manual stop', async () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    vi.advanceTimersByTime(1000);
+    const renewal = sentCommands()[0]!;
+    const stopped = device.command('debug.set', { enabled: false });
+    const stop = sentCommands().at(-1)!;
+    acknowledge(renewal, debugState(600000));
+    await flushPromises();
+    expect(device.autoRenewStatus.value).toBe('idle');
+    expect(device.lastRenewedAt.value).toBeNull();
+    acknowledge(stop, debugState(0, false));
+    FakeSocket.current.receive('event', event('debug', debugState(0, false)));
+    await stopped;
+    vi.advanceTimersByTime(600000);
+    expect(sentCommands().filter((command) => command.command === 'debug.renew')).toHaveLength(1);
+  });
+
+  it('skips renewal while a staged user operation is pending', async () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    const pending = device.command('config.set', { revision: 1, values: { SSID: 'test' } });
+    const config = sentCommands()[0]!;
+    acknowledge(config, { stage: 'testing' });
+    vi.advanceTimersByTime(5000);
+    expect(sentCommands()).toHaveLength(1);
+    acknowledge(config, { stage: 'applied' });
+    await pending;
+    vi.advanceTimersByTime(1000);
+    expect(sentCommands().at(-1)?.command).toBe('debug.renew');
+  });
+
+  it('reports a failed renewal separately and backs off instead of flooding commands', async () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    device.notice.value = 'keep notice';
+    device.error.value = 'keep error';
+    vi.advanceTimersByTime(1000);
+    acknowledge(sentCommands()[0]!, {}, false);
+    await flushPromises();
+    expect(device.autoRenewStatus.value).toBe('error');
+    expect(device.autoRenewError.value).toContain('simulated renewal failure');
+    for (let tick = 0; tick < 29; tick++) {
+      FakeSocket.current.receive('event', event('debug', debugState(59000 - tick * 1000)));
+      vi.advanceTimersByTime(1000);
+    }
+    expect(sentCommands()).toHaveLength(1);
+    FakeSocket.current.receive('event', event('debug', debugState(30000)));
+    vi.advanceTimersByTime(1000);
+    expect(sentCommands()).toHaveLength(2);
+    expect(device.notice.value).toBe('keep notice');
+    expect(device.error.value).toBe('keep error');
+    acknowledge(sentCommands()[1]!, {}, false);
+    await flushPromises();
+    FakeSocket.current.receive('event', event('debug', debugState(0, false)));
+    expect(device.autoRenewError.value).toContain('simulated renewal failure');
+    expect(device.autoRenewStatus.value).toBe('idle');
+  });
+
+  it('times out a missing renewal ACK and cancels all activity on page unmount', async () => {
+    enableRenewCapability();
+    FakeSocket.current.receive('event', event('debug', debugState(60000)));
+    vi.advanceTimersByTime(19000);
+    await flushPromises();
+    expect(device.autoRenewError.value).toContain('回执超时');
+    expect(sentCommands()).toHaveLength(1);
+    wrapper!.unmount();
+    wrapper = undefined;
+    vi.advanceTimersByTime(600000);
+    expect(sentCommands()).toHaveLength(1);
+  });
+
+  it.each(['boot', 'port', 'socket'] as const)(
+    'invalidates a pending renewal across %s changes',
+    async (change) => {
+      enableRenewCapability();
+      FakeSocket.current.receive('event', event('debug', debugState(60000)));
+      vi.advanceTimersByTime(1000);
+      const renewal = sentCommands()[0]!;
+      const oldSocket = FakeSocket.current;
+      if (change === 'boot')
+        oldSocket.receive(
+          'event',
+          event(
+            'hello',
+            { firmware: 'test', board: 'test', capabilities: ['debug-renew'] },
+            'boot-b',
+          ),
+        );
+      else if (change === 'port')
+        oldSocket.receive('connection', {
+          connected: true,
+          mode: 'usb',
+          port: 'COM4',
+          error: null,
+        });
+      else oldSocket.close();
+      acknowledge(renewal, debugState(600000));
+      await flushPromises();
+      expect(device.lastRenewedAt.value).toBeNull();
+      if (change === 'boot') expect(device.bootId.value).toBe('boot-b');
+      vi.advanceTimersByTime(1000);
+      if (change === 'socket') {
+        FakeSocket.current.onopen?.(new Event('open'));
+        oldSocket.receive('event', event('debug', debugState(60000)));
+      }
+      vi.advanceTimersByTime(5000);
+      expect(sentCommands()).toHaveLength(1);
+    },
+  );
 });

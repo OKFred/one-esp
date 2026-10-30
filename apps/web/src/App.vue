@@ -53,6 +53,11 @@ const {
   deviceId,
   oledAge,
   samplingPaused,
+  autoRenewEnabled,
+  autoRenewStatus,
+  autoRenewError,
+  lastRenewedAt,
+  leaseRemainingMs,
   stale,
   refreshPorts,
   connect,
@@ -69,6 +74,15 @@ const ttl = ref(600);
 const oledFps = ref(2);
 const gpioHz = ref(10);
 const profileLimits = computed(() => debugProfileLimits[profile.value]);
+const autoRenewLabel = computed(() => {
+  if (!autoRenewEnabled.value) return '自动续期已关闭';
+  if (autoRenewStatus.value === 'unsupported') return '当前固件不支持自动续期';
+  if (autoRenewStatus.value === 'error' || autoRenewError.value) return '续期失败，请检查连接';
+  if (autoRenewStatus.value === 'renewing') return '正在续期…';
+  if (!clientReady.value) return '等待设备连接';
+  if (debug.value?.enabled && leaseRemainingMs.value === 0) return '会话已到期，请重新开启采集';
+  return debug.value?.enabled ? '自动续期已开启' : '开启采集后自动续期';
+});
 const logLevel = ref('all');
 const paused = ref(false);
 const pausedLogs = shallowRef<DeviceEvent[]>([]);
@@ -230,6 +244,10 @@ function changeProfile(value: unknown) {
   profile.value = settings.profile;
   oledFps.value = settings.oledFps;
   gpioHz.value = settings.gpioHz;
+}
+
+function setAutoRenew(value: boolean | string | number) {
+  autoRenewEnabled.value = !!value;
 }
 
 async function setDebug(enabled: boolean | string | number) {
@@ -462,7 +480,7 @@ function clearVisibleLogs() {
               }}</strong
               ><small>{{
                 debug?.enabled
-                  ? `剩余 ${Math.ceil(debug.expiresInMs / 1000)} 秒`
+                  ? `${autoRenewEnabled && ['waiting', 'renewing'].includes(autoRenewStatus) ? '自动续期 · ' : ''}剩余 ${Math.ceil(leaseRemainingMs / 1000)} 秒`
                   : '连接后开启调试以获取遥测'
               }}</small>
             </div>
@@ -622,6 +640,26 @@ function clearVisibleLogs() {
                 />
               </div>
               <div class="controls-body">
+                <div class="auto-renew-control">
+                  <div class="auto-renew-heading">
+                    <span>自动续期</span>
+                    <ASwitch
+                      :checked="autoRenewEnabled"
+                      aria-label="自动续期"
+                      @change="setAutoRenew"
+                    />
+                  </div>
+                  <p class="control-help" aria-live="polite">{{ autoRenewLabel }}</p>
+                  <p v-if="autoRenewError" class="control-help tone-warning">
+                    {{ autoRenewError }}
+                  </p>
+                  <p v-if="lastRenewedAt" class="control-help">
+                    上次成功续期 {{ new Date(lastRenewedAt).toLocaleTimeString() }}
+                  </p>
+                  <p class="control-help">
+                    本页连接时自动续期。关闭本页后不再续期；没有其他页面续期时，到期后暂停。电脑休眠时可能到期。
+                  </p>
+                </div>
                 <label class="field-label" for="profile-select">采集档位</label
                 ><ASelect
                   id="profile-select"

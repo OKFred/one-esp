@@ -186,3 +186,30 @@ test('restores a paused LITE session and resumes from the screen action', async 
   await expect(page.getByRole('button', { name: '开启实时采集', exact: true })).toHaveCount(0);
   await assertNoPageOverflow(page);
 });
+
+test('renews an active short session by default and respects a manual pause', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectScenario(page, '正常启动');
+  const autoRenew = page.getByRole('switch', { name: '自动续期', exact: true });
+  await expect(autoRenew).toBeChecked();
+  const ttlInput = page.getByRole('spinbutton', { name: '调试会话有效期', exact: true });
+  await ttlInput.fill('10');
+  await ttlInput.press('Tab');
+  const renewal = page.waitForRequest(
+    (request) =>
+      request.url().endsWith('/api/command') && request.postDataJSON()?.command === 'debug.renew',
+  );
+  await page.getByRole('button', { name: '应用参数 / 续期', exact: true }).click();
+  const request = await renewal;
+  expect(request.postDataJSON().args).toEqual({ ttlSeconds: 10 });
+  expect(request.postDataJSON().bootId).toBeTruthy();
+  await expect(page.getByText(/上次成功续期/)).toBeVisible();
+  const debugSwitch = page.getByRole('switch', { name: '开启调试采集', exact: true });
+  await expect(debugSwitch).toBeChecked();
+  await debugSwitch.click();
+  await expect(debugSwitch).not.toBeChecked();
+  await expect(page.getByText('开启采集后自动续期', { exact: true })).toBeVisible();
+  await expect(autoRenew).toBeChecked();
+  await assertNoPageOverflow(page);
+});

@@ -1,4 +1,4 @@
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import {
   applyDeviceEvent,
   createBridgeState,
@@ -11,6 +11,10 @@ import type { AckData, DebugData, OledData, PinData, PortInfo, StatusData } from
 
 interface PendingCommand {
   name: DeviceCommand['command'];
+  automatic: boolean;
+  epoch: number;
+  stopVersion: number;
+  debugSettings?: { enabled?: unknown; ttlSeconds?: unknown };
   resolve: (ack: AckData) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -24,6 +28,12 @@ export function useDevice() {
   const error = ref('');
   const notice = ref('');
   const pendingCount = ref(0);
+  const autoRenewEnabled = ref(true);
+  const autoRenewError = ref('');
+  const lastRenewedAt = ref<number | null>(null);
+  const leaseExpiresAt = ref(0);
+  const renewalInFlight = ref(false);
+  const manuallyStopped = ref(false);
   const now = ref(Date.now());
   const pending = new Map<string, PendingCommand>();
   const secrets = new Set<string>();
@@ -32,6 +42,12 @@ export function useDevice() {
   let clockTimer: ReturnType<typeof setInterval> | undefined;
   let stopped = false;
   let retryDelay = 1000;
+  let renewalEpoch = 0;
+  let stopVersion = 0;
+  let renewalTtlSeconds = 600;
+  let appliedLeaseIdentity: string | null = null;
+  let awaitingReconnectSnapshot = false;
+  let retryRenewalAt = 0;
 
   const clean = (value: string) => {
     let result = value;
@@ -79,6 +95,129 @@ export function useDevice() {
     return received.get(event.type) ?? state.value.lastSeen ?? now.value;
   }
 
+  const leaseRemainingMs = computed(() => Math.max(0, leaseExpiresAt.value - now.value));
+  const supportsRenewal = computed(() => {
+    const capabilities = state.value.hello?.data.capabilities;
+    return Array.isArray(capabilities) && capabilities.includes('debug-renew');
+  });
+  const autoRenewStatus = computed<'idle' | 'waiting' | 'renewing' | 'error' | 'unsupported'>(
+    () => {
+      if (
+        !autoRenewEnabled.value ||
+        stopped ||
+        !channelConnected.value ||
+        !state.value.connection.connected ||
+        !debug.value?.enabled ||
+        manuallyStopped.value ||
+        leaseRemainingMs.value === 0
+      )
+        return 'idle';
+      if (!supportsRenewal.value) return 'unsupported';
+      if (renewalInFlight.value) return 'renewing';
+      return autoRenewError.value ? 'error' : 'waiting';
+    },
+  );
+
+  function invalidateRenewal(resetHistory = false, clearFailure = true) {
+    renewalEpoch += 1;
+    renewalInFlight.value = false;
+    retryRenewalAt = 0;
+    if (clearFailure) autoRenewError.value = '';
+    if (resetHistory) {
+      leaseExpiresAt.value = 0;
+      lastRenewedAt.value = null;
+    }
+  }
+
+  function leaseIdentity(snapshot: BridgeState) {
+    const source = snapshot.hello ?? snapshot.status ?? snapshot.metrics ?? snapshot.debug;
+    return source
+      ? JSON.stringify([
+          snapshot.connection.mode,
+          snapshot.connection.port,
+          source.deviceId,
+          source.bootId,
+        ])
+      : null;
+  }
+
+  function syncAppliedDuration() {
+    const identity = leaseIdentity(state.value);
+    if (identity && appliedLeaseIdentity && identity !== appliedLeaseIdentity) {
+      renewalTtlSeconds = 600;
+      appliedLeaseIdentity = null;
+    }
+  }
+
+  function recordLease(data: Record<string, unknown>, receivedAt: number) {
+    if (
+      data.enabled === true &&
+      typeof data.expiresInMs === 'number' &&
+      Number.isFinite(data.expiresInMs) &&
+      data.expiresInMs > 0
+    ) {
+      leaseExpiresAt.value = receivedAt + data.expiresInMs;
+    } else if (data.enabled === false) {
+      leaseExpiresAt.value = 0;
+      invalidateRenewal(false, false);
+      manuallyStopped.value = false;
+    }
+  }
+
+  function updatePendingCount() {
+    // A user must still be able to stop sampling while a renewal ACK is pending.
+    pendingCount.value = [...pending.values()].filter((item) => !item.automatic).length;
+  }
+
+  function maybeRenew() {
+    if (
+      !autoRenewEnabled.value ||
+      stopped ||
+      awaitingReconnectSnapshot ||
+      renewalInFlight.value ||
+      manuallyStopped.value ||
+      !channelConnected.value ||
+      !state.value.connection.connected ||
+      !bootId.value ||
+      !debug.value?.enabled ||
+      !supportsRenewal.value ||
+      pending.size > 0 ||
+      busy.value ||
+      Date.now() < retryRenewalAt ||
+      leaseRemainingMs.value <= 0
+    )
+      return;
+    const debugEvent = state.value.debug;
+    if (
+      !debugEvent ||
+      Date.now() - eventReceivedAt(debugEvent) > 15000 ||
+      age.value === null ||
+      age.value > 10000
+    )
+      return;
+    const margin = Math.min(120000, (renewalTtlSeconds * 1000) / 3);
+    if (leaseRemainingMs.value > margin) return;
+    const epoch = renewalEpoch;
+    renewalInFlight.value = true;
+    void sendCommand('debug.renew', { ttlSeconds: renewalTtlSeconds }, true)
+      .then(() => {
+        if (stopped || epoch !== renewalEpoch) return;
+        lastRenewedAt.value = Date.now();
+        autoRenewError.value = '';
+        retryRenewalAt = 0;
+      })
+      .catch((cause: unknown) => {
+        if (stopped || epoch !== renewalEpoch) return;
+        autoRenewError.value = clean(cause instanceof Error ? cause.message : '自动续期失败');
+        retryRenewalAt = Date.now() + 30000;
+      })
+      .finally(() => {
+        if (epoch === renewalEpoch) renewalInFlight.value = false;
+      });
+  }
+
+  watch(autoRenewEnabled, () => invalidateRenewal(), { flush: 'sync' });
+
   function acceptSnapshot(snapshot: BridgeState) {
     received.clear();
     const events = [
@@ -101,6 +240,9 @@ export function useDevice() {
         (snapshot.lastSeen ?? Date.now()) - Math.max(0, latestTick - event.ts),
       );
     state.value = { ...snapshot, metrics: snapshot.metrics ?? null };
+    syncAppliedDuration();
+    if (snapshot.debug) recordLease(snapshot.debug.data, eventReceivedAt(snapshot.debug));
+    awaitingReconnectSnapshot = false;
   }
 
   function rejectPending(reason: string) {
@@ -109,11 +251,18 @@ export function useDevice() {
       command.reject(new Error(reason));
     }
     pending.clear();
-    pendingCount.value = 0;
+    updatePendingCount();
   }
 
   function acceptEvent(event: DeviceEvent) {
     const previousBoot = bootId.value;
+    if (
+      event.type === 'ack' &&
+      previousBoot &&
+      event.bootId !== previousBoot &&
+      !pending.has(String(event.data.id))
+    )
+      return;
     if (event.type === 'log') {
       const data = event.data as Record<string, unknown>;
       event = {
@@ -122,12 +271,15 @@ export function useDevice() {
       } as DeviceEvent;
     }
     if (previousBoot && event.bootId !== previousBoot && event.type !== 'log') {
+      invalidateRenewal(true);
       rejectPending('设备已重启，旧命令已取消');
       state.value = { ...createBridgeState(), connection: state.value.connection };
       received.clear();
     }
     received.set(event.type, Date.now());
     state.value = applyDeviceEvent(state.value, event, Date.now());
+    syncAppliedDuration();
+    if (event.type === 'debug') recordLease(event.data, Date.now());
     if (event.type === 'ack') {
       const ack = event.data as unknown as AckData;
       const command = pending.get(ack.id);
@@ -138,23 +290,52 @@ export function useDevice() {
       }
       clearTimeout(command.timer);
       pending.delete(ack.id);
-      pendingCount.value = pending.size;
-      if (ack.ok) command.resolve(ack);
-      else command.reject(new Error(clean(ack.error || '设备拒绝了操作')));
+      updatePendingCount();
+      if (ack.ok) {
+        const settings = command.debugSettings;
+        if (
+          settings &&
+          command.stopVersion === stopVersion &&
+          (!command.automatic || command.epoch === renewalEpoch)
+        ) {
+          if (settings.enabled === true || command.name === 'debug.renew') {
+            const ttl = settings.ttlSeconds;
+            if (typeof ttl === 'number' && Number.isFinite(ttl) && ttl >= 1 && ttl <= 1800) {
+              renewalTtlSeconds = Math.trunc(ttl);
+              appliedLeaseIdentity = JSON.stringify([
+                state.value.connection.mode,
+                state.value.connection.port,
+                event.deviceId,
+                event.bootId,
+              ]);
+            }
+            if (command.name === 'debug.set') {
+              manuallyStopped.value = false;
+              retryRenewalAt = 0;
+              autoRenewError.value = '';
+            }
+            if (ack.result) recordLease(ack.result, Date.now());
+          }
+        }
+        command.resolve(ack);
+      } else command.reject(new Error(clean(ack.error || '设备拒绝了操作')));
     }
   }
 
   function connectSocket() {
     if (stopped) return;
-    socket = new WebSocket(
+    const currentSocket = new WebSocket(
       `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`,
     );
-    socket.onopen = () => {
+    socket = currentSocket;
+    currentSocket.onopen = () => {
+      if (stopped || socket !== currentSocket) return;
       channelConnected.value = true;
       retryDelay = 1000;
       error.value = '';
     };
-    socket.onmessage = (message) => {
+    currentSocket.onmessage = (message) => {
+      if (stopped || socket !== currentSocket) return;
       try {
         const packet = JSON.parse(String(message.data)) as {
           type: string;
@@ -163,6 +344,7 @@ export function useDevice() {
         if (packet.type === 'snapshot') {
           const snapshot = packet.data as BridgeState;
           if (bootId.value && snapshot.hello?.bootId && snapshot.hello.bootId !== bootId.value) {
+            invalidateRenewal(true);
             rejectPending('设备会话已变化，请重新操作');
           }
           acceptSnapshot(snapshot);
@@ -173,6 +355,7 @@ export function useDevice() {
             connection.port !== state.value.connection.port ||
             connection.mode !== state.value.connection.mode;
           if (!connection.connected || changed) rejectPending('设备连接已变化，命令已取消');
+          if (!connection.connected || changed) invalidateRenewal(true);
           if (changed) received.clear();
           state.value = changed
             ? { ...createBridgeState(), connection }
@@ -182,10 +365,14 @@ export function useDevice() {
         error.value = '收到无法解析的 bridge 消息';
       }
     };
-    socket.onerror = () => {
+    currentSocket.onerror = () => {
+      if (stopped || socket !== currentSocket) return;
       error.value = '无法连接本地 bridge，请确认服务已启动';
     };
-    socket.onclose = () => {
+    currentSocket.onclose = () => {
+      if (socket !== currentSocket) return;
+      awaitingReconnectSnapshot = true;
+      invalidateRenewal(true);
       channelConnected.value = false;
       state.value = { ...state.value, metrics: null };
       rejectPending('调试通道已断开');
@@ -220,6 +407,7 @@ export function useDevice() {
   }
 
   async function changeConnection(path: string, body: unknown) {
+    invalidateRenewal(true);
     busy.value = true;
     error.value = '';
     try {
@@ -235,6 +423,19 @@ export function useDevice() {
   function command(name: DeviceCommand['command'], args: Record<string, unknown> = {}) {
     error.value = '';
     notice.value = '';
+    if (name === 'debug.set' && args.enabled === false) {
+      stopVersion += 1;
+      manuallyStopped.value = true;
+      invalidateRenewal();
+    }
+    return sendCommand(name, args, false);
+  }
+
+  function sendCommand(
+    name: DeviceCommand['command'],
+    args: Record<string, unknown>,
+    automatic: boolean,
+  ) {
     if (!state.value.connection.connected || !channelConnected.value)
       return Promise.reject(new Error('请先连接设备或打开回放'));
     for (const [key, value] of Object.entries((args.values as Record<string, unknown>) || {})) {
@@ -253,20 +454,31 @@ export function useDevice() {
       const timer = setTimeout(
         () => {
           pending.delete(id);
-          pendingCount.value = pending.size;
+          updatePendingCount();
           reject(new Error('等待设备回执超时，请检查实际状态后再试'));
         },
         name === 'config.set' ? 90000 : 18000,
       );
-      pending.set(id, { name, resolve, reject, timer });
-      pendingCount.value = pending.size;
+      pending.set(id, {
+        name,
+        automatic,
+        epoch: renewalEpoch,
+        stopVersion,
+        ...(['debug.set', 'debug.renew'].includes(name)
+          ? { debugSettings: { enabled: args.enabled, ttlSeconds: args.ttlSeconds } }
+          : {}),
+        resolve,
+        reject,
+        timer,
+      });
+      updatePendingCount();
     });
     void request('/command', payload).catch((cause: unknown) => {
       const item = pending.get(id);
       if (!item) return;
       clearTimeout(item.timer);
       pending.delete(id);
-      pendingCount.value = pending.size;
+      updatePendingCount();
       item.reject(cause instanceof Error ? cause : new Error('命令发送失败'));
     });
     return result;
@@ -288,10 +500,12 @@ export function useDevice() {
     connectSocket();
     clockTimer = setInterval(() => {
       now.value = Date.now();
+      maybeRenew();
     }, 1000);
   });
   onBeforeUnmount(() => {
     stopped = true;
+    invalidateRenewal(true);
     clearTimeout(retryTimer);
     clearInterval(clockTimer);
     rejectPending('页面已关闭');
@@ -306,6 +520,11 @@ export function useDevice() {
     error,
     notice,
     pendingCount,
+    autoRenewEnabled,
+    autoRenewStatus,
+    autoRenewError,
+    lastRenewedAt,
+    leaseRemainingMs,
     status,
     debug,
     oled,

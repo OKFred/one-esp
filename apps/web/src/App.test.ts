@@ -83,6 +83,11 @@ function makeSession() {
     deviceId: ref('test-device'),
     oledAge: ref(1000),
     samplingPaused: ref(true),
+    autoRenewEnabled: ref(true),
+    autoRenewStatus: ref('idle'),
+    autoRenewError: ref(''),
+    lastRenewedAt: ref<number | null>(null),
+    leaseRemainingMs: ref(0),
     stale: ref(false),
     refreshPorts: vi.fn(),
     connect: vi.fn(),
@@ -121,6 +126,19 @@ beforeEach(() => {
   });
 });
 afterEach(() => wrapper.unmount());
+
+it('defaults to automatic renewal while allowing it to be disabled independently of collection', async () => {
+  const autoRenew = wrapper
+    .findAllComponents({ name: 'Switch' })
+    .find((item) => item.attributes('aria-label') === '自动续期');
+  expect(autoRenew?.props('checked')).toBe(true);
+  expect(wrapper.text()).toContain('开启采集后自动续期');
+  autoRenew!.vm.$emit('change', false);
+  await nextTick();
+  expect(session.autoRenewEnabled.value).toBe(false);
+  expect(wrapper.text()).toContain('自动续期已关闭');
+  expect(session.perform).not.toHaveBeenCalled();
+});
 
 function numberControl(id: string) {
   const control = wrapper

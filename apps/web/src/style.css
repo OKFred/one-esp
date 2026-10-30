@@ -644,6 +644,23 @@ h1 {
   color: #5d7a89;
   letter-spacing: 0.4px;
 }
+.auto-renew-control {
+  margin-bottom: 18px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #27343d;
+}
+.auto-renew-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #b7ccd4;
+  font-size: 12px;
+}
+.auto-renew-control .control-help {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
 .toolbar-dot {
   margin: 0 9px;
   color: #415964;
