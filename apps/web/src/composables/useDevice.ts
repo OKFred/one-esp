@@ -34,6 +34,10 @@ export function useDevice() {
   const leaseExpiresAt = ref(0);
   const renewalInFlight = ref(false);
   const manuallyStopped = ref(false);
+  const screenRecoveryPending = ref(false);
+  const screenRecoveryError = ref('');
+  const screenProgressAt = ref<number | null>(null);
+  const activeScreenSince = ref<number | null>(null);
   const now = ref(Date.now());
   const pending = new Map<string, PendingCommand>();
   const secrets = new Set<string>();
@@ -48,6 +52,13 @@ export function useDevice() {
   let appliedLeaseIdentity: string | null = null;
   let awaitingReconnectSnapshot = false;
   let retryRenewalAt = 0;
+  let screenRecoveryEpoch = 0;
+  let lastScreenRecoveryAt = -Infinity;
+  let screenClock: string | null = null;
+  let screenIdentity: string | null = null;
+  let lastPacketAt = Date.now();
+  let receivedPacket = false;
+  let resumeSnapshotRequested = false;
 
   const clean = (value: string) => {
     let result = value;
@@ -80,6 +91,25 @@ export function useDevice() {
   const oledAge = computed(() =>
     state.value.oled ? Math.max(0, now.value - eventReceivedAt(state.value.oled)) : null,
   );
+  const screenTimeoutMs = computed(() =>
+    Math.max(10000, 3000 / Math.max(0.1, debug.value?.oledFps ?? 1)),
+  );
+  const screenStale = computed(() => {
+    if (!channelConnected.value || !state.value.connection.connected) return true;
+    if (!debug.value?.enabled || manuallyStopped.value) return false;
+    const baseline = activeScreenSince.value;
+    if (baseline === null) return false;
+    if (!oled.value) return now.value - baseline >= screenTimeoutMs.value;
+    if (screenClock !== null && screenProgressAt.value !== null)
+      return now.value - screenProgressAt.value >= screenTimeoutMs.value;
+    // Connecting/error pages can be intentionally static. Their status/debug
+    // cadence proves device liveness without repeatedly recapturing OLED.
+    const telemetryAt = Math.max(
+      state.value.status ? eventReceivedAt(state.value.status) : baseline,
+      state.value.debug ? eventReceivedAt(state.value.debug) : baseline,
+    );
+    return now.value - telemetryAt >= screenTimeoutMs.value;
+  });
   const samplingPaused = computed(
     () =>
       channelConnected.value && state.value.connection.connected && debug.value?.enabled === false,
@@ -129,6 +159,70 @@ export function useDevice() {
     }
   }
 
+  function invalidateScreenRecovery(resetProgress = false) {
+    screenRecoveryEpoch += 1;
+    screenRecoveryPending.value = false;
+    screenRecoveryError.value = '';
+    lastScreenRecoveryAt = -Infinity;
+    if (resetProgress) {
+      screenIdentity = null;
+      screenClock = null;
+      screenProgressAt.value = null;
+      activeScreenSince.value = null;
+    }
+  }
+
+  function recordScreen(event: DeviceEvent, receivedAt: number) {
+    const identity = JSON.stringify([event.deviceId, event.bootId]);
+    if (screenIdentity !== identity) {
+      if (screenIdentity !== null) {
+        const activeSince = activeScreenSince.value;
+        invalidateScreenRecovery(true);
+        activeScreenSince.value = activeSince;
+      }
+      screenIdentity = identity;
+    }
+    const token =
+      String(event.data.text ?? '').match(/\b(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d\b/)?.[0] ?? null;
+    // A repeated snapshot is a new packet, not proof that the device clock moved.
+    if (screenProgressAt.value === null || token !== screenClock) {
+      screenProgressAt.value = receivedAt;
+      screenRecoveryError.value = '';
+    }
+    screenClock = token;
+  }
+
+  function maybeRecoverScreen(force = false) {
+    const capabilities = state.value.hello?.data.capabilities;
+    if (
+      stopped ||
+      awaitingReconnectSnapshot ||
+      manuallyStopped.value ||
+      !channelConnected.value ||
+      !state.value.connection.connected ||
+      !debug.value?.enabled ||
+      screenRecoveryPending.value ||
+      pending.size > 0 ||
+      busy.value ||
+      !Array.isArray(capabilities) ||
+      !capabilities.includes('oled') ||
+      (!force && !screenStale.value) ||
+      Date.now() - lastScreenRecoveryAt < 15000
+    )
+      return;
+    const epoch = screenRecoveryEpoch;
+    lastScreenRecoveryAt = Date.now();
+    screenRecoveryPending.value = true;
+    void sendCommand('snapshot.get', {}, true)
+      .catch((cause: unknown) => {
+        if (stopped || epoch !== screenRecoveryEpoch) return;
+        screenRecoveryError.value = clean(cause instanceof Error ? cause.message : '画面恢复失败');
+      })
+      .finally(() => {
+        if (epoch === screenRecoveryEpoch) screenRecoveryPending.value = false;
+      });
+  }
+
   function leaseIdentity(snapshot: BridgeState) {
     const source = snapshot.hello ?? snapshot.status ?? snapshot.metrics ?? snapshot.debug;
     return source
@@ -157,10 +251,13 @@ export function useDevice() {
       data.expiresInMs > 0
     ) {
       leaseExpiresAt.value = receivedAt + data.expiresInMs;
+      activeScreenSince.value ??= receivedAt;
     } else if (data.enabled === false) {
       leaseExpiresAt.value = 0;
       invalidateRenewal(false, false);
       manuallyStopped.value = false;
+      activeScreenSince.value = null;
+      invalidateScreenRecovery();
     }
   }
 
@@ -219,6 +316,9 @@ export function useDevice() {
   watch(autoRenewEnabled, () => invalidateRenewal(), { flush: 'sync' });
 
   function acceptSnapshot(snapshot: BridgeState) {
+    const previousIdentity = leaseIdentity(state.value);
+    if (previousIdentity && previousIdentity !== leaseIdentity(snapshot))
+      invalidateScreenRecovery(true);
     received.clear();
     const events = [
       snapshot.hello,
@@ -242,7 +342,12 @@ export function useDevice() {
     state.value = { ...snapshot, metrics: snapshot.metrics ?? null };
     syncAppliedDuration();
     if (snapshot.debug) recordLease(snapshot.debug.data, eventReceivedAt(snapshot.debug));
+    if (snapshot.oled) recordScreen(snapshot.oled, eventReceivedAt(snapshot.oled));
     awaitingReconnectSnapshot = false;
+    if (resumeSnapshotRequested) {
+      resumeSnapshotRequested = false;
+      maybeRecoverScreen(true);
+    }
   }
 
   function rejectPending(reason: string) {
@@ -272,6 +377,7 @@ export function useDevice() {
     }
     if (previousBoot && event.bootId !== previousBoot && event.type !== 'log') {
       invalidateRenewal(true);
+      invalidateScreenRecovery(true);
       rejectPending('设备已重启，旧命令已取消');
       state.value = { ...createBridgeState(), connection: state.value.connection };
       received.clear();
@@ -280,6 +386,7 @@ export function useDevice() {
     state.value = applyDeviceEvent(state.value, event, Date.now());
     syncAppliedDuration();
     if (event.type === 'debug') recordLease(event.data, Date.now());
+    if (event.type === 'oled') recordScreen(event, Date.now());
     if (event.type === 'ack') {
       const ack = event.data as unknown as AckData;
       const command = pending.get(ack.id);
@@ -328,9 +435,12 @@ export function useDevice() {
       `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`,
     );
     socket = currentSocket;
+    lastPacketAt = Date.now();
+    receivedPacket = false;
     currentSocket.onopen = () => {
       if (stopped || socket !== currentSocket) return;
       channelConnected.value = true;
+      lastPacketAt = Date.now();
       retryDelay = 1000;
       error.value = '';
     };
@@ -341,6 +451,10 @@ export function useDevice() {
           type: string;
           data: BridgeState | DeviceEvent | BridgeState['connection'];
         };
+        if (['snapshot', 'event', 'connection', 'heartbeat'].includes(packet.type)) {
+          lastPacketAt = Date.now();
+          receivedPacket = true;
+        }
         if (packet.type === 'snapshot') {
           const snapshot = packet.data as BridgeState;
           if (bootId.value && snapshot.hello?.bootId && snapshot.hello.bootId !== bootId.value) {
@@ -356,6 +470,7 @@ export function useDevice() {
             connection.mode !== state.value.connection.mode;
           if (!connection.connected || changed) rejectPending('设备连接已变化，命令已取消');
           if (!connection.connected || changed) invalidateRenewal(true);
+          if (!connection.connected || changed) invalidateScreenRecovery(changed);
           if (changed) received.clear();
           state.value = changed
             ? { ...createBridgeState(), connection }
@@ -371,16 +486,39 @@ export function useDevice() {
     };
     currentSocket.onclose = () => {
       if (socket !== currentSocket) return;
-      awaitingReconnectSnapshot = true;
-      invalidateRenewal(true);
-      channelConnected.value = false;
-      state.value = { ...state.value, metrics: null };
-      rejectPending('调试通道已断开');
-      if (!stopped) {
-        retryTimer = setTimeout(connectSocket, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, 10000);
-      }
+      socket = undefined;
+      disconnectedSocket('调试通道已断开');
     };
+  }
+
+  function disconnectedSocket(reason: string) {
+    awaitingReconnectSnapshot = true;
+    invalidateRenewal(true);
+    invalidateScreenRecovery();
+    channelConnected.value = false;
+    state.value = { ...state.value, metrics: null };
+    rejectPending(reason);
+    if (!stopped) {
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(connectSocket, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 10000);
+    }
+  }
+
+  function checkSocket() {
+    if (stopped || !socket || Date.now() - lastPacketAt <= (receivedPacket ? 15000 : 20000)) return;
+    const previous = socket;
+    socket = undefined;
+    disconnectedSocket('调试通道无响应，正在重新连接');
+    previous.close();
+  }
+
+  function resumeViewer() {
+    if (stopped || document.visibilityState === 'hidden') return;
+    now.value = Date.now();
+    checkSocket();
+    if (!channelConnected.value || awaitingReconnectSnapshot) resumeSnapshotRequested = true;
+    else maybeRecoverScreen(true);
   }
 
   async function request<T>(path: string, body?: unknown): Promise<T> {
@@ -408,6 +546,7 @@ export function useDevice() {
 
   async function changeConnection(path: string, body: unknown) {
     invalidateRenewal(true);
+    invalidateScreenRecovery(true);
     busy.value = true;
     error.value = '';
     try {
@@ -427,6 +566,7 @@ export function useDevice() {
       stopVersion += 1;
       manuallyStopped.value = true;
       invalidateRenewal();
+      invalidateScreenRecovery();
     }
     return sendCommand(name, args, false);
   }
@@ -500,14 +640,21 @@ export function useDevice() {
     connectSocket();
     clockTimer = setInterval(() => {
       now.value = Date.now();
+      checkSocket();
       maybeRenew();
+      maybeRecoverScreen();
     }, 1000);
+    document.addEventListener('visibilitychange', resumeViewer);
+    window.addEventListener('pageshow', resumeViewer);
   });
   onBeforeUnmount(() => {
     stopped = true;
     invalidateRenewal(true);
+    invalidateScreenRecovery(true);
     clearTimeout(retryTimer);
     clearInterval(clockTimer);
+    document.removeEventListener('visibilitychange', resumeViewer);
+    window.removeEventListener('pageshow', resumeViewer);
     rejectPending('页面已关闭');
     socket?.close();
   });
@@ -535,6 +682,9 @@ export function useDevice() {
     deviceId,
     age,
     oledAge,
+    screenStale,
+    screenRecoveryPending,
+    screenRecoveryError,
     samplingPaused,
     stale,
     refreshPorts,

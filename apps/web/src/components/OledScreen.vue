@@ -50,6 +50,7 @@ watch(() => props.frame, draw);
       <div v-else-if="!frame.available" class="oled-waiting">
         <span>DISPLAY UNAVAILABLE</span><small>设备尚未初始化显示屏</small>
       </div>
+      <div v-else-if="stale && !paused" class="oled-stalled">画面停更 · 最后收到的画面</div>
     </div>
     <div class="oled-mount oled-mount-bottom"><i></i><span>128 × 64 / MONO_VLSB</span><i></i></div>
   </div>

@@ -82,6 +82,9 @@ function makeSession() {
     pins: ref([]),
     deviceId: ref('test-device'),
     oledAge: ref(1000),
+    screenStale: ref(false),
+    screenRecoveryPending: ref(false),
+    screenRecoveryError: ref(''),
     samplingPaused: ref(true),
     autoRenewEnabled: ref(true),
     autoRenewStatus: ref('idle'),
@@ -138,6 +141,21 @@ it('defaults to automatic renewal while allowing it to be disabled independently
   expect(session.autoRenewEnabled.value).toBe(false);
   expect(wrapper.text()).toContain('自动续期已关闭');
   expect(session.perform).not.toHaveBeenCalled();
+});
+
+it('flags a stalled screen independently of healthy resource telemetry', async () => {
+  session.samplingPaused.value = false;
+  session.debug.value = { ...lite, enabled: true };
+  session.screenStale.value = true;
+  session.screenRecoveryPending.value = true;
+  await nextTick();
+  expect(wrapper.find('.freshness.expired').text()).toBe('画面停更');
+  expect(wrapper.find('[aria-label="屏幕恢复状态"]').text()).toContain('正在恢复画面');
+  expect(wrapper.find('oled-screen-stub').attributes('stale')).toBe('true');
+  session.screenStale.value = false;
+  session.screenRecoveryPending.value = false;
+  await nextTick();
+  expect(wrapper.find('[aria-label="屏幕恢复状态"]').exists()).toBe(false);
 });
 
 function numberControl(id: string) {

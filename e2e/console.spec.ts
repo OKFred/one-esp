@@ -213,3 +213,62 @@ test('renews an active short session by default and respects a manual pause', as
   await expect(autoRenew).toBeChecked();
   await assertNoPageOverflow(page);
 });
+
+test('detects OLED-only silence and recovers without restarting sampling', async ({ page }) => {
+  let dropOled = false;
+  await page.routeWebSocket('**/ws', (viewer) => {
+    const server = viewer.connectToServer();
+    server.onMessage((message) => {
+      const packet = JSON.parse(String(message));
+      if (dropOled && packet.type === 'event' && packet.data.type === 'oled') return;
+      viewer.send(message);
+    });
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectScenario(page, '正常启动');
+  const canvas = page.locator('.oled-glass canvas');
+  await expect(canvas).toHaveAttribute('aria-label', /WiFi Connected!/);
+  dropOled = true;
+  const initial = await canvas.getAttribute('aria-label');
+  const snapshotRequest = page.waitForRequest(
+    (request) =>
+      request.url().endsWith('/api/command') && request.postDataJSON()?.command === 'snapshot.get',
+    { timeout: 25000 },
+  );
+  const writes: string[] = [];
+  page.on('request', (request) => {
+    if (request.url().endsWith('/api/command')) writes.push(request.postDataJSON().command);
+  });
+  await expect(page.locator('.display-panel')).toContainText('画面停更', { timeout: 25000 });
+  await snapshotRequest;
+  expect(await canvas.getAttribute('aria-label')).toBe(initial);
+  await saveScreenshot(page, 390, 'oled-stalled');
+  dropOled = false;
+  await expect(canvas).not.toHaveAttribute('aria-label', initial!);
+  await expect(page.locator('.display-panel')).not.toContainText('画面停更');
+  expect(writes).not.toContain('debug.set');
+  await assertNoPageOverflow(page);
+});
+
+test('reconnects a silently stalled websocket and receives a fresh screen', async ({ page }) => {
+  let blackhole = false;
+  let connections = 0;
+  await page.routeWebSocket('**/ws', (viewer) => {
+    const number = ++connections;
+    const server = viewer.connectToServer();
+    server.onMessage((message) => {
+      if (blackhole && number === 1) return;
+      viewer.send(message);
+    });
+  });
+  await page.goto('/');
+  await selectScenario(page, '正常启动');
+  const canvas = page.locator('.oled-glass canvas');
+  await expect(canvas).toHaveAttribute('aria-label', /WiFi Connected!/);
+  const initial = await canvas.getAttribute('aria-label');
+  blackhole = true;
+  await expect.poll(() => connections, { timeout: 25000 }).toBeGreaterThan(1);
+  await expect(canvas).not.toHaveAttribute('aria-label', initial!);
+  await expect(page.getByRole('switch', { name: '开启调试采集', exact: true })).toBeChecked();
+});

@@ -6,15 +6,21 @@ import { useDevice } from './useDevice';
 
 class FakeSocket {
   static current: FakeSocket;
+  private heartbeat: ReturnType<typeof setInterval>;
   onopen?: (event: Event) => void;
   onmessage?: (event: { data: string }) => void;
   onclose?: (event: Event) => void;
   onerror?: (event: Event) => void;
   constructor() {
     FakeSocket.current = this;
+    this.heartbeat = setInterval(() => this.receive('heartbeat', { ts: Date.now() }), 5000);
   }
   close() {
+    this.stopHeartbeat();
     this.onclose?.(new Event('close'));
+  }
+  stopHeartbeat() {
+    clearInterval(this.heartbeat);
   }
   receive(type: string, data: unknown) {
     this.onmessage?.({ data: JSON.stringify({ type, data }) });
@@ -516,4 +522,174 @@ describe('automatic lease renewal', () => {
       expect(sentCommands()).toHaveLength(1);
     },
   );
+});
+
+function startScreen(text?: string, fps = 2) {
+  FakeSocket.current.receive(
+    'event',
+    event('hello', {
+      firmware: 'test',
+      board: 'test',
+      capabilities: ['oled'],
+    }),
+  );
+  FakeSocket.current.receive('event', event('debug', { ...debugState(600000), oledFps: fps }));
+  if (text !== undefined)
+    FakeSocket.current.receive(
+      'event',
+      event('oled', {
+        available: true,
+        width: 128,
+        height: 64,
+        format: 'MONO_VLSB',
+        buffer: 'frame',
+        text,
+      }),
+    );
+}
+
+describe('screen liveness and viewer recovery', () => {
+  it('requests one read-only snapshot when OLED stops despite continuing status and heartbeat', async () => {
+    startScreen();
+    vi.advanceTimersByTime(9000);
+    FakeSocket.current.receive('event', event('status', { uptimeMs: 9000 }));
+    expect(sentCommands()).toHaveLength(0);
+    vi.advanceTimersByTime(1000);
+    expect(device.stale.value).toBe(false);
+    expect(device.screenStale.value).toBe(true);
+    expect(sentCommands()).toMatchObject([{ command: 'snapshot.get', args: {} }]);
+    expect(device.screenRecoveryPending.value).toBe(true);
+    expect(device.pendingCount.value).toBe(0);
+    // First-ever capture must not reset the recovery cooldown or invalidate its ACK.
+    FakeSocket.current.receive('event', event('oled', { text: '10-30 13:50:00', buffer: 'first' }));
+    acknowledge(sentCommands()[0]!, {});
+    await flushPromises();
+    vi.advanceTimersByTime(14000);
+    expect(sentCommands()).toHaveLength(1);
+    vi.advanceTimersByTime(1000);
+    expect(sentCommands()).toHaveLength(2);
+    vi.advanceTimersByTime(10000);
+    expect(sentCommands()).toHaveLength(2);
+    expect(sentCommands().every((command) => command.command === 'snapshot.get')).toBe(true);
+  });
+
+  it('does not let repeated clock snapshots conceal a frozen device clock', async () => {
+    const frozen = '10-30 13:50:00';
+    startScreen(frozen);
+    for (let i = 0; i < 2; i++) {
+      vi.advanceTimersByTime(5000);
+      FakeSocket.current.receive('event', event('oled', { text: frozen, buffer: 'same' }));
+      FakeSocket.current.receive('event', event('status', { uptimeMs: (i + 1) * 5000 }));
+    }
+    expect(device.oledAge.value).toBe(0);
+    expect(device.screenStale.value).toBe(true);
+    acknowledge(sentCommands()[0]!, {});
+    await flushPromises();
+    expect(device.screenStale.value).toBe(true);
+    FakeSocket.current.receive('event', event('oled', { text: '10-30 13:50:01', buffer: 'moved' }));
+    expect(device.screenStale.value).toBe(false);
+    expect(device.screenRecoveryError.value).toBe('');
+  });
+
+  it('gives a low-FPS clock three frame periods and accepts intentional static screens', () => {
+    startScreen('10-30 13:50:00', 0.2);
+    vi.advanceTimersByTime(14000);
+    expect(device.screenStale.value).toBe(false);
+    vi.advanceTimersByTime(1000);
+    expect(device.screenStale.value).toBe(true);
+    expect(sentCommands()).toHaveLength(1);
+    wrapper!.unmount();
+    wrapper = undefined;
+  });
+
+  it('does not treat an intentionally static Wi-Fi error screen as a frozen clock', () => {
+    startScreen('Check password');
+    for (let i = 0; i < 6; i++) {
+      vi.advanceTimersByTime(5000);
+      FakeSocket.current.receive('event', event('status', { uptimeMs: (i + 1) * 5000 }));
+    }
+    expect(device.oledAge.value).toBe(30000);
+    expect(device.screenStale.value).toBe(false);
+    expect(sentCommands()).toHaveLength(0);
+  });
+
+  it('keeps user commands ahead of recovery and ignores late recovery failure after manual stop', async () => {
+    startScreen();
+    const user = device.command('config.get');
+    vi.advanceTimersByTime(10000);
+    expect(sentCommands()).toHaveLength(1);
+    acknowledge(sentCommands()[0]!, {});
+    await user;
+    vi.advanceTimersByTime(1000);
+    const recovery = sentCommands()[1]!;
+    expect(recovery.command).toBe('snapshot.get');
+    const stopping = device.command('debug.set', { enabled: false });
+    const stop = sentCommands()[2]!;
+    acknowledge(recovery, {}, false);
+    acknowledge(stop, debugState(0, false));
+    FakeSocket.current.receive('event', event('debug', debugState(0, false)));
+    await stopping;
+    await flushPromises();
+    vi.advanceTimersByTime(60000);
+    expect(device.screenRecoveryError.value).toBe('');
+    expect(device.screenRecoveryPending.value).toBe(false);
+    expect(sentCommands()).toHaveLength(3);
+    expect(device.samplingPaused.value).toBe(true);
+  });
+
+  it('reconnects a half-open channel without waiting for its close event and ignores old messages', () => {
+    const old = FakeSocket.current;
+    old.receive('event', event('debug', debugState(0, false)));
+    old.stopHeartbeat();
+    vi.advanceTimersByTime(15000);
+    expect(device.channelConnected.value).toBe(true);
+    vi.advanceTimersByTime(1000);
+    expect(device.channelConnected.value).toBe(false);
+    old.receive('event', event('oled', { text: 'late old frame' }));
+    expect(device.oled.value).toBeUndefined();
+    vi.advanceTimersByTime(1000);
+    expect(FakeSocket.current).not.toBe(old);
+    FakeSocket.current.onopen?.(new Event('open'));
+    expect(device.channelConnected.value).toBe(true);
+    expect(sentCommands()).toHaveLength(0);
+  });
+
+  it('refreshes only active screens on foreground return and removes wake listeners on unmount', async () => {
+    startScreen('10-30 13:50:00');
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(sentCommands()).toMatchObject([{ command: 'snapshot.get' }]);
+    acknowledge(sentCommands()[0]!, {});
+    await flushPromises();
+    window.dispatchEvent(new Event('pageshow'));
+    expect(sentCommands()).toHaveLength(1);
+    wrapper!.unmount();
+    wrapper = undefined;
+    vi.advanceTimersByTime(60000);
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('pageshow'));
+    expect(sentCommands()).toHaveLength(1);
+  });
+
+  it('revalidates the socket after a suspended tab wakes and waits for its new snapshot', () => {
+    startScreen('10-30 13:50:00');
+    const old = FakeSocket.current;
+    vi.setSystemTime(Date.now() + 60000);
+    window.dispatchEvent(new Event('pageshow'));
+    expect(device.channelConnected.value).toBe(false);
+    expect(sentCommands()).toHaveLength(0);
+    vi.advanceTimersByTime(1000);
+    const replacement = FakeSocket.current;
+    expect(replacement).not.toBe(old);
+    replacement.onopen?.(new Event('open'));
+    expect(sentCommands()).toHaveLength(0);
+    const snapshot = createBridgeState();
+    snapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+    snapshot.hello = event('hello', { firmware: 'test', board: 'test', capabilities: ['oled'] });
+    snapshot.debug = event('debug', debugState(500000));
+    snapshot.oled = event('oled', { text: '10-30 13:50:00', buffer: 'same' });
+    snapshot.lastSeen = Date.now();
+    replacement.receive('snapshot', snapshot);
+    expect(device.screenStale.value).toBe(true);
+    expect(sentCommands()).toMatchObject([{ command: 'snapshot.get' }]);
+  });
 });

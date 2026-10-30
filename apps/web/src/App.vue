@@ -52,13 +52,15 @@ const {
   pins,
   deviceId,
   oledAge,
+  screenStale,
+  screenRecoveryPending,
+  screenRecoveryError,
   samplingPaused,
   autoRenewEnabled,
   autoRenewStatus,
   autoRenewError,
   lastRenewedAt,
   leaseRemainingMs,
-  stale,
   refreshPorts,
   connect,
   disconnect,
@@ -192,11 +194,13 @@ const screenAge = computed(() =>
     ? '设备未连接'
     : samplingPaused.value
       ? '采集已暂停'
-      : oledAge.value === null
-        ? '尚无数据'
-        : oledAge.value < 1000
-          ? '刚刚更新'
-          : `${Math.floor(oledAge.value / 1000)} 秒前更新`,
+      : screenStale.value
+        ? '画面停更'
+        : oledAge.value === null
+          ? '尚无数据'
+          : oledAge.value < 1000
+            ? '刚刚更新'
+            : `${Math.floor(oledAge.value / 1000)} 秒前更新`,
 );
 const firmwareVersion = computed(() => String(state.value.hello?.data.firmware ?? '等待识别'));
 const formatUptime = (milliseconds: number | undefined) => {
@@ -497,10 +501,20 @@ function clearVisibleLogs() {
                   <h2>屏幕镜像</h2>
                   <span class="panel-subtitle">DISPLAY</span>
                 </div>
-                <span :class="['freshness', { expired: stale }]"><i></i>{{ screenAge }}</span>
+                <span :class="['freshness', { expired: screenStale }]"><i></i>{{ screenAge }}</span>
               </div>
               <div class="display-content">
-                <OledScreen :frame="oled" :stale="stale" :paused="samplingPaused" />
+                <OledScreen :frame="oled" :stale="screenStale" :paused="samplingPaused" />
+                <p
+                  v-if="(screenStale && (oled || debug?.enabled)) || screenRecoveryPending"
+                  class="screen-recovery tone-warning"
+                  role="status"
+                  aria-label="屏幕恢复状态"
+                >
+                  <span v-if="screenStale">画面停更 · </span>
+                  {{ screenRecoveryPending ? '正在恢复画面' : '等待设备的新画面，自动尝试恢复' }}
+                  <span v-if="screenRecoveryError"> · {{ screenRecoveryError }}</span>
+                </p>
                 <ClockQuality v-if="status?.clock" :clock="status.clock" />
               </div>
               <div class="display-toolbar">
