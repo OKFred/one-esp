@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DeviceCommandSchema,
   DeviceEventSchema,
+  EnvironmentSchema,
   WIRE_PREFIX,
   applyDeviceEvent,
   createBridgeState,
@@ -33,7 +34,83 @@ const metrics = {
   sampleDurationUs: 400,
 };
 
+const environment = {
+  enabled: true,
+  phase: 'idle',
+  samples: 1,
+  failures: 0,
+  lastError: null,
+  readAtMs: 1000,
+  ageMs: 100,
+  stale: false,
+  intervalMs: 60000,
+  nextReadInMs: 59900,
+  temperatureC: 28.8,
+  relativeHumidityPercent: 48.4,
+};
+
 describe('portable device protocol', () => {
+  it('accepts enabled environment status and remains compatible with older firmware', () => {
+    const status = {
+      ...event,
+      type: 'status' as const,
+      data: {
+        uptimeMs: 1100,
+        memFree: 50000,
+        wifi: { connected: true, status: 1010 },
+        sensorEnabled: true,
+        environment,
+      },
+    };
+    expect(DeviceEventSchema.safeParse(status).success).toBe(true);
+    const { environment: _unused, ...legacy } = status.data;
+    expect(
+      DeviceEventSchema.safeParse({ ...status, data: { ...legacy, sensorEnabled: false } }).success,
+    ).toBe(true);
+    expect(parseDeviceLine(WIRE_PREFIX + JSON.stringify(status))?.data.environment).toEqual(
+      environment,
+    );
+  });
+  it('rejects unknown environment keys and unbounded, invalid or non-finite fields', () => {
+    for (const fields of [
+      { privateEndpoint: 'unit-only' },
+      { temperatureC: -40.1 },
+      { temperatureC: 125.1 },
+      { relativeHumidityPercent: -0.1 },
+      { relativeHumidityPercent: 100.1 },
+      { temperatureC: NaN },
+      { temperatureC: Infinity },
+      { relativeHumidityPercent: '48.4' },
+      { samples: 1.5 },
+      { failures: -1 },
+      { readAtMs: -1 },
+      { ageMs: -1 },
+      { intervalMs: 0 },
+      { nextReadInMs: -1 },
+      { stale: 'false' },
+      { phase: 'x'.repeat(41) },
+      { lastError: 'x'.repeat(81) },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...environment, ...fields }).success).toBe(false);
+  });
+  it('accepts missing readings as null and measured boundary values without inventing zero', () => {
+    const missing = {
+      ...environment,
+      samples: 0,
+      readAtMs: null,
+      ageMs: null,
+      temperatureC: null,
+      relativeHumidityPercent: null,
+      stale: true,
+    };
+    expect(EnvironmentSchema.parse(missing)).toEqual(missing);
+    for (const temperatureC of [-40, 125])
+      for (const relativeHumidityPercent of [0, 100])
+        expect(
+          EnvironmentSchema.safeParse({ ...environment, temperatureC, relativeHumidityPercent })
+            .success,
+        ).toBe(true);
+  });
   it('does not interpret ordinary boot logs as protocol', () => {
     expect(parseDeviceLine('ets Jul 29 2019')).toBeNull();
     expect(parseDeviceLine(WIRE_PREFIX + JSON.stringify(event))).toEqual(event);

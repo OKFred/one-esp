@@ -23,6 +23,7 @@ export interface StatusData {
   memFree: number | null;
   wifi: { connected: boolean; status: number | string; ssid?: string; ip?: string; rssi?: number };
   sensorEnabled: boolean;
+  environment?: EnvironmentData;
   maintenance?: { tcpMs?: number | null; tcpOk?: boolean | null };
   clock?: {
     synced: boolean;
@@ -58,3 +59,5 @@ export interface PortInfo {
   vendorId?: string;
   productId?: string;
 }
+import type { EnvironmentData } from '@one-esp/protocol';
+export type { EnvironmentData } from '@one-esp/protocol';

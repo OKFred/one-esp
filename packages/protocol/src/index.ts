@@ -56,6 +56,24 @@ export const MetricsSchema = z.object({
 });
 export type MetricsData = z.infer<typeof MetricsSchema>;
 
+export const EnvironmentSchema = z
+  .object({
+    enabled: z.boolean(),
+    phase: z.string().min(1).max(40),
+    samples: bytes,
+    failures: bytes,
+    lastError: z.string().max(80).nullable(),
+    readAtMs: bytes.nullable(),
+    ageMs: bytes.nullable(),
+    stale: z.boolean(),
+    intervalMs: z.number().int().positive(),
+    nextReadInMs: bytes,
+    temperatureC: z.number().min(-40).max(125).nullable(),
+    relativeHumidityPercent: z.number().min(0).max(100).nullable(),
+  })
+  .strict();
+export type EnvironmentData = z.infer<typeof EnvironmentSchema>;
+
 const eventDataSchemas = {
   hello: z
     .object({ firmware: z.string(), board: z.string(), capabilities: z.array(z.string()) })
@@ -73,7 +91,8 @@ const eventDataSchemas = {
           rssi: z.number().nullable().optional(),
         })
         .passthrough(),
-      sensorEnabled: z.literal(false),
+      sensorEnabled: z.boolean(),
+      environment: EnvironmentSchema.optional(),
     })
     .passthrough(),
   oled: OledFrameSchema,
