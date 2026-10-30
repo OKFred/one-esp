@@ -112,7 +112,7 @@ export function createReplaySession(
     send('debug', {
       enabled,
       profile,
-      expiresInMs: Math.max(0, expiresAt - Date.now()),
+      expiresInMs: enabled ? Math.max(0, expiresAt - Date.now()) : 0,
       oledFps: profile === 'full' ? 2 : 1,
       gpioHz: profile === 'full' ? 10 : 1,
       droppedLogs: 0,
@@ -259,8 +259,10 @@ export function createReplaySession(
     command(command) {
       if (command.command === 'debug.set') {
         enabled = command.args.enabled === true;
-        profile = command.args.profile === 'lite' ? 'lite' : 'full';
-        expiresAt = Date.now() + Math.min(1800, Number(command.args.ttlSeconds) || 600) * 1000;
+        if (enabled) {
+          profile = command.args.profile === 'lite' ? 'lite' : 'full';
+          expiresAt = Date.now() + Math.min(1800, Number(command.args.ttlSeconds) || 600) * 1000;
+        }
         debug();
         if (enabled) metrics();
       } else if (command.command === 'snapshot.get') {

@@ -61,3 +61,29 @@ it('replays resource metrics at 5/15 second cadence and stops on debug expiry', 
   session.stop();
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it('retains the device profile when pausing and refreshing a quiet replay', () => {
+  const events: DeviceEvent[] = [];
+  const session = createReplaySession(
+    'normal',
+    (event) => events.push(event),
+    () => {},
+  );
+  session.start();
+  session.command({
+    v: 1,
+    id: 'lite',
+    command: 'debug.set',
+    args: { enabled: true, profile: 'lite' },
+  });
+  session.command({ v: 1, id: 'pause', command: 'debug.set', args: { enabled: false } });
+  session.command({ v: 1, id: 'refresh', command: 'snapshot.get', args: {} });
+  expect(events.filter((event) => event.type === 'debug').at(-1)?.data).toMatchObject({
+    enabled: false,
+    profile: 'lite',
+    oledFps: 1,
+    gpioHz: 1,
+    expiresInMs: 0,
+  });
+  session.stop();
+});
