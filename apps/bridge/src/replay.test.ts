@@ -5,12 +5,26 @@ import type { DeviceEvent } from '@one-esp/protocol';
 afterEach(() => vi.useRealTimers());
 
 it.each([
-  ['normal', 'Sensor disabled', 'TCP: 42ms', '10-30 03:20:59', '10-30 03:21:00'],
-  ['wifi-error', 'WiFi failed', 'Check password', 'RTC 03:20:59', 'RTC 03:21:00'],
-  ['offline', 'Last known frame', 'Device offline', 'RTC 03:20:59', 'RTC 03:20:59'],
+  ['normal', 'USB diagnostics', 'Sensor disabled', 'TCP: 42ms', '10-30 03:20:59', '10-30 03:21:00'],
+  [
+    'wifi-error',
+    'WiFi failed',
+    'Check password',
+    'Edit WiFi config',
+    'RTC 03:20:59',
+    'RTC 03:21:00',
+  ],
+  [
+    'offline',
+    'USB diagnostics',
+    'Last known frame',
+    'Device offline',
+    'RTC 03:20:59',
+    'RTC 03:20:59',
+  ],
 ] as const)(
   '%s replay keeps the task layout and truthful clock progress',
-  (scenario, detail, state, stamp, nextStamp) => {
+  (scenario, title, detail, state, stamp, nextStamp) => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-29T19:20:59Z'));
     const events: DeviceEvent[] = [];
@@ -22,17 +36,12 @@ it.each([
     session.start();
     const first = events.find((event) => event.type === 'oled')!;
     const firstLines = String(first.data.text).split('\n');
-    expect(firstLines).toEqual(['USB diagnostics', detail, state, stamp]);
+    expect(firstLines).toEqual([title, detail, state, stamp]);
     expect(firstLines.every((line) => /^[\x20-\x7e]{1,16}$/.test(line))).toBe(true);
     expect(events.find((event) => event.type === 'status')!.data.sensorEnabled).toBe(false);
     vi.advanceTimersByTime(1000);
     const next = events.filter((event) => event.type === 'oled').at(-1)!;
-    expect(String(next.data.text).split('\n')).toEqual([
-      'USB diagnostics',
-      detail,
-      state,
-      nextStamp,
-    ]);
+    expect(String(next.data.text).split('\n')).toEqual([title, detail, state, nextStamp]);
     if (scenario === 'offline') expect(next.data.buffer).toBe(first.data.buffer);
     else expect(next.data.buffer).not.toBe(first.data.buffer);
     session.command({ v: 1, id: 'pause', command: 'debug.set', args: { enabled: false } });

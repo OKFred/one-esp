@@ -798,7 +798,8 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.clock_tick()
             screens.append(self.display.screen_display.call_args.args[0].split('\n'))
         self.assertEqual([screen[-1] for screen in screens], ['RTC 12:34:56', 'RTC 12:34:57'])
-        self.assertTrue(all(len(screen) == 4 and screen[2] == 'Check password' for screen in screens))
+        self.assertTrue(all(len(screen) == 4 and screen[:3] ==
+                            ['WiFi failed', 'Check password', 'Edit WiFi config'] for screen in screens))
         self.command('debug.set', {'enabled': True})
         self.assertTrue(self.runtime.service.enabled)
         self.assertIn('"type": "ack"', self.output.getvalue())
@@ -833,11 +834,12 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.mqtt = Mock(status=Mock(return_value=mqtt))
         self.assertEqual(self.runtime.task_screen().split('\n')[2], 'MQTT: pending')
         mqtt['transport'] = {'connected': False, 'phase': 'backoff'}
-        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'MQTT reconnect')
+        self.assertEqual(self.runtime.task_screen().split('\n')[:3],
+                         ['MQTT offline', 'Upload queued', 'Reconnecting...'])
         mqtt['clockReady'] = False
         self.assertEqual(self.runtime.task_screen().split('\n')[2], 'Syncing clock')
         self.runtime.network_state = 'reconnecting'
-        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'WiFi offline')
+        self.assertEqual(self.runtime.task_screen().split('\n')[0], 'WiFi offline')
 
     def test_task_screen_disabled_sensor_does_not_invent_environment_readings(self):
         self.runtime.network_state = 'connected'
@@ -851,8 +853,56 @@ class RuntimeTests(unittest.TestCase):
             self.runtime._mqtt_enabled = None
             self.runtime._mqtt_init_failed(None, permanent)
             lines = self.runtime.task_screen().split('\n')
-            self.assertEqual(lines[0], 'System telemetry')
+            self.assertEqual(lines[0], 'MQTT setup error')
             self.assertEqual(lines[2], expected)
+
+    def test_network_errors_take_the_title_and_recover_before_the_next_rtc_second(self):
+        self.runtime.network_state = 'connected'
+        self.wlan.connected = True
+        self.runtime._sensor_requested = True
+        self.runtime.tcp_ok = True
+        mqtt = {'enabled': True, 'clockReady': True, 'pending': True,
+                'transport': {'connected': True}}
+        client = types.SimpleNamespace(connected=True)
+        self.runtime.mqtt = Mock(status=Mock(return_value=mqtt), client=client)
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[0], 'Env telemetry')
+        self.clock.value = 100
+        self.runtime.tcp_at = 60000
+        self.runtime.record_probe(self.probe.result(False))
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[:3],
+                         ['TCP test failed', 'MQTT online', 'Retry in 60s'])
+        self.clock.value = 200
+        self.probe.busy = True
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[2], 'Testing TCP...')
+        self.clock.value = 300
+        self.probe.busy = False
+        self.runtime.record_probe(self.probe.result(True))
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[0], 'Env telemetry')
+        self.clock.value = 400
+        client.connected = False
+        mqtt['transport'] = {'connected': False, 'phase': 'backoff', 'nextRetryInMs': 1000}
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[:3],
+                         ['MQTT offline', 'Upload queued', 'Retry in 1s'])
+        self.clock.value = 500
+        self.wlan.connected = False
+        self.runtime.network_tick()
+        self.runtime.clock_tick()
+        self.assertEqual(self.display.screen_display.call_args.args[0].split('\n')[:3],
+                         ['WiFi offline', 'Env telemetry', 'Reconnecting...'])
+        self.clock.value = 600
+        self.wlan.connected = True
+        client.connected = True
+        mqtt['transport'] = {'connected': True}
+        self.runtime.network_tick()
+        self.runtime.clock_tick()
+        lines = self.display.screen_display.call_args.args[0].split('\n')
+        self.assertEqual(lines[0], 'Env telemetry')
+        self.assertEqual(lines[-1], 'RTC 12:34:56')
 
     def test_failed_trial_restores_previous_credentials_and_reports_rollback(self):
         self.command('debug.set', {'enabled': True}, 'enable')

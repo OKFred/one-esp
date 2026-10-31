@@ -330,6 +330,7 @@ class DiagnosticRuntime:
         environment = (self.sensor is not None or self._sensor_requested is True or
                        self._sensor_state in ('configuration_error', 'initialization_retry'))
         mqtt = self.mqtt.status() if self.mqtt else None
+        transport = (mqtt.get('transport') or {}) if mqtt else {}
         mqtt_problem = self._mqtt_state in ('configuration_error', 'initialization_retry')
         title = 'Env telemetry' if environment else (
             'System telemetry' if self._mqtt_enabled or mqtt_problem or (mqtt and mqtt.get('enabled'))
@@ -361,7 +362,6 @@ class DiagnosticRuntime:
         elif self.network_state != 'connected':
             delivery = 'WiFi pending'
         elif mqtt and mqtt.get('enabled'):
-            transport = mqtt.get('transport') or {}
             if not mqtt.get('clockReady'):
                 delivery = 'Syncing clock'
             elif transport.get('connected'):
@@ -377,6 +377,30 @@ class DiagnosticRuntime:
         else:
             delivery = ('TCP: ' + str(self.tcp_ms) + 'ms') if self.tcp_ok else (
                 'TCP: failed' if self.tcp_ok is False else 'TCP: pending')
+        # Errors take the heading as soon as the owning network stage notices
+        # them. A failed probe describes that test, not all Internet traffic.
+        if self.network_state == 'failed':
+            title, detail = 'WiFi failed', delivery
+            delivery = 'Edit WiFi config'
+        elif self.network_state == 'reconnecting':
+            detail, title, delivery = title, 'WiFi offline', 'Reconnecting...'
+        elif self.network_state == 'connected':
+            if self.tcp_ok is False:
+                title = 'TCP test failed'
+                detail = ('MQTT online' if transport.get('connected') else 'MQTT offline') if mqtt and mqtt.get('enabled') else 'WiFi online'
+                retry = max(0, self.tcp_at - self.service.now())
+                delivery = 'Testing TCP...' if self.probe.busy or not retry else 'Retry in %ds' % ((retry + 999) // 1000)
+            elif mqtt_problem:
+                title = 'MQTT setup error'
+                detail = 'Config invalid' if self._mqtt_state == 'configuration_error' else 'Setup retry'
+            elif (mqtt and mqtt.get('enabled') and mqtt.get('clockReady') and
+                  not transport.get('connected') and
+                  (transport.get('phase') in ('backoff', 'unavailable') or
+                   transport.get('connections', 0) > 0 or mqtt.get('transportFailures', 0) > 0)):
+                title = 'MQTT offline'
+                detail = 'Upload queued' if mqtt.get('pending') else 'Connection lost'
+                retry = transport.get('nextRetryInMs', 0)
+                delivery = 'Retry in %ds' % ((retry + 999) // 1000) if retry else 'Reconnecting...'
         local = get_local_time(float(self.config.values['TIMEZONE_HOURS']))
         stamp = local['formatted_simple_date_time'] if self.ntp_synced else 'RTC ' + local['formatted_time']
         # Keep overflow out of adjacent rows, especially the final clock row.
@@ -392,8 +416,10 @@ class DiagnosticRuntime:
         # Observe the RTC second boundary cheaply instead of refreshing at an
         # arbitrary one-second phase, which could leave displayed seconds late.
         # Formatting/I2C still occur only when the visible second/state changes.
+        client = getattr(self.mqtt, 'client', None)
         view = (time.time(), self.tcp_ok, self.tcp_ms, self.ntp_synced,
-                self.config.values['TIMEZONE_HOURS'], self.network_state)
+                self.config.values['TIMEZONE_HOURS'], self.network_state,
+                self._mqtt_state, getattr(client, 'connected', None), self.probe.busy)
         if view == self._last_clock_view:
             return
         if self.show(self.task_screen()):

@@ -184,7 +184,7 @@ export function createReplaySession(
     const clock = new Date(Date.now() + 8 * 3600_000).toISOString();
     const lines =
       scenario === 'wifi-error'
-        ? ['USB diagnostics', 'WiFi failed', 'Check password', `RTC ${clock.slice(11, 19)}`]
+        ? ['WiFi failed', 'Check password', 'Edit WiFi config', `RTC ${clock.slice(11, 19)}`]
         : scenario === 'offline'
           ? ['USB diagnostics', 'Last known frame', 'Device offline', `RTC ${clock.slice(11, 19)}`]
           : [

@@ -10,6 +10,10 @@ The environment sensor is opt-in through private `.sensor.json`; missing/disable
 
 The output-control allowlist in `components/board_profile.py` is empty; sensor ownership does not enable user writes to GPIO13/14/15. Future output entries require a reviewed GPIO, a Pin object and an explicit `safeValue`. Reserved pins cannot be opted in. Session expiry restores the reviewed safe values.
 
+The OLED uses four fixed rows of up to 16 ASCII characters: the primary task, two detail rows, and the current local date/time on the final row. Configured environment acquisition shows `Env telemetry`, measured temperature/humidity, and MQTT delivery state. Humidity is rounded to a whole percent on the small screen; telemetry retains its original precision. Failed/stale reads replace the displayed values with an explicit hint. Before time synchronization, the final row is marked `RTC`.
+
+Wi-Fi loss, a failed TCP probe, or a lost MQTT connection takes priority in the heading and detail rows; recovery restores the task view. Wi-Fi and MQTT changes redraw on the next approximately 100ms screen check. TCP errors appear when the existing once-per-minute probe detects failure, with a retry countdown or an active-test indication. A failed probe is labeled `TCP test failed`, since failure to reach one target does not prove that all Internet traffic is unavailable. The clock continues during network errors.
+
 ## USB protocol
 
 115200 baud, 8N1, no flow control. Lines begin with `@one-esp ` followed by one JSON object and LF. Ordinary boot/REPL output is not a protocol frame. The receiver uses `sys.stdin` and polling; it never initializes a second UART0 driver or executes received Python.
