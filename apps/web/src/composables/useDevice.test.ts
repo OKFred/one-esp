@@ -120,6 +120,166 @@ describe('device command lifecycle', () => {
     expect(device.samplingPaused.value).toBe(true);
     expect(device.stale.value).toBe(false);
   });
+
+  it('does not let a delayed HTTP snapshot replace newer same-boot WebSocket state', async () => {
+    const oldSnapshot = createBridgeState();
+    oldSnapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+    const kinds = ['hello', 'status', 'oled', 'pins', 'debug', 'metrics'] as const;
+    const oldData = [
+      { firmware: 'old', board: 'test', capabilities: [] },
+      { uptimeMs: 100, mqtt: { dailyAcknowledged: 10 } },
+      { text: '10-31 23:59:58' },
+      { pins: [] },
+      debugState(600000),
+      { sampledAtMs: 100 },
+    ];
+    for (const [index, kind] of kinds.entries())
+      oldSnapshot[kind] = { ...event(kind, oldData[index]!), seq: 10 + index, ts: 100 + index };
+    oldSnapshot.lastSeen = Date.now();
+    let resolveSnapshot!: (value: typeof oldSnapshot) => void;
+    const delayed = new Promise<typeof oldSnapshot>((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    vi.mocked(fetch).mockImplementation(
+      async (path) =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => (String(path).endsWith('/state') ? delayed : { accepted: true }),
+        }) as Response,
+    );
+    const connecting = device.connect('COM3');
+    await flushPromises();
+    const currentData = [
+      { firmware: 'current', board: 'test', capabilities: [] },
+      { uptimeMs: 200, mqtt: { dailyAcknowledged: 11 } },
+      { text: '10-31 23:59:59' },
+      { pins: [] },
+      debugState(10000),
+      { sampledAtMs: 200 },
+    ];
+    for (const [index, kind] of kinds.entries())
+      FakeSocket.current.receive('event', {
+        ...event(kind, currentData[index]!),
+        seq: 20 + index,
+        ts: 200 + index,
+      });
+    expect(device.status.value?.mqtt?.dailyAcknowledged).toBe(11);
+    vi.advanceTimersByTime(1000);
+    resolveSnapshot(oldSnapshot);
+    await connecting;
+    expect(device.status.value?.mqtt?.dailyAcknowledged).toBe(11);
+    for (const [index, kind] of kinds.entries())
+      expect(device.state.value[kind]?.seq).toBe(20 + index);
+    expect(device.oledAge.value).toBe(1000);
+    expect(device.leaseRemainingMs.value).toBe(9000);
+  });
+
+  it('does not let a delayed old-boot HTTP snapshot replace an observed device restart', async () => {
+    const oldSnapshot = createBridgeState();
+    oldSnapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+    oldSnapshot.hello = event('hello', { firmware: 'old', board: 'test', capabilities: [] });
+    oldSnapshot.status = event('status', { uptimeMs: 100, mqtt: { dailyAcknowledged: 10 } });
+    oldSnapshot.lastSeen = Date.now();
+    let resolveSnapshot!: (value: typeof oldSnapshot) => void;
+    const delayed = new Promise<typeof oldSnapshot>((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    vi.mocked(fetch).mockImplementation(
+      async (path) =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => (String(path).endsWith('/state') ? delayed : { accepted: true }),
+        }) as Response,
+    );
+    const connecting = device.connect('COM3');
+    await flushPromises();
+    FakeSocket.current.receive(
+      'event',
+      event('hello', { firmware: 'current', board: 'test', capabilities: [] }, 'boot-b'),
+    );
+    FakeSocket.current.receive(
+      'event',
+      event('status', { uptimeMs: 200, mqtt: { dailyAcknowledged: 5 } }, 'boot-b'),
+    );
+    expect(device.bootId.value).toBe('boot-b');
+    resolveSnapshot(oldSnapshot);
+    await connecting;
+    expect(device.bootId.value).toBe('boot-b');
+    expect(device.status.value?.mqtt?.dailyAcknowledged).toBe(5);
+  });
+
+  it('does not resurrect a connection that disconnected while its HTTP state was delayed', async () => {
+    const oldSnapshot = createBridgeState();
+    oldSnapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+    oldSnapshot.hello = event('hello', { firmware: 'old', board: 'test', capabilities: [] });
+    let resolveSnapshot!: (value: typeof oldSnapshot) => void;
+    const delayed = new Promise<typeof oldSnapshot>((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    vi.mocked(fetch).mockImplementation(
+      async (path) =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => (String(path).endsWith('/state') ? delayed : { accepted: true }),
+        }) as Response,
+    );
+    const connecting = device.connect('COM3');
+    await flushPromises();
+    FakeSocket.current.receive('connection', {
+      connected: false,
+      mode: 'usb',
+      port: 'COM3',
+      error: 'device removed',
+    });
+    resolveSnapshot(oldSnapshot);
+    await connecting;
+    expect(device.state.value.connection.connected).toBe(false);
+    expect(device.state.value.connection.error).toBe('device removed');
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'does not let an older connection operation %s over a completed newer disconnect',
+    async (completion) => {
+      const oldSnapshot = createBridgeState();
+      oldSnapshot.connection = { connected: true, mode: 'usb', port: 'COM3', error: null };
+      oldSnapshot.hello = event('hello', { firmware: 'old', board: 'test', capabilities: [] });
+      let resolveSnapshot!: (value: typeof oldSnapshot) => void;
+      let rejectSnapshot!: (reason: Error) => void;
+      const delayed = new Promise<typeof oldSnapshot>((resolve, reject) => {
+        resolveSnapshot = resolve;
+        rejectSnapshot = reject;
+      });
+      let stateReads = 0;
+      vi.mocked(fetch).mockImplementation(
+        async (path) =>
+          ({
+            ok: true,
+            status: 200,
+            json: async () =>
+              String(path).endsWith('/state')
+                ? ++stateReads === 1
+                  ? delayed
+                  : createBridgeState()
+                : { accepted: true },
+          }) as Response,
+      );
+      const oldOperation = device.connect('COM3');
+      await flushPromises();
+      await device.disconnect();
+      expect(device.state.value.connection.connected).toBe(false);
+      expect(device.error.value).toBe('');
+      if (completion === 'resolve') resolveSnapshot(oldSnapshot);
+      else rejectSnapshot(new Error('late old HTTP failure'));
+      await oldOperation;
+      expect(device.state.value.connection.connected).toBe(false);
+      expect(device.error.value).toBe('');
+      expect(device.busy.value).toBe(false);
+    },
+  );
+
   it('clears resource samples on disconnect/reboot and accepts older snapshots', () => {
     FakeSocket.current.receive('event', event('metrics', { sampledAtMs: 100 }));
     expect(device.metrics.value?.sampledAtMs).toBe(100);
@@ -162,6 +322,29 @@ describe('device command lifecycle', () => {
       event('hello', { firmware: 'test', board: 'test', capabilities: [] }, 'boot-b'),
     );
     await rejected;
+    expect(device.pendingCount.value).toBe(0);
+  });
+
+  it('ignores an old-boot ACK while a different command is pending on the new boot', async () => {
+    const oldCommand = device.command('snapshot.get');
+    const cancelled = expect(oldCommand).rejects.toThrow('设备已重启');
+    FakeSocket.current.receive(
+      'event',
+      event('hello', { firmware: 'test', board: 'test', capabilities: [] }, 'boot-b'),
+    );
+    await cancelled;
+    const current = device.command('snapshot.get');
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id', ok: true, result: {} }, 'boot-a'),
+    );
+    expect(device.bootId.value).toBe('boot-b');
+    expect(device.pendingCount.value).toBe(1);
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id-2', ok: true, result: {} }, 'boot-b'),
+    );
+    expect((await current).ok).toBe(true);
     expect(device.pendingCount.value).toBe(0);
   });
 
@@ -230,6 +413,88 @@ describe('device command lifecycle', () => {
     );
     await rejected;
     expect(device.pendingCount.value).toBe(0);
+  });
+
+  it.each(['mqtt.config.set', 'sensor.config.set'] as const)(
+    'ends the testing hint when %s has no final ACK after 90 seconds and ignores a late success',
+    async (name) => {
+      const result = device.perform(name, { revision: 1, values: { enabled: false } });
+      FakeSocket.current.receive(
+        'event',
+        event('ack', { id: 'command-id', ok: true, result: { stage: 'testing' } }),
+      );
+      await vi.advanceTimersByTimeAsync(89999);
+      expect(device.pendingCount.value).toBe(1);
+      expect(device.notice.value).toContain('设备正在测试');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toBeUndefined();
+      expect(device.pendingCount.value).toBe(0);
+      expect(device.error.value).toContain('等待设备回执超时');
+      expect(device.notice.value).not.toContain('设备正在测试');
+      FakeSocket.current.receive(
+        'event',
+        event('ack', { id: 'command-id', ok: true, result: { stage: 'applied', revision: 2 } }),
+      );
+      await flushPromises();
+      expect(device.error.value).toContain('等待设备回执超时');
+      expect(device.notice.value).not.toContain('设备已确认');
+      expect(sentCommands()).toHaveLength(1);
+    },
+  );
+
+  it.each(['mqtt.config.set', 'sensor.config.set'] as const)(
+    'clears the staged %s hint when its device connection disappears',
+    async (name) => {
+      const result = device.perform(name, { revision: 1, values: { enabled: false } });
+      FakeSocket.current.receive(
+        'event',
+        event('ack', { id: 'command-id', ok: true, result: { stage: 'testing' } }),
+      );
+      FakeSocket.current.receive('connection', {
+        connected: false,
+        mode: 'usb',
+        port: 'COM3',
+        error: null,
+      });
+      expect(await result).toBeUndefined();
+      expect(device.error.value).toContain('设备连接已变化');
+      expect(device.pendingCount.value).toBe(0);
+      expect(device.notice.value).not.toContain('设备正在测试');
+      expect(device.notice.value).not.toContain('回退');
+    },
+  );
+
+  it('does not clear the newer staged command hint when an older command ends', async () => {
+    const previous = device.command('mqtt.config.set', {
+      revision: 1,
+      values: { enabled: false },
+    });
+    const rejected = expect(previous).rejects.toThrow('older trial failed');
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id', ok: true, result: { stage: 'testing' } }),
+    );
+    const current = device.command('sensor.config.set', {
+      revision: 1,
+      values: { enabled: false },
+    });
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id-2', ok: true, result: { stage: 'testing' } }),
+    );
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id', ok: false, error: 'older trial failed' }),
+    );
+    await rejected;
+    expect(device.pendingCount.value).toBe(1);
+    expect(device.notice.value).toContain('设备正在测试');
+    FakeSocket.current.receive(
+      'event',
+      event('ack', { id: 'command-id-2', ok: true, result: { stage: 'applied' } }),
+    );
+    expect((await current).ok).toBe(true);
+    expect(device.notice.value).not.toContain('设备正在测试');
   });
 
   it('rejects an unsuccessful device ACK and redacts a newly entered password from the error', async () => {

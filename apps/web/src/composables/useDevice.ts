@@ -59,6 +59,9 @@ export function useDevice() {
   let lastPacketAt = Date.now();
   let receivedPacket = false;
   let resumeSnapshotRequested = false;
+  let stagedNoticeId: string | null = null;
+  let stateRevision = 0;
+  let connectionOperation = 0;
 
   const clean = (value: string) => {
     let result = value;
@@ -316,6 +319,7 @@ export function useDevice() {
   watch(autoRenewEnabled, () => invalidateRenewal(), { flush: 'sync' });
 
   function acceptSnapshot(snapshot: BridgeState) {
+    stateRevision += 1;
     const previousIdentity = leaseIdentity(state.value);
     if (previousIdentity && previousIdentity !== leaseIdentity(snapshot))
       invalidateScreenRecovery(true);
@@ -350,9 +354,16 @@ export function useDevice() {
     }
   }
 
+  function clearStagedNotice(id: string) {
+    if (stagedNoticeId !== id) return;
+    stagedNoticeId = null;
+    notice.value = '';
+  }
+
   function rejectPending(reason: string) {
-    for (const command of pending.values()) {
+    for (const [id, command] of pending) {
       clearTimeout(command.timer);
+      clearStagedNotice(id);
       command.reject(new Error(reason));
     }
     pending.clear();
@@ -368,6 +379,7 @@ export function useDevice() {
       !pending.has(String(event.data.id))
     )
       return;
+    stateRevision += 1;
     if (event.type === 'log') {
       const data = event.data as Record<string, unknown>;
       event = {
@@ -396,6 +408,7 @@ export function useDevice() {
         ack.ok &&
         ack.result?.stage === 'testing'
       ) {
+        stagedNoticeId = ack.id;
         notice.value =
           command.name === 'config.set'
             ? '设备正在测试新 Wi-Fi，等待最终结果（最多 60 秒）'
@@ -403,6 +416,7 @@ export function useDevice() {
         return;
       }
       clearTimeout(command.timer);
+      clearStagedNotice(ack.id);
       pending.delete(ack.id);
       updatePendingCount();
       if (ack.ok) {
@@ -471,6 +485,7 @@ export function useDevice() {
           acceptSnapshot(snapshot);
         } else if (packet.type === 'event') acceptEvent(packet.data as DeviceEvent);
         else if (packet.type === 'connection') {
+          stateRevision += 1;
           const connection = packet.data as BridgeState['connection'];
           const changed =
             connection.port !== state.value.connection.port ||
@@ -552,23 +567,31 @@ export function useDevice() {
   }
 
   async function changeConnection(path: string, body: unknown) {
+    const operation = ++connectionOperation;
     invalidateRenewal(true);
     invalidateScreenRecovery(true);
     busy.value = true;
     error.value = '';
     try {
       await request(path, body);
-      acceptSnapshot(await request<BridgeState>('/state'));
+      if (operation !== connectionOperation) return;
+      const revision = stateRevision;
+      const snapshot = await request<BridgeState>('/state');
+      // The ordered live stream owns any updates received while this HTTP
+      // snapshot was in flight. Do not replace them or refresh their ages.
+      if (operation === connectionOperation && revision === stateRevision) acceptSnapshot(snapshot);
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : '连接操作失败';
+      if (operation === connectionOperation)
+        error.value = cause instanceof Error ? cause.message : '连接操作失败';
     } finally {
-      busy.value = false;
+      if (operation === connectionOperation) busy.value = false;
     }
   }
 
   function command(name: DeviceCommand['command'], args: Record<string, unknown> = {}) {
     error.value = '';
     notice.value = '';
+    stagedNoticeId = null;
     if (name === 'debug.set' && args.enabled === false) {
       stopVersion += 1;
       manuallyStopped.value = true;
@@ -601,6 +624,7 @@ export function useDevice() {
       const timer = setTimeout(
         () => {
           pending.delete(id);
+          clearStagedNotice(id);
           updatePendingCount();
           reject(new Error('等待设备回执超时，请检查实际状态后再试'));
         },
@@ -625,6 +649,7 @@ export function useDevice() {
       if (!item) return;
       clearTimeout(item.timer);
       pending.delete(id);
+      clearStagedNotice(id);
       updatePendingCount();
       item.reject(cause instanceof Error ? cause : new Error('命令发送失败'));
     });

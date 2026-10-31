@@ -391,6 +391,31 @@ it('reports remote readiness only after granted SUBACK, not merely an enabled ex
   expect(wrapper.find('[aria-label="MQTT 下行状态"]').text()).toContain('已订阅');
 });
 
+it('ignores a late fallback reread after a successful save moves to another device context', async () => {
+  const fallback = deferred<AckData>();
+  let mqttReads = 0;
+  const command = vi.fn<Command>(async (name) => {
+    if (name === 'mqtt.config.set') return ack({ stage: 'applied' });
+    if (name === 'sensor.config.get') return ack(sensorResult());
+    ++mqttReads;
+    if (mqttReads === 2) return fallback.promise;
+    return ack(mqttResult(mqttReads === 1 ? 'first.example.com' : 'current.example.com'));
+  });
+  const wrapper = await open(command);
+  await flushPromises();
+  await submit(wrapper, 'mqtt');
+  await flushPromises();
+  expect(saveButton(wrapper, 'mqtt').attributes('data-loading')).toBe('true');
+  await wrapper.setProps({ identity: 'device-b/boot-b' });
+  await flushPromises();
+  fallback.resolve(ack(mqttResult('old-fallback.example.com', 99)));
+  await flushPromises();
+  expect(field(wrapper, '服务器').element).toHaveProperty('value', 'current.example.com');
+  expect(wrapper.text()).not.toContain('配置版本 99');
+  expect(wrapper.text()).not.toContain('MQTT 配置已应用');
+  expect(wrapper.emitted('applied')).toBeUndefined();
+});
+
 it('uses explicit RTU mode with mandatory CRC and has no control to bypass it', async () => {
   const command = commandWithReads();
   const wrapper = await open(command);
