@@ -44,7 +44,17 @@ export interface MqttStatusData {
   samples?: number;
   acknowledged?: number;
   pending?: boolean;
-  transport?: { connected?: boolean; phase?: string };
+  transport?: {
+    connected?: boolean;
+    phase?: string;
+    commands?: {
+      configured?: boolean;
+      active?: boolean;
+      state?: string;
+      replyPending?: number;
+      replyAcknowledged?: number;
+    };
+  };
 }
 
 export interface DebugData {

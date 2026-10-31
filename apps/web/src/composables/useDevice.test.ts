@@ -165,37 +165,48 @@ describe('device command lifecycle', () => {
     expect(device.pendingCount.value).toBe(0);
   });
 
-  it('keeps a staged Wi-Fi change pending until the final applied acknowledgement', async () => {
-    let finished = false;
-    const promise = device
-      .command('config.set', { revision: 1, values: { SSID: 'test' } })
-      .then((ack) => {
-        finished = true;
-        return ack;
-      });
-    FakeSocket.current.receive(
-      'event',
-      event('ack', {
-        id: 'command-id',
-        ok: true,
-        result: { stage: 'testing', timeoutSeconds: 60 },
-      }),
-    );
-    await flushPromises();
-    expect(finished).toBe(false);
-    expect(device.pendingCount.value).toBe(1);
-    expect(device.notice.value).toContain('测试新 Wi-Fi');
-    FakeSocket.current.receive(
-      'event',
-      event('ack', {
-        id: 'command-id',
-        ok: true,
-        result: { stage: 'applied', revision: 2 },
-      }),
-    );
-    expect((await promise).result?.revision).toBe(2);
-    expect(device.pendingCount.value).toBe(0);
-  });
+  it.each(['config.set', 'mqtt.config.set', 'sensor.config.set'] as const)(
+    'keeps staged %s pending until the final applied acknowledgement',
+    async (name) => {
+      let finished = false;
+      const promise = device
+        .command(name, {
+          revision: 1,
+          values: name === 'config.set' ? { SSID: 'test' } : { enabled: false },
+        })
+        .then((ack) => {
+          finished = true;
+          return ack;
+        });
+      FakeSocket.current.receive(
+        'event',
+        event('ack', {
+          id: 'command-id',
+          ok: true,
+          result: { stage: 'testing', timeoutSeconds: 60 },
+        }),
+      );
+      await flushPromises();
+      expect(finished).toBe(false);
+      expect(device.pendingCount.value).toBe(1);
+      expect(device.notice.value).toContain('设备正在测试');
+      await vi.advanceTimersByTimeAsync(10000);
+      FakeSocket.current.receive('heartbeat', { ts: Date.now() });
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(finished).toBe(false);
+      expect(device.pendingCount.value).toBe(1);
+      FakeSocket.current.receive(
+        'event',
+        event('ack', {
+          id: 'command-id',
+          ok: true,
+          result: { stage: 'applied', revision: 2 },
+        }),
+      );
+      expect((await promise).result?.revision).toBe(2);
+      expect(device.pendingCount.value).toBe(0);
+    },
+  );
 
   it('reports a staged Wi-Fi rollback as a failure instead of a successful save', async () => {
     const promise = device.command('config.set', { revision: 1, values: { SSID: 'test' } });

@@ -391,8 +391,15 @@ export function useDevice() {
       const ack = event.data as unknown as AckData;
       const command = pending.get(ack.id);
       if (!command) return;
-      if (command.name === 'config.set' && ack.ok && ack.result?.stage === 'testing') {
-        notice.value = '设备正在测试新 Wi-Fi，等待最终结果（最多 60 秒）';
+      if (
+        ['config.set', 'mqtt.config.set', 'sensor.config.set'].includes(command.name) &&
+        ack.ok &&
+        ack.result?.stage === 'testing'
+      ) {
+        notice.value =
+          command.name === 'config.set'
+            ? '设备正在测试新 Wi-Fi，等待最终结果（最多 60 秒）'
+            : '设备正在测试通信配置，等待应用或回退结果';
         return;
       }
       clearTimeout(command.timer);
@@ -597,7 +604,7 @@ export function useDevice() {
           updatePendingCount();
           reject(new Error('等待设备回执超时，请检查实际状态后再试'));
         },
-        name === 'config.set' ? 90000 : 18000,
+        ['config.set', 'mqtt.config.set', 'sensor.config.set'].includes(name) ? 90000 : 18000,
       );
       pending.set(id, {
         name,

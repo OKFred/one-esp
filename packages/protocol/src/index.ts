@@ -167,7 +167,7 @@ export const MqttConfigValuesSchema = z
     interval_seconds: z.number().int().min(60).max(86400).optional(),
     keepalive: z.number().int().min(15).max(300).optional(),
     commands_enabled: z.boolean().optional(),
-    ca_file: z.literal('.mqtt-ca.der').optional(),
+    ca_file: z.string().min(1).max(256).optional(),
     broker_ip: z.string().max(15).optional(),
   })
   .strict();
