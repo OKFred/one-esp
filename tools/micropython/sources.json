@@ -331,5 +331,7 @@
     "certificateVerificationRequired": true,
     "certificateTimeChecks": true
   },
-  "referenceAppSourcesSha256": "9a1a2a4244ecf4f9cefedc61142c8f8ddb145b0c0b070013f70cd052157d53a7"
+  "referenceAppSourcesSha256": "9a1a2a4244ecf4f9cefedc61142c8f8ddb145b0c0b070013f70cd052157d53a7",
+  "hardwareAccepted": false,
+  "runtimeAcceptance": "application-only flashed and digest verified; frozen startup and 16 current private files verified; short normal USB RTU/CRC/PUBACK and wrong-address rollback passed; one invalid UTF-8 line rejected; long-term, server-kick recovery and complete remote-command acceptance pending"
 }
