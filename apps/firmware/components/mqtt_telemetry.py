@@ -30,7 +30,7 @@ PUBLISH_RETRY_MS = 1000
 CONFIG_FIELDS = ('enabled', 'host', 'port', 'server_hostname', 'ca_file',
                  'username', 'password', 'client_id', 'site_id', 'gateway_id',
                  'device_id', 'interval_seconds', 'broker_ip', 'keepalive', 'keepalive_seconds',
-                 'ca_data')
+                 'ca_data', 'commands_enabled')
 
 
 def _text(value, maximum):
@@ -76,13 +76,16 @@ def validate_config(values):
     enabled = values.get('enabled', False)
     if type(enabled) is not bool:
         raise ValueError('Invalid MQTT enabled flag')
+    if type(values.get('commands_enabled', False)) is not bool:
+        raise ValueError('Invalid MQTT commands_enabled flag')
     if not enabled:
         return {'enabled': False}
     result = dict(values)
     result['enabled'] = True
+    result['commands_enabled'] = values.get('commands_enabled', False)
     result['port'] = values.get('port', 8883)
-    if type(result['port']) is not int or result['port'] != 8883:
-        raise ValueError('MQTT requires TLS port 8883')
+    if not _integer(result['port'], 1, 65535):
+        raise ValueError('Invalid MQTT TLS port')
     result['server_hostname'] = values.get('server_hostname', values.get('host'))
     for name in ('host', 'server_hostname'):
         if not _host(result.get(name)):
@@ -289,7 +292,8 @@ class TemperatureTelemetry:
         if not _utc_text_valid(stamp):
             return None
         metrics, source = observation.get('metrics'), observation.get('source')
-        if type(metrics) is not dict or type(source) is not dict or source.get('driver') != 'rs485.ascii.READ':
+        if (type(metrics) is not dict or type(source) is not dict or
+                source.get('driver') not in ('rs485.ascii.READ', 'rs485.modbus.sht20')):
             return None
         temperature, humidity = metrics.get('temperature_c'), metrics.get('humidity_pct')
         if (not _finite(temperature) or not -40 <= temperature <= 125 or
@@ -298,12 +302,41 @@ class TemperatureTelemetry:
         # Copy only known numeric metrics and fixed provenance. Provider-owned
         # latest observations may change while one original MQTT payload waits.
         copied = {'temperature_c': temperature, 'humidity_pct': humidity}
-        origins = {'temperature_c': 'rs485.ascii.READ', 'humidity_pct': 'rs485.ascii.READ'}
+        driver = source['driver']
+        if driver == 'rs485.modbus.sht20' and source.get('integrity') != 'crc_verified':
+            return None
+        origins = {'temperature_c': driver, 'humidity_pct': driver}
         cpu = metrics.get('cpu_temperature_c')
         if _finite(cpu):
             copied['cpu_temperature_c'] = cpu
             origins['cpu_temperature_c'] = 'esp32.raw_temperature'
-        return (copied, stamp, {'driver': 'rs485.ascii.READ', 'metric_sources': origins}, read_at, sequence)
+        provenance = {'driver': driver, 'metric_sources': origins,
+                      'integrity': 'crc_verified' if driver == 'rs485.modbus.sht20' else 'format_only'}
+        return (copied, stamp, provenance, read_at, sequence)
+
+    def prepare_reconfigure(self, config, client):
+        """Validate and allocate before a durable configuration commit."""
+        updated = validate_config(config)
+        if not updated['enabled']:
+            updated = dict(self.config)
+            updated.update(config)
+            updated['enabled'] = False
+        if self._pending is not None and any(updated.get(key) != self.config.get(key) for key in
+                                             ('site_id', 'gateway_id', 'device_id', 'client_id')):
+            raise ValueError('A pending message prevents MQTT identity changes')
+        topic = self._topic
+        if updated['enabled']:
+            topic = ('iot/v1/' + updated['site_id'] + '/' + updated['gateway_id'] +
+                     '/devices/' + updated['device_id'] + '/telemetry')
+        return updated, client, updated.get('interval_seconds', 60) * 1000, topic
+
+    def adopt_reconfiguration(self, prepared):
+        # All attributes already exist; adoption only moves references.
+        self.config, self.client, self._interval_ms, self._topic = prepared
+
+    def reconfigure(self, config, client):
+        """Adopt a verified transport without replacing a pending observation."""
+        self.adopt_reconfiguration(self.prepare_reconfigure(config, client))
 
     def _sample(self, now):
         if self._sample_provider is None:

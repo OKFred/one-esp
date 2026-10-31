@@ -384,6 +384,26 @@ describe('bridge controller without hardware', () => {
     expect(transport.writes).toHaveLength(2);
   });
 
+  it.each(['mqtt.config.set', 'sensor.config.set'] as const)(
+    'allows %s without a debug lease but rejects a stale boot',
+    async (name) => {
+      const { controller, transports } = setup();
+      await controller.connect('COM-test');
+      const transport = transports[0]!;
+      transport.receive(eventLine());
+      const command = {
+        v: 1,
+        id: 'settings',
+        bootId: 'old-boot',
+        command: name,
+        args: { revision: 0, values: { enabled: false } },
+      };
+      await expect(controller.command(command)).rejects.toThrow('已重启');
+      await controller.command({ ...command, bootId: 'test-boot' });
+      expect(transport.writes.at(-1)).toContain(name);
+    },
+  );
+
   it('never forwards GPIO writes outside the reported output whitelist', async () => {
     const { controller, transports } = setup();
     await controller.connect('COM-test');

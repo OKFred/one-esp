@@ -835,6 +835,29 @@ class DebugServiceTests(unittest.TestCase):
         self.assertEqual(len(self.events('ack')), 8)
         self.assertEqual(self.service._pending_acks, [])
 
+    def test_large_settings_ack_cache_is_byte_bounded_and_replacement_releases_budget(self):
+        for index in range(12):
+            self.service.acknowledge('large-' + str(index), True,
+                                     {'values': {'synthetic': 'x' * 1500}})
+        self.assertLessEqual(self.service._ack_bytes, 12288)
+        self.assertLess(len(self.service._acks), 12)
+        self.assertIn('large-11', self.service._acks)
+        before = self.service._ack_bytes
+        self.service.acknowledge('large-11', True, {'stage': 'applied'})
+        self.assertLess(self.service._ack_bytes, before)
+        self.assertEqual(self.service._ack_bytes, sum(self.service._ack_sizes.values()))
+        self.assertEqual(set(self.service._acks), set(self.service._ack_sizes))
+
+    def test_business_secret_redaction_handles_overlapping_replacements_and_fails_closed(self):
+        self.service.secret_provider = lambda: ['synthetic-short', 'synthetic-short-and-long']
+        self.assertEqual(self.service._redact('synthetic-short-and-long synthetic-short'),
+                         '[redacted] [redacted]')
+        def unavailable():
+            raise OSError('synthetic secret provider failure')
+        self.service.secret_provider = unavailable
+        self.assertEqual(self.service._redact('sensitive message'),
+                         'Secret state unavailable; message suppressed')
+
     def test_busy_debug_tick_emits_at_most_one_frame_with_logs_and_commands(self):
         self.service.metrics_provider = self.metrics
         self.enable()

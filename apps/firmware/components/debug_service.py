@@ -18,6 +18,8 @@ MAX_LOG_BYTES = 4096
 MAX_LOGS = 32
 LOG_OVERHEAD_BYTES = 64
 MAX_ACKS = 16
+MAX_ACK_BYTES = 12288
+ACK_OVERHEAD_BYTES = 256
 NORMAL_BYTES_PER_SECOND = 7000
 PRIORITY_BYTES_PER_SECOND = 2048
 SNAPSHOT_PIN_CHUNK = 6
@@ -38,7 +40,8 @@ def _utf8_size(value):
 class DebugService:
     def __init__(self, writer, device_id, boot_id, status_provider, pins,
                  config_store, config_apply=None, restart=None, clock=None,
-                 metrics_provider=None, writer_counts_bytes=None):
+                 metrics_provider=None, writer_counts_bytes=None,
+                 settings_handler=None, secret_provider=None):
         self.writer = writer
         # MicroPython stream.write reports UTF-8 bytes; CPython TextIO reports
         # characters. None-returning writers mean the complete part was written.
@@ -53,6 +56,8 @@ class DebugService:
         self.config = config_store
         self.config_apply = config_apply
         self.restart = restart
+        self.settings_handler = settings_handler
+        self.secret_provider = secret_provider
         self.clock = clock or time
         self._raw_tick = self.clock.ticks_ms()
         self._uptime = 0
@@ -77,6 +82,8 @@ class DebugService:
         self._oled_revision = 0
         self._sent_oled_revision = -1
         self._acks = {}
+        self._ack_sizes = {}
+        self._ack_bytes = 0
         self._ack_order = []
         self._pending_acks = []
         self._line = ''
@@ -100,12 +107,24 @@ class DebugService:
     def _redact(self, message):
         message = str(message)
         candidates = [self.config.values]
+        secrets = []
         if self.config.pending:
             candidates.append(self.config.pending)
         for values in candidates:
             secret = values.get('PASSWORD')
             if secret:
-                message = message.replace(secret, '[redacted]')
+                secrets.append(secret)
+        if self.secret_provider:
+            try:
+                for secret in self.secret_provider():
+                    if isinstance(secret, str) and secret:
+                        secrets.append(secret)
+            except Exception:
+                return 'Secret state unavailable; message suppressed'
+        # A previous credential may be a prefix of its replacement.
+        secrets.sort(key=len, reverse=True)
+        for secret in secrets:
+            message = message.replace(secret, '[redacted]')
         return message
 
     def _write_part(self, part, byte_size=None):
@@ -197,6 +216,8 @@ class DebugService:
                         'config', 'restart', 'gpio-allowlist', 'debug-renew']
         if self.metrics_provider:
             capabilities.append('metrics')
+        if self.settings_handler:
+            capabilities.extend(('mqtt-config', 'sensor-config'))
         return self.emit('hello', {
             'firmware': 'one-esp-debug/1.0', 'board': 'esp32-oled-096',
             'capabilities': capabilities,
@@ -328,11 +349,18 @@ class DebugService:
             data['result'] = result
         if error is not None:
             data['error'] = self._redact(error)
+        size = _utf8_size(json.dumps(data)) + ACK_OVERHEAD_BYTES
+        if size > MAX_ACK_BYTES:
+            data = {'id': command_id, 'ok': False, 'error': 'Command result exceeds acknowledgement budget'}
+            size = _utf8_size(json.dumps(data)) + ACK_OVERHEAD_BYTES
         if command_id not in self._acks:
             self._ack_order.append(command_id)
+        self._ack_bytes += size - self._ack_sizes.get(command_id, 0)
+        self._ack_sizes[command_id] = size
         self._acks[command_id] = data
-        while len(self._ack_order) > MAX_ACKS:
+        while len(self._ack_order) > MAX_ACKS or self._ack_bytes > MAX_ACK_BYTES:
             evicted = self._ack_order.pop(0)
+            self._ack_bytes -= self._ack_sizes.pop(evicted)
             del self._acks[evicted]
             if evicted in self._pending_acks:
                 self._pending_acks.remove(evicted)
@@ -370,15 +398,24 @@ class DebugService:
             args = command.get('args', {})
             if type(args) is not dict:
                 raise ValueError('Invalid command arguments')
-            if name not in ('debug.set', 'snapshot.get', 'config.get'):
+            business = name in ('mqtt.config.get', 'mqtt.config.set', 'sensor.config.get', 'sensor.config.set')
+            if name not in ('debug.set', 'snapshot.get', 'config.get', 'mqtt.config.get', 'sensor.config.get'):
                 if command.get('bootId') != self.boot_id:
                     raise ValueError('Device rebooted; refresh the snapshot')
-                if not self.enabled or self.now() >= self.expires_at:
+                if not business and (not self.enabled or self.now() >= self.expires_at):
                     self.stop()
                     raise ValueError('Enable a debug session first')
             elif 'bootId' in command and command['bootId'] != self.boot_id:
                 raise ValueError('Device rebooted; refresh the snapshot')
-            if name == 'debug.set':
+            if business:
+                if self.settings_handler is None:
+                    raise ValueError('Business settings unavailable')
+                def finish(response):
+                    self.acknowledge(command_id, response.get('ok') is True,
+                                     response.get('result'), response.get('error'))
+                response = self.settings_handler(name, args, command_id, finish)
+                finish(response)
+            elif name == 'debug.set':
                 if type(args.get('enabled')) is not bool:
                     raise ValueError('enabled must be a boolean')
                 if args['enabled']:

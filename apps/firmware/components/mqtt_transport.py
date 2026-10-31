@@ -18,7 +18,8 @@ try:
 except ImportError:
     import errno
 
-from components.mqtt_wire import connect_packet, publish_packet, ping_packet, PacketReader
+from components.mqtt_wire import (connect_packet, publish_packet, ping_packet, PacketReader,
+                                  subscribe_packet, puback_packet, decode_publish)
 
 
 DNS_TIMEOUT_MS = 15000
@@ -30,6 +31,8 @@ PING_TIMEOUT_MS = 10000
 MAX_BACKOFF_MS = 60000
 IO_BYTES_PER_TICK = 256
 MAX_PAYLOAD_BYTES = 2048
+MAX_COMMAND_REPLIES = 2
+MAX_COMMAND_PUBACKS = 8
 POLL_OUT = getattr(select, 'POLLOUT', 4)
 POLL_ERRORS = (getattr(select, 'POLLERR', 8) | getattr(select, 'POLLHUP', 16) |
                getattr(select, 'POLLNVAL', 32))
@@ -105,7 +108,11 @@ def _failure_details(phase, operation, reason, error):
                                   'Invalid MQTT CONNACK', 'Invalid MQTT PUBACK identifier',
                                   'MQTT input must be bytes', 'Unexpected MQTT packet header',
                                   'Invalid MQTT remaining length', 'MQTT packet is too large',
-                                  'Invalid MQTT packet length', 'MQTT receive flood'):
+                                  'Invalid MQTT packet length', 'MQTT receive flood',
+                                  'Unexpected MQTT SUBACK', 'Invalid MQTT SUBACK',
+                                  'Invalid MQTT command PUBLISH', 'Invalid MQTT command topic',
+                                  'Unexpected MQTT command PUBLISH', 'Invalid MQTT packet identifier',
+                                  'MQTT command acknowledgement queue full'):
                     reason = 'malformed_packet'
                 else:
                     certificate_reason = _certificate_reason(message)
@@ -189,7 +196,8 @@ class ThreadResolver:
 
 class MqttTransport:
     def __init__(self, config, now_ms, socket_module=None, ssl_module=None,
-                 resolver=None, poll_factory=None, collect=None):
+                 resolver=None, poll_factory=None, collect=None,
+                 command_handler=None, command_clock=None, command_active=True):
         self._config = config
         self._now = now_ms
         self._sockets = socket_module if socket_module is not None else socket
@@ -225,7 +233,32 @@ class MqttTransport:
                                              config['password'], self._keepalive, clean_session=True)
         self._resolver = resolver if resolver is not None else ThreadResolver(self._sockets)
         self._poll_factory = poll_factory if poll_factory is not None else select.poll
-        self._reader = PacketReader()
+        self._commands_enabled = config.get('commands_enabled', False) is True
+        self._commands_active = command_active is True
+        self._commands = None
+        self._command_topic = self._reply_topic = None
+        if all(isinstance(config.get(key), str) and config.get(key) for key in ('site_id', 'gateway_id', 'device_id')):
+            prefix = ('iot/v1/' + config['site_id'] + '/' + config['gateway_id'] +
+                      '/devices/' + config['device_id'] + '/commands')
+            # The codec rejects wildcard or invalid UTF-8 authority.
+            subscribe_packet(prefix, 1)
+            self._command_topic, self._reply_topic = prefix, prefix + '/ack'
+        if self._commands_enabled and callable(command_handler) and self._command_topic:
+            from components.mqtt_commands import CommandProcessor
+            self._commands = CommandProcessor(command_handler, command_clock)
+        self._command_state = ('awaiting_connection' if self._commands else
+                               'unavailable' if self._commands_enabled else 'disabled')
+        self._reader = PacketReader(allow_commands=self._commands is not None)
+        self._subscribe_id = None
+        self._subscribe_sent = False
+        self._subscribe_deadline = 0
+        self._command_pubacks = []
+        self._reply_queue = []
+        self._reply_inflight = None
+        self._reply_deadline = 0
+        self._reply_ack_count = 0
+        self._wrong_command_topics = 0
+        self._blocked_commands = 0
         self._raw = None
         self._stream = None
         self._poll = None
@@ -253,6 +286,7 @@ class MqttTransport:
         self._publish_count = 0
         self._ssl_context = None
         self._use_context = use_context
+        self._handoff_complete = False
 
     def _context(self):
         if self._ssl_context is None:
@@ -273,11 +307,93 @@ class MqttTransport:
             return False
         if not isinstance(payload, bytes) or not 1 <= len(payload) <= MAX_PAYLOAD_BYTES:
             raise ValueError('Invalid MQTT telemetry payload')
-        packet_id = self._next_packet_id % 65535 + 1
+        packet_id = self._packet_id()
         # Validate topic and size before accepting responsibility for this message.
         publish_packet(topic, payload, packet_id)
-        self._next_packet_id = packet_id
         self._pending = [topic, payload, packet_id, False]
+        return True
+
+    def _packet_id(self):
+        reserved = (self._pending[2] if self._pending else None,
+                    self._reply_inflight[2] if self._reply_inflight else None,
+                    self._subscribe_id)
+        for _ in range(4):
+            self._next_packet_id = self._next_packet_id % 65535 + 1
+            if self._next_packet_id not in reserved:
+                return self._next_packet_id
+        raise ValueError('MQTT packet identifiers unavailable')
+
+    def release_context(self):
+        """Free an inactive TLS context without discarding pending data."""
+        if self._raw is not None or self._stream is not None:
+            raise ValueError('MQTT connection must be closed before releasing TLS context')
+        self._ssl_context = None
+        self._collect_once()
+
+    def prepare_pending_transfer_from(self, previous):
+        """Validate/allocate before configuration commit; leave both senders intact."""
+        if (previous is self or not self.connected or self._pending is not None or
+                self._reply_inflight is not None or self._reply_queue or
+                (self._commands is not None and self._commands.status()['cached']) or
+                previous._raw is not None or previous._stream is not None or previous._handoff_complete):
+            raise ValueError('MQTT pending transfer is unavailable')
+        if (previous._reply_inflight or previous._reply_queue) and self._reply_topic != previous._reply_topic:
+            raise ValueError('MQTT control identity changed')
+        commands = previous._commands if self._command_topic == previous._command_topic else None
+        # All sums and the empty replacement queue are allocated here, before
+        # ownership moves. Large counters may use heap-backed MicroPython ints.
+        return (self, previous, previous._pending, previous._acked, previous._next_packet_id,
+                self._publish_count + previous._publish_count,
+                self._ack_count + previous._ack_count,
+                self._failures + previous._failures,
+                self._connections + previous._connections,
+                self._reply_ack_count + previous._reply_ack_count,
+                previous._reply_inflight, previous._reply_queue, [], commands)
+
+    def transfer_pending_from(self, previous, prepared=None):
+        """Adopt one paused sender; the prepared commit phase only assigns references."""
+        token = self.prepare_pending_transfer_from(previous) if prepared is None else prepared
+        if (type(token) is not tuple or len(token) != 14 or token[0] is not self or
+                token[1] is not previous or previous._pending is not token[2] or
+                previous._reply_queue is not token[11] or previous._handoff_complete or
+                not self.connected or self._pending is not None or self._reply_inflight is not None or
+                self._reply_queue or previous._raw is not None or previous._stream is not None):
+            raise ValueError('MQTT pending transfer preparation changed')
+        self._pending = token[2]
+        previous._pending = None
+        self._acked = token[3]
+        previous._acked = False
+        self._next_packet_id = token[4]
+        self._publish_count = token[5]
+        self._ack_count = token[6]
+        self._failures = token[7]
+        self._connections = token[8]
+        self._reply_ack_count = token[9]
+        self._reply_inflight = token[10]
+        previous._reply_inflight = None
+        self._reply_queue = token[11]
+        previous._reply_queue = token[12]
+        self._reply_deadline = 0
+        if token[13] is not None:
+            self._commands = token[13]
+            previous._commands = None
+        previous._handoff_complete = True
+        previous._state = 'transferred'
+
+    def set_commands_active(self, active):
+        """A candidate can test SUBACK while configuration execution is paused."""
+        if type(active) is not bool:
+            raise ValueError('Invalid MQTT command activation')
+        self._commands_active = active
+
+    def _enqueue_reply(self, identifier, payload):
+        for index, entry in enumerate(self._reply_queue):
+            if entry[0] == identifier:
+                self._reply_queue[index] = (identifier, payload)
+                return True
+        if len(self._reply_queue) >= MAX_COMMAND_REPLIES:
+            return False
+        self._reply_queue.append((identifier, payload))
         return True
 
     def take_ack(self):
@@ -298,16 +414,31 @@ class MqttTransport:
                 'publishes': self._publish_count, 'failures': self._failures,
                 'connections': self._connections, 'lastError': self._last_error,
                 'lastFailure': dict(self._last_failure) if self._last_failure else None,
-                'nextRetryInMs': max(0, self._retry_at - self._now())}
+                'nextRetryInMs': max(0, self._retry_at - self._now()),
+                'commands': dict({'configured': self._commands_enabled,
+                                  'active': self._commands_active and self._commands_enabled and self._commands is not None,
+                                  'state': self._command_state,
+                                  'replyPending': len(self._reply_queue) + bool(self._reply_inflight),
+                                  'replyAcknowledged': self._reply_ack_count,
+                                  'wrongTopics': self._wrong_command_topics,
+                                  'blocked': self._blocked_commands},
+                                 **(self._commands.status() if self._commands else {}))}
 
     def _drop_socket(self):
         raw, stream, poller = self._raw, self._stream, self._poll
         self._raw = self._stream = self._poll = None
+        self._state = 'waiting_network'
         self._tx = None
         self._tx_offset = 0
         self._tx_kind = None
         self._ack_deadline = self._ping_deadline = 0
-        self._reader.reset()
+        self._reply_deadline = self._subscribe_deadline = 0
+        self._subscribe_id = None
+        self._subscribe_sent = False
+        while self._command_pubacks:
+            self._command_pubacks.pop()
+        self._command_state = ('awaiting_connection' if self._commands_enabled and self._commands else
+                               'unavailable' if self._commands_enabled else 'disabled')
         if poller is not None and raw is not None:
             try:
                 poller.unregister(raw)
@@ -325,6 +456,9 @@ class MqttTransport:
                 raw.close()
             except Exception:
                 pass
+        # Reset can allocate a tiny parser buffer. Native handles must already
+        # be closed even when memory pressure prevents that allocation.
+        self._reader.reset()
 
     def close(self):
         """Release the connection; retained pending data may retry on later ticks."""
@@ -428,6 +562,11 @@ class MqttTransport:
                 self._ack_deadline = self._now() + ACK_TIMEOUT_MS
             elif kind == 'ping':
                 self._ping_deadline = self._now() + PING_TIMEOUT_MS
+            elif kind == 'subscribe':
+                self._subscribe_sent = True
+                self._subscribe_deadline = self._now() + ACK_TIMEOUT_MS
+            elif kind == 'command_reply':
+                self._reply_deadline = self._now() + ACK_TIMEOUT_MS
 
     def _read_once(self):
         self._operation = 'read'
@@ -442,7 +581,7 @@ class MqttTransport:
         if not data:
             raise OSError('MQTT stream closed')
         self._operation = 'packet_decode'
-        for packet_type, _, body in self._reader.feed(data):
+        for packet_type, flags, body in self._reader.feed(data):
             if packet_type == 2:
                 self._operation = 'connack'
                 if self._state != 'mqtt_connect' or body[0] != 0 or self._tx is not None:
@@ -450,15 +589,47 @@ class MqttTransport:
                 self._state = 'connected'
                 self._last_error = None
                 self._connections += 1
+                if self._commands_enabled and self._commands:
+                    self._subscribe_id = self._packet_id()
+                    self._command_state = 'subscribing'
             elif packet_type == 4:
                 packet_id = (body[0] << 8) | body[1]
-                if (self._state == 'connected' and self._pending is not None and
+                if (self._state == 'connected' and self._reply_inflight is not None and
+                        self._reply_deadline and packet_id == self._reply_inflight[2]):
+                    self._reply_inflight = None
+                    self._reply_deadline = 0
+                    self._reply_ack_count += 1
+                elif (self._state == 'connected' and self._pending is not None and
                         self._ack_deadline and packet_id == self._pending[2]):
                     self._pending = None
                     self._ack_deadline = 0
                     self._acked = True
                     self._ack_count += 1
                     self._attempt = 0
+            elif packet_type == 9:
+                packet_id = (body[0] << 8) | body[1]
+                if (not self.connected or not self._subscribe_sent or
+                        packet_id != self._subscribe_id or body[2] == 2):
+                    raise ValueError('Unexpected MQTT SUBACK')
+                self._subscribe_id = None
+                self._subscribe_deadline = 0
+                self._command_state = 'denied' if body[2] == 128 else 'ready'
+            elif packet_type == 3:
+                if not self.connected:
+                    raise ValueError('Unexpected MQTT command PUBLISH')
+                topic, payload, packet_id, qos, retained = decode_publish(flags, body)
+                if qos:
+                    if packet_id not in self._command_pubacks:
+                        if len(self._command_pubacks) >= MAX_COMMAND_PUBACKS:
+                            raise ValueError('MQTT command acknowledgement queue full')
+                        self._command_pubacks.append(packet_id)
+                if (self._commands_enabled and self._commands_active and self._commands and
+                        self._command_state == 'ready' and topic == self._command_topic):
+                    self._commands.receive(payload, retained)
+                elif topic != self._command_topic:
+                    self._wrong_command_topics += 1
+                else:
+                    self._blocked_commands += 1
             elif packet_type == 13:
                 if self._state != 'connected':
                     raise ValueError('Unexpected MQTT PINGRESP')
@@ -467,6 +638,8 @@ class MqttTransport:
 
     def tick(self, connected, time_ready):
         """Do at most one TLS write and one TLS read; never wait for an ACK."""
+        if self._handoff_complete:
+            return
         now = self._now()
         if not connected or not time_ready:
             if self._raw is not None or self._stream is not None or self._tx is not None:
@@ -517,8 +690,29 @@ class MqttTransport:
             if self._ping_deadline and now >= self._ping_deadline:
                 self._fail('ping_timeout')
                 return
+            if self._subscribe_deadline and now >= self._subscribe_deadline:
+                self._fail('subscription_timeout')
+                return
+            if self._reply_deadline and now >= self._reply_deadline:
+                self._fail('command_reply_timeout')
+                return
+            if self.connected and self._commands:
+                self._commands.drain(self._enqueue_reply)
             if self._state == 'connected' and self._tx is None:
-                if self._pending is not None and not self._ack_deadline:
+                if self._command_pubacks:
+                    self._queue(puback_packet(self._command_pubacks.pop(0)), 'command_puback')
+                elif self._subscribe_id is not None and not self._subscribe_sent:
+                    self._queue(subscribe_packet(self._command_topic, self._subscribe_id), 'subscribe')
+                elif self._subscribe_id is None and self._reply_inflight is not None and not self._reply_deadline:
+                    _, payload, packet_id, attempted = self._reply_inflight
+                    self._queue(publish_packet(self._reply_topic, payload, packet_id, duplicate=attempted), 'command_reply')
+                    self._reply_inflight[3] = True
+                elif self._subscribe_id is None and self._reply_inflight is None and self._reply_queue:
+                    identifier, payload = self._reply_queue.pop(0)
+                    packet_id = self._packet_id()
+                    self._reply_inflight = [identifier, payload, packet_id, True]
+                    self._queue(publish_packet(self._reply_topic, payload, packet_id), 'command_reply')
+                elif self._subscribe_id is None and self._pending is not None and not self._ack_deadline:
                     topic, payload, packet_id, attempted = self._pending
                     self._queue(publish_packet(topic, payload, packet_id, duplicate=attempted), 'publish')
                     self._pending[3] = True

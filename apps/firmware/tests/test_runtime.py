@@ -697,7 +697,7 @@ class RuntimeTests(unittest.TestCase):
         expected = {'sample': 7, 'readAtMs': 1234, 'readTimeUtc': '2026-10-31T01:02:03Z',
                     'metrics': {'temperature_c': 28.8, 'humidity_pct': 48.4,
                                 'cpu_temperature_c': 53.3},
-                    'source': {'driver': 'rs485.ascii.READ'}}
+                    'source': {'driver': 'rs485.ascii.READ', 'integrity': 'format_only'}}
         self.assertEqual(self.runtime._sensor_sample(), expected)
         capture.assert_called_once()
         self.clock.value = 11234
@@ -1378,7 +1378,9 @@ class RuntimeTests(unittest.TestCase):
                 self.runtime.mqtt_tick()
             self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,)])
         load.assert_called_once_with(self.runtime._mqtt_config_path)
-        transport.assert_called_once_with(config, self.runtime.service.now)
+        transport.assert_called_once_with(config, self.runtime.service.now,
+                                          command_handler=self.runtime.handle_sensor_command,
+                                          command_clock=self.runtime._command_clock)
         sampler.assert_called_once_with(config, client, self.runtime.service.now, logger=self.runtime.service.log)
         self.assertIs(self.runtime.mqtt, publisher)
         self.assertTrue(self.runtime._mqtt_initialized)

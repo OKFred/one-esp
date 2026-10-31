@@ -50,7 +50,9 @@ class DiagnosticRuntime:
         self.service = DebugService(sys.stdout.write, device_id, boot_id,
                                     self.status, self.pins, self.config,
                                     self.apply_config, self.schedule_restart, clock=time,
-                                    metrics_provider=lambda interval: self.metrics.sample(interval))
+                                    metrics_provider=lambda interval: self.metrics.sample(interval),
+                                    settings_handler=self._handle_settings_command,
+                                    secret_provider=self._settings_secrets)
         self.metrics = SystemMetrics(self.service.now, wlan=self.wlan)
         # A text read(1) can wait for UTF-8 continuation bytes after POLLIN.
         # Explicit binary adapters also support host tests without real stdin.
@@ -114,6 +116,15 @@ class DiagnosticRuntime:
         self._sensor_interval_ms = 60000
         self._sensor_gate_until = self.service.now() + 20000
         self._mqtt_init_stage = 'not_started'
+        self._settings_stores = {}
+        self._sensor_options = None
+        self._sensor_sequence = 0
+        self._sensor_sample_offset = 0
+        self._sensor_reader_sample = None
+        self._sensor_trial = None
+        self._mqtt_trial = None
+        self._environment_mode = False
+        self._sensor_pin_defaults = {gpio: dict(self.pins.descriptions[gpio]) for gpio in (13, 14, 15)}
         self.service.hello()
 
     def status(self):
@@ -140,6 +151,8 @@ class DiagnosticRuntime:
                 'wifi': wifi, 'sensorEnabled': self.sensor is not None,
                 'environment': self.sensor.status() if self.sensor else {
                     'enabled': self._sensor_requested is True, 'phase': self._sensor_state,
+                    'protocol': (self._sensor_options or {}).get('protocol', 'ascii_read'),
+                    'integrity': 'none', 'crcFailures': 0, 'lastFrameHex': '',
                     'samples': 0, 'failures': 0, 'lastError': None,
                     'readAtMs': None, 'ageMs': None, 'stale': True,
                     'intervalMs': 60000, 'nextReadInMs': 0,
@@ -562,6 +575,247 @@ class DiagnosticRuntime:
             self.pins.restore_safe_values()
             machine.reset()
 
+    def _settings(self, kind):
+        if kind not in self._settings_stores:
+            from components.device_settings import SettingsStore
+            path = self._mqtt_config_path if kind == 'mqtt' else self._sensor_config_path
+            self._settings_stores[kind] = SettingsStore(path, kind)
+        return self._settings_stores[kind]
+
+    def _settings_secrets(self):
+        result = []
+        publisher = getattr(self, 'mqtt', None)
+        if publisher and isinstance(getattr(publisher, 'config', None), dict):
+            secret = publisher.config.get('password')
+            if secret:
+                result.append(secret)
+        for store in getattr(self, '_settings_stores', {}).values():
+            result.extend(store.secret_values())
+        return result
+
+    def _command_clock(self):
+        try:
+            seconds = int(time.time())
+            if time.gmtime(0)[0] == 2000:
+                seconds += 946684800
+            return seconds, self._mqtt_clock_ready()
+        except (AttributeError, OSError, TypeError, ValueError):
+            return 0, False
+
+    def handle_sensor_command(self, command, finish):
+        """Restricted MQTT entry; business settings do not require USB debug."""
+        name = command.get('command') if type(command) is dict else None
+        if name not in ('sensor.config.get', 'sensor.config.set'):
+            return {'ok': False, 'error': 'Unsupported remote command'}
+        try:
+            return self._handle_settings_command(name, command.get('args', {}), command.get('id'), finish)
+        except (ValueError, TypeError, KeyError, OSError):
+            return {'ok': False, 'error': 'Sensor configuration rejected'}
+
+    def _handle_settings_command(self, name, args, command_id, finish):
+        if name not in ('mqtt.config.get', 'mqtt.config.set', 'sensor.config.get', 'sensor.config.set'):
+            raise ValueError('Unsupported business settings command')
+        if type(args) is not dict:
+            raise ValueError('Invalid configuration arguments')
+        kind = 'mqtt' if name.startswith('mqtt.') else 'sensor'
+        store = self._settings(kind)
+        if name.endswith('.get'):
+            if args:
+                raise ValueError('Invalid configuration arguments')
+            return {'ok': True, 'result': store.public()}
+        if (type(args) is not dict or set(args) != {'revision', 'values'} or
+                not isinstance(command_id, str) or not callable(finish)):
+            raise ValueError('Invalid configuration arguments')
+        if self._sensor_trial or self._mqtt_trial:
+            raise ValueError('A settings trial is already running')
+        if (kind == 'mqtt' and self.mqtt and getattr(self.mqtt, '_pending', None) is not None and
+                type(args['values']) is dict and any(key in args['values'] and
+                    args['values'][key] != self.mqtt.config.get(key)
+                    for key in ('site_id', 'gateway_id', 'device_id', 'client_id'))):
+            raise ValueError('A pending message prevents MQTT identity changes')
+        candidate = store.begin(args['values'], args['revision'])
+        previous_environment = self._environment_mode
+        previous_provider = getattr(self.mqtt, '_sample_provider', None) if self.mqtt else None
+        try:
+            if kind == 'sensor':
+                if not candidate['enabled']:
+                    self._apply_sensor_values(candidate)
+                    result = store.commit({'stage': 'applied'})
+                    return {'ok': True, 'result': result}
+                self._sensor_trial = {'store': store, 'finish': finish,
+                                      'previousEnvironment': previous_environment,
+                                      'previousProvider': previous_provider,
+                                      'deadline': self.service.now() + max(3000, candidate['timeout_ms'] + 1500)}
+                self._apply_sensor_values(candidate)
+            else:
+                previous = self.mqtt
+                if (previous and getattr(previous, '_pending', None) is not None and
+                        any(candidate.get(key) != previous.config.get(key) for key in
+                            ('site_id', 'gateway_id', 'device_id', 'client_id'))):
+                    raise ValueError('A pending message prevents MQTT identity changes')
+                old_client = getattr(previous, 'client', None)
+                if old_client:
+                    old_client.close()
+                    if callable(getattr(old_client, 'release_context', None)):
+                        old_client.release_context()
+                if not candidate['enabled']:
+                    prepared = previous.prepare_reconfigure(candidate, old_client) if previous else None
+                    result = store.commit({'stage': 'applied'})
+                    if previous:
+                        previous.adopt_reconfiguration(prepared)
+                    self._mqtt_enabled = False
+                    self._mqtt_state = 'disabled'
+                    return {'ok': True, 'result': result}
+                self._mqtt_trial = {'store': store, 'finish': finish, 'previous': previous,
+                                    'client': None, 'config': None,
+                                    'deadline': self.service.now() + 45000}
+                gc.collect()
+                from components.mqtt_telemetry import load_config
+                from components.mqtt_transport import MqttTransport
+                config = load_config(store.pending_path)
+                client = MqttTransport(config, self.service.now,
+                                       command_handler=self.handle_sensor_command,
+                                       command_clock=self._command_clock, command_active=False)
+                self._mqtt_trial.update(client=client, config=config)
+                self._mqtt_state = 'testing'
+        except (ValueError, TypeError, KeyError, OSError, MemoryError):
+            store.rollback()
+            if kind == 'sensor':
+                self._sensor_trial = None
+                self._apply_sensor_values(store.values)
+                self._environment_mode = previous_environment
+                if self.mqtt is not None:
+                    self.mqtt._sample_provider = previous_provider
+            elif self._mqtt_trial:
+                trial, self._mqtt_trial = self._mqtt_trial, None
+                if trial.get('client'):
+                    trial['client'].close()
+                    if callable(getattr(trial['client'], 'release_context', None)):
+                        trial['client'].release_context()
+                self._mqtt_state = 'initialization_retry'
+            result = store.public()
+            result['stage'] = 'rolled-back'
+            return {'ok': False, 'result': result,
+                    'error': 'Settings trial could not start; previous configuration restored'}
+        result = store.public()
+        result['stage'] = 'testing'
+        return {'ok': True, 'result': result}
+
+    def _apply_sensor_values(self, values):
+        self.close_sensor()
+        self._environment_mode = True
+        self._sensor_options = dict(values)
+        self._sensor_requested = values['enabled']
+        self._sensor_interval_ms = values['interval_seconds'] * 1000
+        self._sensor_retry_at = 0
+        self._sensor_gate_until = self.service.now()
+        self._sensor_state = 'starting' if values['enabled'] else 'disabled'
+        if self.mqtt is not None:
+            self.mqtt._sample_provider = self._sensor_sample
+
+    def _settings_reply(self, finish, response):
+        # A failed notification cannot undo an already committed configuration.
+        try:
+            finish(response)
+        except Exception:
+            try:
+                self.service.log('warn', 'Settings acknowledgement could not be queued')
+            except Exception:
+                pass
+
+    def _finish_sensor_trial(self, success):
+        trial, self._sensor_trial = self._sensor_trial, None
+        if not trial:
+            return
+        store = trial['store']
+        try:
+            result = store.commit({'stage': 'applied'}) if success else store.rollback()
+        except (OSError, ValueError, MemoryError):
+            success = False
+            result = store.rollback()
+        if not success:
+            self._apply_sensor_values(store.values)
+            self._environment_mode = trial['previousEnvironment']
+            if self.mqtt is not None:
+                self.mqtt._sample_provider = trial['previousProvider']
+        result['stage'] = 'applied' if success else 'rolled-back'
+        response = {'ok': success, 'result': result}
+        if not success:
+            response['error'] = 'Sensor read trial failed; previous configuration restored'
+        self._settings_reply(trial['finish'], response)
+
+    def settings_tick(self):
+        if self._sensor_trial:
+            failed = self.service.now() >= self._sensor_trial['deadline']
+            if self._sensor_state in ('configuration_error', 'initialization_retry'):
+                failed = True
+            if self.sensor:
+                failures = self.sensor.status().get('failures')
+                failed = failed or (type(failures) is int and failures > 0)
+            if failed:
+                self._finish_sensor_trial(False)
+
+    def _mqtt_trial_tick(self):
+        trial = self._mqtt_trial
+        client, store = trial['client'], trial['store']
+        reason = None
+        state = {}
+        try:
+            client.tick(self.wlan.isconnected(), self._mqtt_clock_ready())
+            state = client.status()
+            commands = state.get('commands') or {}
+            if commands.get('state') in ('denied', 'unavailable'):
+                reason = 'MQTT command subscription unavailable'
+            elif client.connected and (not trial['config'].get('commands_enabled') or commands.get('state') == 'ready'):
+                previous = trial['previous']
+                if previous is None:
+                    from components.mqtt_telemetry import TemperatureTelemetry
+                    kwargs = {'logger': self.service.log}
+                    if self._environment_mode or self._sensor_requested:
+                        kwargs['sample_provider'] = self._sensor_sample
+                    publisher = TemperatureTelemetry(trial['config'], client, self.service.now, **kwargs)
+                    # A new publisher cannot turn a cached physical observation
+                    # into a new UUID simply because MQTT settings changed.
+                    self._sensor_observation = None
+                else:
+                    publisher = previous
+                    prepared = previous.prepare_reconfigure(trial['config'], client)
+                    transfer = client.prepare_pending_transfer_from(previous.client)
+                response = {'ok': True, 'result': None}
+                result = store.commit({'stage': 'applied', 'commands': commands})
+                if previous is not None:
+                    client.transfer_pending_from(previous.client, prepared=transfer)
+                    previous.adopt_reconfiguration(prepared)
+                self.mqtt = publisher
+                client.set_commands_active(True)
+                self._mqtt_enabled = True
+                self._mqtt_initialized = True
+                self._mqtt_state = 'ready'
+                self._mqtt_init_stage = 'ready'
+                self._mqtt_trial = None
+                response['result'] = result
+                self._settings_reply(trial['finish'], response)
+                return
+            elif self.service.now() >= trial['deadline']:
+                reason = 'MQTT connection trial timed out'
+        except (OSError, ValueError, TypeError, MemoryError):
+            reason = 'MQTT connection trial failed'
+        if reason:
+            client.close()
+            if callable(getattr(client, 'release_context', None)):
+                client.release_context()
+            result = store.rollback()
+            self._mqtt_trial = None
+            self.mqtt = trial['previous']
+            self._mqtt_enabled = bool(self.mqtt and self.mqtt.config.get('enabled'))
+            if self.mqtt is None:
+                self._mqtt_enabled = None
+            self._mqtt_state = 'initialization_retry' if self._mqtt_enabled else 'disabled'
+            result.update(stage='rolled-back', commands=state.get('commands') or {})
+            self._settings_reply(trial['finish'], {'ok': False, 'result': result,
+                                                  'error': reason + '; previous configuration restored'})
+            gc.collect()
+
     def _load_sensor_options(self):
         try:
             import ujson as json
@@ -573,19 +827,18 @@ class DiagnosticRuntime:
         except OSError as error:
             if error.args and error.args[0] == 2:
                 self._sensor_requested = False
+                self._sensor_options = None
                 return
             raise
         if len(raw) > 512:
             raise ValueError('Sensor configuration is too large')
         settings = json.loads(raw)
-        if (type(settings) is not dict or any(key not in ('enabled', 'interval_seconds') for key in settings)
-                or type(settings.get('enabled', False)) is not bool):
-            raise ValueError('Invalid sensor configuration')
-        enabled, interval = settings.get('enabled', False), settings.get('interval_seconds', 60)
-        if enabled and (type(interval) is not int or not 5 <= interval <= 3600):
-            raise ValueError('Invalid sensor interval')
-        self._sensor_interval_ms = interval * 1000 if enabled else 60000
-        self._sensor_requested = enabled
+        from components.device_settings import validate_sensor
+        settings = validate_sensor(settings)
+        self._environment_mode = True
+        self._sensor_options = settings
+        self._sensor_interval_ms = settings['interval_seconds'] * 1000
+        self._sensor_requested = settings['enabled']
 
     def _sensor_wait_for_mqtt(self):
         if self.network_state == 'failed' or self.service.now() >= self._sensor_gate_until:
@@ -616,7 +869,15 @@ class DiagnosticRuntime:
                 # have left their helper scope before importing the driver.
                 gc.collect()
                 from components.temperature_humidity import TemperatureHumidityReader
-                self.sensor = TemperatureHumidityReader(self.service.now, interval_ms=self._sensor_interval_ms)
+                options = {'interval_ms': self._sensor_interval_ms}
+                for key, default in (('protocol', 'ascii_read'), ('baudrate', 9600),
+                                     ('slave_address', 1), ('timeout_ms', 2000)):
+                    value = (self._sensor_options or {}).get(key, default)
+                    if value != default:
+                        options[key] = value
+                self._sensor_sample_offset = self._sensor_sequence
+                self._sensor_reader_sample = None
+                self.sensor = TemperatureHumidityReader(self.service.now, **options)
                 for gpio in (14, 15):
                     self.pins.descriptions[gpio].update(
                         mode='uart', owner='RS485 temperature/humidity', source='configured',
@@ -636,6 +897,15 @@ class DiagnosticRuntime:
         self.pins.descriptions[13]['value'] = 1 if self.sensor.phase == 'tx' else 0
         if observation is None:
             return
+        self._sensor_reader_sample = observation['sample']
+        self._sensor_sequence = max(self._sensor_sequence + 1,
+                                    self._sensor_sample_offset + observation['sample'])
+        if self._sensor_trial:
+            self._finish_sensor_trial(True)
+            # Failed persistence restores the old reader; never publish the
+            # candidate's otherwise valid observation under the old settings.
+            if self.sensor is None:
+                return
         # Timestamp and capture at the physical read, never at a later retry.
         metrics = {'temperature_c': observation['temperatureC'],
                    'humidity_pct': observation['relativeHumidityPercent']}
@@ -647,15 +917,19 @@ class DiagnosticRuntime:
             return
         parts = time.gmtime()
         stamp = '%04d-%02d-%02dT%02d:%02d:%02dZ' % parts[:6]
+        protocol = (self._sensor_options or {}).get('protocol', 'ascii_read')
         self._sensor_observation = {
-            'sample': observation['sample'], 'readAtMs': observation['readAtMs'],
-            'readTimeUtc': stamp, 'metrics': metrics, 'source': {'driver': 'rs485.ascii.READ'}}
+            'sample': self._sensor_sequence, 'readAtMs': observation['readAtMs'],
+            'readTimeUtc': stamp, 'metrics': metrics,
+            'source': {'driver': 'rs485.modbus.sht20' if protocol == 'sht20_rtu' else 'rs485.ascii.READ',
+                       'integrity': 'crc_verified' if protocol == 'sht20_rtu' else 'format_only'}}
 
     def _sensor_sample(self):
         if self.sensor is None or self._sensor_observation is None:
             return None
         reading = self.sensor.reading()
-        if (reading is None or reading['sample'] != self._sensor_observation['sample']
+        expected = self._sensor_reader_sample if self._sensor_reader_sample is not None else self._sensor_observation['sample']
+        if (reading is None or reading['sample'] != expected
                 or reading['readAtMs'] != self._sensor_observation['readAtMs']):
             return None
         return self._sensor_observation
@@ -665,8 +939,13 @@ class DiagnosticRuntime:
         self._sensor_requested = False
         self._sensor_observation = None
         self._sensor_state = 'disabled'
-        if sensor is not None:
-            sensor.close()
+        self._sensor_reader_sample = None
+        try:
+            if sensor is not None:
+                sensor.close()
+        finally:
+            for gpio, values in self._sensor_pin_defaults.items():
+                self.pins.descriptions[gpio] = dict(values)
 
     def _mqtt_enabled_flag(self):
         # ConfigStore already needs JSON. This short-lived parse retains only
@@ -762,6 +1041,9 @@ class DiagnosticRuntime:
 
     def mqtt_tick(self):
         now = self.service.now()
+        if self._mqtt_trial:
+            self._mqtt_trial_tick()
+            return
         if not self.mqtt:
             if self._mqtt_enabled is False:
                 self._restore_mqtt_gc_threshold()
@@ -807,9 +1089,11 @@ class DiagnosticRuntime:
                 self._mqtt_init_stage = 'import_transport'
                 from components.mqtt_transport import MqttTransport
                 self._mqtt_init_stage = 'construct_client'
-                client = MqttTransport(config, self.service.now)
+                client = MqttTransport(config, self.service.now,
+                                       command_handler=self.handle_sensor_command,
+                                       command_clock=self._command_clock)
                 publisher_args = {'logger': self.service.log}
-                if self._sensor_requested:
+                if self._sensor_requested or self._environment_mode:
                     publisher_args['sample_provider'] = self._sensor_sample
                 self._mqtt_init_stage = 'construct_publisher'
                 publisher = TemperatureTelemetry(config, client, self.service.now, **publisher_args)
@@ -830,7 +1114,7 @@ class DiagnosticRuntime:
         self.mqtt.tick(connected, self._mqtt_clock_ready() if connected else False)
 
     def debug_telemetry_tick(self):
-        client = getattr(self.mqtt, 'client', None)
+        client = self._mqtt_trial['client'] if self._mqtt_trial else getattr(self.mqtt, 'client', None)
         if getattr(client, 'handshaking', False):
             self.service.tick(quiet=True)
         else:
@@ -842,6 +1126,7 @@ class DiagnosticRuntime:
         # has a bounded retry cadence. KeyboardInterrupt/SystemExit still pass
         # through for mpremote and deliberate maintenance.
         self._run_stage('usb', self.poll_commands)
+        self._run_stage('settings', self.settings_tick)
         self._run_stage('sensor', self.sensor_tick)
         if self.sensor is not None and self.sensor.phase in ('draining', 'tx'):
             # Four UART bytes take about 4.2ms. Receive before a fast reply;

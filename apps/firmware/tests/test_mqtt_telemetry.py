@@ -105,7 +105,7 @@ class MqttConfigTests(unittest.TestCase):
             {'server_hostname': 'other.invalid/path'}, {'username': ''},
             {'password': 'private-test-value\n'}, {'ca_file': ''}, {'enabled': 'true'},
             {'unknown': 'private-test-value'}, {'broker_ip': '192.0.2.999'},
-            {'broker_ip': '192.00.2.10'}, {'port': 1883}, {'port': True},
+            {'broker_ip': '192.00.2.10'}, {'port': 0}, {'port': 65536}, {'port': True},
         ]
         for change in changes:
             with self.subTest(fields=list(change)):
@@ -140,6 +140,12 @@ class MqttConfigTests(unittest.TestCase):
         self.assertEqual(result['broker_ip'], '192.0.2.9')
         self.assertEqual(result['interval_seconds'], 60)
         self.assertEqual(result['keepalive'], 60)
+
+    def test_custom_tls_port_is_allowed_but_plaintext_or_verification_toggles_are_not(self):
+        self.assertEqual(validate_config(configuration(port=8443))['port'], 8443)
+        for values in ({'tls': False}, {'verify_certificate': False}, {'cert_reqs': 0}):
+            with self.subTest(fields=tuple(values)), self.assertRaises(ValueError):
+                validate_config(configuration(**values))
 
 
 class TemperatureTelemetryTests(unittest.TestCase):
@@ -478,7 +484,7 @@ class ProviderTelemetryTests(unittest.TestCase):
         self.assertEqual(sample['read_time_utc'], '2026-10-31T01:02:03.125Z')
         self.assertIsNone(sample['sample_time_utc'])
         self.assertEqual(sample['observation_kind'], 'direct_read')
-        self.assertEqual(sample['source'], {'driver': 'rs485.ascii.READ', 'metric_sources': {
+        self.assertEqual(sample['source'], {'driver': 'rs485.ascii.READ', 'integrity': 'format_only', 'metric_sources': {
             'temperature_c': 'rs485.ascii.READ', 'humidity_pct': 'rs485.ascii.READ',
             'cpu_temperature_c': 'esp32.raw_temperature'}})
         self.assertNotIn('private-id', self.client.published[0][1].decode())
@@ -686,6 +692,48 @@ class ProviderTelemetryTests(unittest.TestCase):
         self.assertNotIn('private-source-address', repr(self.logs))
         self.esp32.raw_temperature.assert_not_called()
         self.clock.gmtime.assert_not_called()
+
+    def test_rtu_observation_requires_verified_crc_and_keeps_driver_provenance(self):
+        self.latest = self.observation(sequence=1, read_at=0)
+        self.latest['source'] = {'driver': 'rs485.modbus.sht20'}
+        self.sampler.tick(True, True)
+        self.assertEqual(self.client.published, [])
+        self.latest['source']['integrity'] = 'crc_verified'
+        self.now = 1000
+        self.sampler.tick(True, True)
+        source = self.payload()['source']
+        self.assertEqual(source['driver'], 'rs485.modbus.sht20')
+        self.assertEqual(source['integrity'], 'crc_verified')
+        self.assertEqual(source['metric_sources']['temperature_c'], 'rs485.modbus.sht20')
+        self.esp32.raw_temperature.assert_not_called()
+
+    def test_reconfiguration_keeps_original_pending_bytes_and_provider_deduplication(self):
+        self.latest = self.observation(sequence=7, read_at=0)
+        self.sampler.tick(True, True)
+        original = self.sampler._pending
+        accepted = self.sampler._accepted
+        latest_id = self.sampler.status()['lastSample']['messageId']
+        replacement = Client()
+        self.sampler.reconfigure(configuration(host='repair.example.invalid'), replacement)
+        self.assertIs(self.sampler._pending, original)
+        self.assertEqual(self.sampler._accepted, accepted)
+        self.assertEqual(self.sampler._provider_last_sample, 7)
+        self.assertEqual(self.sampler.status()['lastSample']['messageId'], latest_id)
+        self.sampler.reconfigure({'enabled': False}, replacement)
+        self.assertEqual(self.sampler.config['site_id'], 'test-site')
+        self.assertIs(self.sampler._pending, original)
+        self.sampler.reconfigure(configuration(), replacement)
+        self.assertIs(self.sampler._pending, original)
+
+    def test_pending_message_blocks_identity_change_before_mutating_publisher(self):
+        self.latest = self.observation(sequence=1, read_at=0)
+        self.sampler.tick(True, True)
+        config, client, pending = self.sampler.config, self.sampler.client, self.sampler._pending
+        with self.assertRaises(ValueError):
+            self.sampler.prepare_reconfigure(configuration(site_id='different-site'), Client())
+        self.assertIs(self.sampler.config, config)
+        self.assertIs(self.sampler.client, client)
+        self.assertIs(self.sampler._pending, pending)
 
 
 if __name__ == '__main__':

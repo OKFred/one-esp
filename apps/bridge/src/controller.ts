@@ -435,12 +435,24 @@ export class BridgeController {
     }
     const transport = this.transport;
     if (!transport) throw new BridgeError('串口不可用。', 409);
-    if (['debug.renew', 'device.restart', 'config.set', 'gpio.write'].includes(command.command)) {
+    if (
+      [
+        'debug.renew',
+        'device.restart',
+        'config.set',
+        'mqtt.config.set',
+        'sensor.config.set',
+        'gpio.write',
+      ].includes(command.command)
+    ) {
       const bootId = this.state.hello?.bootId ?? this.state.status?.bootId;
       if (!bootId || command.bootId !== bootId) {
         throw new BridgeError('设备已重启或尚未就绪，请刷新快照后重试。', 409);
       }
-      if (this.state.debug?.data.enabled !== true || Date.now() >= this.debugExpiresAt) {
+      if (
+        !['mqtt.config.set', 'sensor.config.set'].includes(command.command) &&
+        (this.state.debug?.data.enabled !== true || Date.now() >= this.debugExpiresAt)
+      ) {
         throw new BridgeError('调试会话未开启或已过期，请重新开启调试。', 403);
       }
       if (command.command === 'debug.renew') {
