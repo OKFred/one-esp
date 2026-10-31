@@ -105,7 +105,20 @@ def validate_mqtt(values):
     for key, low, high in (('interval_seconds', 60, 86400), ('keepalive', 15, 300)):
         if type(result[key]) is not int or not low <= result[key] <= high:
             raise ValueError('Invalid MQTT ' + key)
-    from components.mqtt_telemetry import validate_config
+    from components.mqtt_telemetry import validate_config, _host, _identity, _ipv4
+    for key in ('host', 'server_hostname'):
+        if result[key] and not _host(result[key]):
+            raise ValueError('Invalid MQTT ' + key)
+    for key in ('client_id', 'site_id', 'gateway_id', 'device_id'):
+        if result[key] and not _identity(result[key]):
+            raise ValueError('Invalid MQTT ' + key)
+    if not result['ca_file']:
+        raise ValueError('Invalid MQTT ca_file')
+    if 'broker_ip' in result:
+        if result['broker_ip'] in ('', None):
+            result.pop('broker_ip')
+        elif not _ipv4(result['broker_ip']):
+            raise ValueError('Invalid MQTT broker_ip')
     if result['enabled']:
         validate_config(result)
     return result

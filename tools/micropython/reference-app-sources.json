@@ -36,8 +36,8 @@
   },
   {
     "path": "components/device_settings.py",
-    "bytes": 10795,
-    "sha256": "fc6c35bfeeb94420f657f439367bfb44be48f75ca205642dd43f3459d5d854dd"
+    "bytes": 11433,
+    "sha256": "8d8f4b71ea29e15661245ba7c0f8c55877cec10625b0d736de088722cfe78bee"
   },
   {
     "path": "components/env_reader.py",
