@@ -393,7 +393,7 @@ class DiagnosticRuntime:
             elif mqtt_problem:
                 title = 'MQTT setup error'
                 detail = 'Config invalid' if self._mqtt_state == 'configuration_error' else 'Setup retry'
-            elif (mqtt and mqtt.get('enabled') and mqtt.get('clockReady') and
+            elif (mqtt and mqtt.get('enabled') and
                   not transport.get('connected') and
                   (transport.get('phase') in ('backoff', 'unavailable') or
                    transport.get('connections', 0) > 0 or mqtt.get('transportFailures', 0) > 0)):

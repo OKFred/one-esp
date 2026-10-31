@@ -837,6 +837,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.task_screen().split('\n')[:3],
                          ['MQTT offline', 'Upload queued', 'Reconnecting...'])
         mqtt['clockReady'] = False
+        self.assertEqual(self.runtime.task_screen().split('\n')[0], 'MQTT offline')
+        mqtt['transport'] = {'connected': False, 'phase': 'idle'}
         self.assertEqual(self.runtime.task_screen().split('\n')[2], 'Syncing clock')
         self.runtime.network_state = 'reconnecting'
         self.assertEqual(self.runtime.task_screen().split('\n')[0], 'WiFi offline')
