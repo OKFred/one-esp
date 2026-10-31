@@ -158,14 +158,88 @@ class TemperatureTelemetryTests(unittest.TestCase):
         self.logs = []
         self.sampler = self.make()
 
-    def make(self, values=None):
+    def make(self, values=None, local_day=None):
         return TemperatureTelemetry(values or configuration(), self.client, lambda: self.now,
                                     time_module=self.clock, esp32_module=self.esp32,
                                     random_bytes=self.random,
-                                    logger=lambda level, message: self.logs.append((level, message)))
+                                    logger=lambda level, message: self.logs.append((level, message)),
+                                    local_day=local_day)
 
     def payload(self):
         return json.loads(self.client.published[-1][1])
+
+    def test_midnight_resets_display_count_and_counts_cross_day_puback_on_receipt_day(self):
+        day = [10]
+        self.sampler = self.make(local_day=lambda: day[0])
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.now = 1
+        self.sampler.tick(True, True)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        self.now = 60000
+        self.sampler.tick(True, True)
+        pending = self.sampler._pending
+        previous_summary = dict(self.sampler._last_sample)
+        day[0] = 11
+        self.sampler.tick(False, False)
+        status = self.sampler.status()
+        self.assertEqual(status['dailyAcknowledged'], 0)
+        self.assertEqual(status['acknowledged'], 1)
+        self.assertTrue(status['pending'])
+        self.assertIs(self.sampler._pending, pending)
+        self.assertEqual(self.sampler._last_sample, previous_summary)
+        self.client.ack = True
+        self.now = 60001
+        self.sampler.tick(True, True)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        self.assertEqual(self.sampler.status()['acknowledged'], 2)
+        self.assertEqual(self.sampler.status()['lastAcknowledged'], previous_summary)
+        self.assertFalse(self.sampler.status()['pending'])
+
+    def test_unknown_day_and_backward_clock_do_not_fabricate_or_reset_daily_count_twice(self):
+        day = [None]
+        self.sampler = self.make(local_day=lambda: day[0])
+        self.assertIsNone(self.sampler.status()['dailyAcknowledged'])
+        day[0] = 10
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        for value in (9, None, True, 10.0, -1):
+            day[0] = value
+            self.assertIsNone(self.sampler.status()['dailyAcknowledged'])
+        day[0] = 10
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        day[0] = 12
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 0)
+        self.assertEqual(self.sampler.status()['acknowledged'], 1)
+
+    def test_puback_processed_across_midnight_belongs_to_the_new_day(self):
+        day = [10]
+        self.sampler = self.make(local_day=lambda: day[0])
+        self.sampler.tick(True, True)
+        def tick_across_midnight(connected, ready):
+            day[0] = 11
+        self.client.tick = tick_across_midnight
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        self.assertEqual(self.sampler.status()['acknowledged'], 1)
+
+    def test_disabled_mqtt_still_rolls_the_day_without_touching_transport(self):
+        day = [10]
+        self.sampler = self.make(local_day=lambda: day[0])
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        self.sampler.reconfigure({'enabled': False}, self.client)
+        calls = len(self.client.ticks)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        day[0] = 11
+        self.sampler.tick(False, False)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 0)
+        self.assertEqual(self.sampler.status()['acknowledged'], 1)
+        self.assertEqual(len(self.client.ticks), calls)
 
     def test_schema_v2_uses_actual_utc_and_explicit_internal_temperature(self):
         self.sampler.tick(True, True)

@@ -76,9 +76,15 @@ const mqttDelivery = computed(() => {
   } else if (mqtt.state === 'configuration_error') {
     label = 'MQTT 配置异常';
   } else if (mqtt.transport?.connected === true) {
-    const count = mqtt.acknowledged;
+    const daily = Object.prototype.hasOwnProperty.call(mqtt, 'dailyAcknowledged');
+    const count = daily ? mqtt.dailyAcknowledged : mqtt.acknowledged;
     const knownCount = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0;
-    label = `MQTT 已连接 · ${knownCount ? `已确认 ${count} 条` : '确认数未提供'}`;
+    const confirmation = knownCount
+      ? `${daily ? '今日' : '本次启动'}已确认 ${count} 条`
+      : daily
+        ? '今日确认数未提供'
+        : '确认数未提供';
+    label = `MQTT 已连接 · ${confirmation}`;
     if (mqtt.pending === true) label += ' · 等待确认';
   } else if (mqtt.enabled === true || mqtt.state || mqtt.transport?.phase) {
     label = `MQTT 重连中${mqtt.pending === true ? ' · 待发送' : ''}`;

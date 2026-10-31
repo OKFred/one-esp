@@ -232,13 +232,20 @@ def _temperature(esp32):
 
 class TemperatureTelemetry:
     def __init__(self, config, client, now_ms, time_module=None,
-                 esp32_module=None, random_bytes=None, logger=None, sample_provider=None):
+                 esp32_module=None, random_bytes=None, logger=None, sample_provider=None,
+                 local_day=None):
         self.config = validate_config(config)
         self.client = client
         self._now = now_ms
         self._clock = time_module or time
         if sample_provider is not None and not callable(sample_provider):
             raise ValueError('Invalid MQTT sample provider')
+        if local_day is not None and not callable(local_day):
+            raise ValueError('Invalid MQTT local day provider')
+        self._local_day = local_day
+        self._daily_day = None
+        self._daily_current_day = None
+        self._daily_ack_count = 0
         self._sample_provider = sample_provider
         self._provider_last_sample = -1
         self._provider_last_read_at = -1
@@ -268,6 +275,19 @@ class TemperatureTelemetry:
         self._last_read_at = None
         self._last_sample = None
         self._last_acknowledged = None
+
+    def _refresh_daily(self):
+        # Keep lifetime diagnostics and in-flight payloads independent of the
+        # displayed day. A backward clock correction must not reset twice.
+        try:
+            day = self._local_day() if self._local_day is not None else None
+        except Exception:
+            day = None
+        self._daily_current_day = day if type(day) is int and day >= 0 else None
+        if self._daily_current_day is not None and (
+                self._daily_day is None or self._daily_current_day > self._daily_day):
+            self._daily_day = self._daily_current_day
+            self._daily_ack_count = 0
 
     def _warn(self, category, message):
         now = self._now()
@@ -386,18 +406,22 @@ class TemperatureTelemetry:
             self._next_sample_at = now + self._interval_ms
 
     def tick(self, connected, time_ready):
+        self._refresh_daily()
         if not self.config['enabled']:
             return
         self._clock_ready = time_ready is True
         try:
             self.client.tick(connected, self._clock_ready)
             if self._pending is not None and self._accepted and self.client.take_ack():
+                self._refresh_daily()
                 # No newer read can replace this summary until its one pending
                 # payload is acknowledged. A later read creates a fresh dict.
                 self._last_acknowledged = self._last_sample
                 self._pending = None
                 self._accepted = False
                 self._ack_count += 1
+                if self._daily_current_day is not None and self._daily_current_day == self._daily_day:
+                    self._daily_ack_count += 1
                 self._provider_poll_at = 0
         except Exception:
             self._transport_failures += 1
@@ -420,6 +444,7 @@ class TemperatureTelemetry:
 
     def status(self):
         """Safe status only: no account, endpoint, topic, payload or device ID."""
+        self._refresh_daily()
         transport = None
         if callable(getattr(self.client, 'status', None)):
             try:
@@ -429,6 +454,8 @@ class TemperatureTelemetry:
         return {'enabled': self.config['enabled'], 'clockReady': self._clock_ready,
                 'pending': self._pending is not None, 'accepted': self._accepted,
                 'samples': self._read_count, 'acknowledged': self._ack_count,
+                'dailyAcknowledged': self._daily_ack_count if self._daily_current_day is not None and
+                self._daily_current_day == self._daily_day else None,
                 'readFailures': self._read_failures, 'transportFailures': self._transport_failures,
                 'lastReadAtMs': self._last_read_at,
                 'nextSampleInMs': max(0, self._next_sample_at - self._now()),

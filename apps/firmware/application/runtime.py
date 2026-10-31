@@ -33,6 +33,17 @@ MQTT_INIT_MAX_RETRY_MS = 300000
 MQTT_GC_THRESHOLD_BYTES = 8192
 
 
+def _compact_count(value):
+    """At most five ASCII columns, without changing the actual counter."""
+    if type(value) is not int or value < 0:
+        return '?'
+    for size, unit in ((1000000000000, 'T'), (1000000000, 'B'),
+                       (1000000, 'M'), (1000, 'K')):
+        if value >= size:
+            return str(min(999, value // size)) + unit + '+'
+    return str(value)
+
+
 class DiagnosticRuntime:
     def __init__(self, mqtt_config_path='.mqtt.json', sensor_config_path='.sensor.json',
                  command_input=None):
@@ -378,7 +389,10 @@ class DiagnosticRuntime:
             if not mqtt.get('clockReady'):
                 delivery = 'Syncing clock'
             elif transport.get('connected'):
-                delivery = 'MQTT: pending' if mqtt.get('pending') else 'MQTT: sent ' + str(mqtt.get('acknowledged', 0))
+                count = mqtt.get('dailyAcknowledged')
+                delivery = 'MQTT: pending' if mqtt.get('pending') else (
+                    'MQTT today ' + _compact_count(count) if type(count) is int and count >= 0
+                    else 'MQTT count wait')
             else:
                 delivery = 'MQTT reconnect' if transport.get('phase') == 'backoff' else 'MQTT connecting'
         elif self._mqtt_enabled or mqtt_problem:
@@ -770,7 +784,7 @@ class DiagnosticRuntime:
                 previous = trial['previous']
                 if previous is None:
                     from components.mqtt_telemetry import TemperatureTelemetry
-                    kwargs = {'logger': self.service.log}
+                    kwargs = {'logger': self.service.log, 'local_day': self._mqtt_local_day}
                     if self._environment_mode or self._sensor_requested:
                         kwargs['sample_provider'] = self._sensor_sample
                     publisher = TemperatureTelemetry(trial['config'], client, self.service.now, **kwargs)
@@ -969,6 +983,13 @@ class DiagnosticRuntime:
             raise ValueError('Invalid MQTT enabled flag')
         return settings.get('enabled', False)
 
+    def _mqtt_local_day(self):
+        # Both supported epochs start at UTC midnight. Keep epoch arithmetic
+        # integer-only: ESP32 single-precision floats lose RTC seconds.
+        if not self.ntp_synced:
+            return None
+        return (time.time() + int(float(self.config.values['TIMEZONE_HOURS']) * 3600)) // 86400
+
     def _mqtt_clock_ready(self):
         quality = self.clock_sync.status()
         age = quality.get('lastSyncAgeMs')
@@ -1092,7 +1113,7 @@ class DiagnosticRuntime:
                 client = MqttTransport(config, self.service.now,
                                        command_handler=self.handle_sensor_command,
                                        command_clock=self._command_clock)
-                publisher_args = {'logger': self.service.log}
+                publisher_args = {'logger': self.service.log, 'local_day': self._mqtt_local_day}
                 if self._sensor_requested or self._environment_mode:
                     publisher_args['sample_provider'] = self._sensor_sample
                 self._mqtt_init_stage = 'construct_publisher'

@@ -142,7 +142,7 @@ it('keeps local sampling health separate from disconnected MQTT delivery', async
   await wrapper.setProps({
     mqtt: { enabled: true, acknowledged: 7, pending: false, transport: { connected: true } },
   });
-  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 已确认 7 条');
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 本次启动已确认 7 条');
   expect(wrapper.find('.ambient-delivery').classes()).not.toContain('tone-warning');
 });
 
@@ -154,7 +154,9 @@ it('labels paused, disconnected or stale MQTT evidence as the last known status'
       telemetryActive: false,
     },
   });
-  expect(wrapper.find('.ambient-delivery').text()).toBe('上次MQTT状态：MQTT 已连接 · 已确认 6 条');
+  expect(wrapper.find('.ambient-delivery').text()).toBe(
+    '上次MQTT状态：MQTT 已连接 · 本次启动已确认 6 条',
+  );
   await wrapper.setProps({ telemetryActive: true, connected: false });
   expect(wrapper.find('.ambient-delivery').text()).toContain('上次MQTT状态');
   await wrapper.setProps({ connected: true, deviceStale: true });
@@ -172,7 +174,91 @@ it('does not fabricate confirmation counts for old firmware or incomplete MQTT f
   await wrapper.setProps({
     mqtt: { enabled: true, acknowledged: 0, transport: { connected: true } },
   });
-  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 已确认 0 条');
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 本次启动已确认 0 条');
+});
+
+it.each([0, 999, 1000, 1001, 999999, 1000000, Number.MAX_SAFE_INTEGER])(
+  'shows the complete daily count %s instead of clipping it or using the boot total',
+  (count) => {
+    const wrapper = mount(AmbientReadings, {
+      props: {
+        ...props,
+        mqtt: {
+          enabled: true,
+          dailyAcknowledged: count,
+          acknowledged: 123456,
+          transport: { connected: true },
+        },
+      },
+    });
+    expect(wrapper.find('.ambient-delivery').text()).toBe(`MQTT 已连接 · 今日已确认 ${count} 条`);
+  },
+);
+
+it.each([null, undefined, NaN, Infinity, -Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+  'does not substitute the boot total for an unavailable or invalid daily count %s',
+  (count) => {
+    const wrapper = mount(AmbientReadings, {
+      props: {
+        ...props,
+        mqtt: {
+          enabled: true,
+          dailyAcknowledged: count,
+          acknowledged: 42,
+          transport: { connected: true },
+        },
+      },
+    });
+    expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 今日确认数未提供');
+    expect(wrapper.find('.ambient-delivery').text()).not.toContain('42');
+  },
+);
+
+it.each([1000, Number.MAX_SAFE_INTEGER])(
+  'labels the complete old-firmware count %s as this boot',
+  (count) => {
+    const wrapper = mount(AmbientReadings, {
+      props: {
+        ...props,
+        mqtt: { enabled: true, acknowledged: count, transport: { connected: true } },
+      },
+    });
+    expect(wrapper.find('.ambient-delivery').text()).toBe(
+      `MQTT 已连接 · 本次启动已确认 ${count} 条`,
+    );
+  },
+);
+
+it('keeps the last reported daily count while paused, then accepts the device midnight reset', async () => {
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      telemetryActive: false,
+      mqtt: {
+        enabled: true,
+        dailyAcknowledged: 1000,
+        acknowledged: 2000,
+        transport: { connected: true },
+      },
+    },
+  });
+  expect(wrapper.find('.ambient-delivery').text()).toBe(
+    '上次MQTT状态：MQTT 已连接 · 今日已确认 1000 条',
+  );
+  await wrapper.setProps({ uptimeMs: 86431000 });
+  expect(wrapper.find('.ambient-delivery').text()).toContain('今日已确认 1000 条');
+  await wrapper.setProps({
+    telemetryActive: true,
+    statusUptimeMs: 86431000,
+    mqtt: {
+      enabled: true,
+      dailyAcknowledged: 0,
+      acknowledged: 2000,
+      pending: true,
+      transport: { connected: true },
+    },
+  });
+  expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 已连接 · 今日已确认 0 条 · 等待确认');
 });
 
 it('distinguishes disabled MQTT, waiting on prerequisites and invalid configuration', async () => {

@@ -43,6 +43,7 @@ export interface MqttStatusData {
   state?: string;
   samples?: number;
   acknowledged?: number;
+  dailyAcknowledged?: number | null;
   pending?: boolean;
   transport?: {
     connected?: boolean;

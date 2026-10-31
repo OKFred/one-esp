@@ -813,18 +813,49 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.sensor = Mock(status=Mock(return_value=sensor))
         self.runtime.mqtt = Mock(status=Mock(return_value={
             'enabled': True, 'clockReady': True, 'pending': False,
-            'acknowledged': 5, 'transport': {'connected': True}}))
+            'acknowledged': 100, 'dailyAcknowledged': 5, 'transport': {'connected': True}}))
         for temperature, humidity, expected in ((28.8, 50.4, 'T:28.8C H:50%'),
                                                 (-40, 100, 'T:-40.0C H:100%'),
                                                 (125, 0, 'T:125.0C H:0%')):
             sensor.update(temperatureC=temperature, relativeHumidityPercent=humidity)
             lines = self.runtime.task_screen().split('\n')
-            self.assertEqual(lines, ['Env telemetry', expected, 'MQTT: sent 5', '10-30 12:34:56'])
+            self.assertEqual(lines, ['Env telemetry', expected, 'MQTT today 5', '10-30 12:34:56'])
             self.assertTrue(all(len(line) <= 16 and line.isascii() for line in lines))
         sensor['lastError'] = 'invalid_frame'
         self.assertEqual(self.runtime.task_screen().split('\n')[1], 'Sensor read err')
         sensor.update(lastError=None, stale=True)
         self.assertEqual(self.runtime.task_screen().split('\n')[1], 'Sensor stale')
+
+    def test_task_screen_daily_count_boundaries_never_truncate_a_number_or_clock(self):
+        self.runtime.network_state = 'connected'
+        self.runtime.ntp_synced = True
+        mqtt = {'enabled': True, 'clockReady': True, 'pending': False,
+                'acknowledged': 123456789, 'transport': {'connected': True}}
+        self.runtime.mqtt = Mock(status=Mock(return_value=mqtt))
+        cases = ((0, '0'), (999, '999'), (1000, '1K+'), (1999, '1K+'),
+                 (999999, '999K+'), (1000000, '1M+'), (1000000000, '1B+'),
+                 (1000000000000, '1T+'), (10 ** 100, '999T+'))
+        for count, expected in cases:
+            with self.subTest(count=count):
+                mqtt['dailyAcknowledged'] = count
+                lines = self.runtime.task_screen().split('\n')
+                self.assertEqual(lines[2], 'MQTT today ' + expected)
+                self.assertEqual(lines[3], '10-30 12:34:56')
+                self.assertTrue(all(len(line) <= 16 and line.isascii() for line in lines))
+        for invalid in (None, True, -1, 1000.0, float('nan'), float('inf')):
+            mqtt['dailyAcknowledged'] = invalid
+            self.assertEqual(self.runtime.task_screen().split('\n')[2], 'MQTT count wait')
+
+    def test_daily_count_boundary_uses_configured_fractional_timezone_and_waits_for_sync(self):
+        self.assertIsNone(self.runtime._mqtt_local_day())
+        self.runtime.ntp_synced = True
+        for offset in (8, 5.5, -3.5):
+            self.config.values['TIMEZONE_HOURS'] = offset
+            midnight = 100 * 86400 - int(offset * 3600)
+            with patch.object(self.clock, 'time', return_value=midnight - 1):
+                self.assertEqual(self.runtime._mqtt_local_day(), 99)
+            with patch.object(self.clock, 'time', return_value=midnight):
+                self.assertEqual(self.runtime._mqtt_local_day(), 100)
 
     def test_task_screen_distinguishes_pending_reconnect_and_clock_wait(self):
         self.runtime.network_state = 'connected'
@@ -1381,7 +1412,8 @@ class RuntimeTests(unittest.TestCase):
         transport.assert_called_once_with(config, self.runtime.service.now,
                                           command_handler=self.runtime.handle_sensor_command,
                                           command_clock=self.runtime._command_clock)
-        sampler.assert_called_once_with(config, client, self.runtime.service.now, logger=self.runtime.service.log)
+        sampler.assert_called_once_with(config, client, self.runtime.service.now,
+                                        logger=self.runtime.service.log, local_day=self.runtime._mqtt_local_day)
         self.assertIs(self.runtime.mqtt, publisher)
         self.assertTrue(self.runtime._mqtt_initialized)
         self.assertEqual(self.module.gc.collect.call_count, 2)
