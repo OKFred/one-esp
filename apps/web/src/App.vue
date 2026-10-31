@@ -31,6 +31,8 @@ import BoardView from './components/BoardView.vue';
 import OledScreen from './components/OledScreen.vue';
 import ClockQuality from './components/ClockQuality.vue';
 import SystemMetrics from './components/SystemMetrics.vue';
+import AmbientReadings from './components/AmbientReadings.vue';
+import DeviceSettings from './components/DeviceSettings.vue';
 import { useDevice } from './composables/useDevice';
 import { configValuesForSave, createConfigForm, readConfigValues } from './config';
 import { debugCommandArgs, debugProfileLimits, normalizeDebugSettings } from './debug-settings';
@@ -56,6 +58,7 @@ const {
   screenRecoveryPending,
   screenRecoveryError,
   samplingPaused,
+  stale,
   autoRenewEnabled,
   autoRenewStatus,
   autoRenewError,
@@ -91,6 +94,10 @@ const pausedLogs = shallowRef<DeviceEvent[]>([]);
 const hiddenLogs = shallowRef(new Set<string>());
 const logStream = ref<HTMLElement>();
 const configOpen = ref(false);
+const deviceSettingsOpen = ref(false);
+const settingsIdentity = computed(
+  () => deviceId.value + ':' + (state.value.hello?.bootId ?? state.value.status?.bootId ?? ''),
+);
 const configLoading = ref(false);
 const configLoaded = ref(false);
 const configSaving = ref(false);
@@ -536,6 +543,16 @@ function clearVisibleLogs() {
               </div>
             </section>
 
+            <AmbientReadings
+              :environment="status?.environment"
+              :mqtt="status?.mqtt"
+              :connected="state.connection.connected && channelConnected"
+              :telemetry-active="!!debug?.enabled"
+              :device-stale="stale"
+              :uptime-ms="deviceUptimeMs"
+              :status-uptime-ms="status?.uptimeMs"
+            />
+
             <SystemMetrics
               :metrics="metrics"
               :active="!!debug?.enabled && channelConnected"
@@ -645,15 +662,19 @@ function clearVisibleLogs() {
             </section>
             <section class="panel controls-panel">
               <div class="panel-heading">
-                <div><h2>采集设置</h2></div>
+                <div><h2>实时调试采集</h2></div>
                 <ASwitch
                   :checked="debug?.enabled ?? false"
                   :disabled="!clientReady || pendingCount > 0"
-                  aria-label="开启调试采集"
+                  aria-label="实时调试采集"
                   @change="setDebug"
                 />
               </div>
               <div class="controls-body">
+                <p class="control-help">
+                  控制屏幕镜像、引脚和资源指标的实时更新。关闭后仍可获取快照，MQTT
+                  温度上报继续运行。
+                </p>
                 <div class="auto-renew-control">
                   <div class="auto-renew-heading">
                     <span>自动续期</span>
@@ -727,7 +748,11 @@ function clearVisibleLogs() {
                 </p>
                 <div class="device-actions">
                   <AButton :disabled="!clientReady || pendingCount > 0" @click="openConfig"
-                    ><template #icon><Icon :icon="settingsIcon" /></template>设备配置</AButton
+                    ><template #icon><Icon :icon="settingsIcon" /></template>Wi-Fi / 时钟</AButton
+                  ><AButton
+                    :disabled="!clientReady || pendingCount > 0"
+                    @click="deviceSettingsOpen = true"
+                    ><template #icon><Icon :icon="settingsIcon" /></template>MQTT / RS485</AButton
                   ><AButton :disabled="!canMutate" @click="restartOpen = true"
                     ><template #icon><Icon :icon="restartIcon" /></template>重启</AButton
                   >
@@ -804,13 +829,21 @@ function clearVisibleLogs() {
             ><span>{{ state.connection.port || (isReplay ? 'REPLAY FIXTURE' : 'NO DEVICE') }}</span>
           </div>
           <div>
-            <span>EMQX 远程适配预留</span><span class="footer-separator">·</span
-            ><span>温湿度采集 / 下一期</span><Icon :icon="arrowIcon" />
+            <span>MQTT / 独立于网页调试</span><span class="footer-separator">·</span
+            ><span>环境温湿度 / RS485</span><Icon :icon="arrowIcon" />
           </div>
         </footer>
       </main>
     </div>
 
+    <DeviceSettings
+      v-model:open="deviceSettingsOpen"
+      :connected="clientReady && !isReplay"
+      :identity="settingsIdentity"
+      :remote="status?.mqtt?.transport?.commands"
+      :command="command"
+      @applied="perform('snapshot.get')"
+    />
     <AModal
       v-model:open="configOpen"
       title="设备配置"
@@ -860,18 +893,9 @@ function clearVisibleLogs() {
             :max="65535"
           />
         </div>
-        <div>
-          <label for="poll-interval">业务轮询间隔 / 毫秒</label
-          ><AInputNumber
-            id="poll-interval"
-            v-model:value="form.POLL_INTERVAL_MS"
-            :min="100"
-            :max="60000"
-          />
-        </div>
         <div class="config-revision">
           配置版本 <strong class="mono">{{ configRevision }}</strong
-          ><small>MQTT 参数在后续接入阶段启用</small>
+          ><small>采集周期与 MQTT 参数在“MQTT / RS485”中设置</small>
         </div>
       </form>
       <p v-if="configError" class="inline-error" role="alert">{{ configError }}</p>

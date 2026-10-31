@@ -1,8 +1,6 @@
-import { StringDecoder } from 'node:string_decoder';
-
 /** Serial data is a byte stream, not a stream of whole JSON messages. */
 export class BoundedLineParser {
-  private readonly decoder = new StringDecoder('utf8');
+  private decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   private text = '';
   private bytes = 0;
   private discarding = false;
@@ -11,6 +9,7 @@ export class BoundedLineParser {
     private readonly onLine: (line: string) => void,
     private readonly onOverflow: () => void,
     private readonly maxBytes = 8192,
+    private readonly onInvalidUtf8: () => void = () => {},
   ) {}
 
   push(chunk: Uint8Array): void {
@@ -21,8 +20,13 @@ export class BoundedLineParser {
         if (!this.discarding) {
           this.append(chunk.subarray(start, index));
           if (!this.discarding) {
-            const tail = this.decoder.end();
-            this.onLine((this.text + tail).replace(/\r$/, ''));
+            let tail = '';
+            try {
+              tail = this.decoder.decode();
+            } catch {
+              this.rejectUtf8();
+            }
+            if (!this.discarding) this.onLine((this.text + tail).replace(/\r$/, ''));
           }
         }
         this.reset();
@@ -38,17 +42,26 @@ export class BoundedLineParser {
     if (this.bytes > this.maxBytes) {
       this.discarding = true;
       this.text = '';
-      this.decoder.end();
       this.onOverflow();
       return;
     }
-    this.text += this.decoder.write(Buffer.from(chunk));
+    try {
+      this.text += this.decoder.decode(chunk, { stream: true });
+    } catch {
+      this.rejectUtf8();
+    }
+  }
+
+  private rejectUtf8(): void {
+    this.discarding = true;
+    this.text = '';
+    this.onInvalidUtf8();
   }
 
   private reset(): void {
     this.text = '';
     this.bytes = 0;
     this.discarding = false;
-    this.decoder.end();
+    this.decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   }
 }

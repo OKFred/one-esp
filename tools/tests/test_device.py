@@ -4,6 +4,7 @@ import binascii
 import builtins
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -125,7 +126,7 @@ class UploadPlanTests(unittest.TestCase):
                 with patch.object(device, "backup", backup), patch.object(device, "build_upload_plan", plan), patch.object(device, "mpremote", transport):
                     with self.assertRaises((RuntimeError, OSError)):
                         device.upload("COM3")
-                backup.assert_called_once_with("COM3", restart=False)
+                backup.assert_called_once_with("COM3", restart=False, require_mutable=True)
                 self.assertEqual(transport.call_args.args, ("COM3", "reset"))
 
     def compiled(self):
@@ -209,20 +210,30 @@ class UploadPlanTests(unittest.TestCase):
                 patch.object(device, "mpremote") as transport, patch.object(device, "build_upload_plan") as plan:
             with self.assertRaisesRegex(RuntimeError, "upload --precompile"):
                 device.upload("COM-test")
-        backup.assert_called_once_with("COM-test", restart=False)
+        backup.assert_called_once_with("COM-test", restart=False, require_mutable=True)
         plan.assert_not_called()
         transport.assert_called_once_with("COM-test", "reset")
 
     def test_precompiled_upload_compiles_then_backs_up_before_executing_shadow_plan(self):
         calls = []
         mapping = {"boot.py": Path("boot.py"), "components/test.mpy": Path("test.mpy")}
-        with patch.object(device, "precompile_firmware", side_effect=lambda: calls.append("compile") or mapping), \
+        with patch.object(device, "precompile_firmware", side_effect=lambda **kwargs: calls.append("compile") or mapping) as compile_firmware, \
                 patch.object(device, "backup", side_effect=lambda *a, **k: calls.append("backup") or self.backup), \
                 patch.object(device, "build_upload_plan", side_effect=lambda **k: calls.append("plan") or ["exec", "verified plan"]) as plan, \
                 patch.object(device, "mpremote", side_effect=lambda *a: calls.append(a[-1])):
             device.upload("COM-test", precompile=True)
         self.assertEqual(calls, ["compile", "backup", "plan", "verified plan", "reset"])
+        compile_firmware.assert_called_once_with(mpy_version=device.DEFAULT_MPY_VERSION)
         plan.assert_called_once_with(compiled=mapping)
+
+    def test_explicit_legacy_compiler_reaches_precompiled_upload(self):
+        mapping = {"boot.py": Path("boot.py"), "components/test.mpy": Path("test.mpy")}
+        with patch.object(device, "precompile_firmware", return_value=mapping) as compile_firmware, \
+                patch.object(device, "backup", return_value=self.backup), \
+                patch.object(device, "build_upload_plan", return_value=["exec", "verified plan"]), \
+                patch.object(device, "mpremote"):
+            device.upload("COM-test", precompile=True, mpy_version="1.22.2")
+        compile_firmware.assert_called_once_with(mpy_version="1.22.2")
 
     def test_host_precompile_failure_does_not_interrupt_the_device(self):
         with patch.object(device, "precompile_firmware", side_effect=RuntimeError("compiler failed")), \
@@ -232,15 +243,19 @@ class UploadPlanTests(unittest.TestCase):
         backup.assert_not_called()
         transport.assert_not_called()
 
-    def compiler(self, header=None, version=None):
+    def compiler(self, header=None, version=None, mpy_version="1.29.0.post2"):
         calls = []
+        target, mpy_format = {"1.22.2": ("1.22.2", "6.2"),
+                              "1.29.0.post2": ("1.29.0", "6.3")}[mpy_version]
+        prefix = ["uv", "tool", "run", "--from", "mpy-cross==" + mpy_version, "mpy-cross"]
 
         def run(command, **options):
             calls.append((command, options))
-            self.assertEqual(command[:len(device.MPY_CROSS_COMMAND)], list(device.MPY_CROSS_COMMAND))
+            self.assertEqual(command[:len(prefix)], prefix)
             self.assertFalse(any(value.startswith("-march") or value.startswith("-O") for value in command))
             if command[-1] == "--version":
-                return SimpleNamespace(stdout=version or "MicroPython v1.22.2 on 2024-02-24; mpy-cross emitting mpy v6.2\n")
+                return SimpleNamespace(stdout=version or "MicroPython v" + target +
+                                       " on 2026-08-29; mpy-cross emitting mpy v" + mpy_format + "\n")
             output = Path(command[command.index("-o") + 1])
             source_name = command[command.index("-s") + 1]
             self.assertFalse(Path(source_name).is_absolute())
@@ -252,33 +267,83 @@ class UploadPlanTests(unittest.TestCase):
         return Mock(side_effect=run), calls
 
     def test_precompile_pins_version_compiles_all_sources_and_keeps_boot_entrypoint(self):
-        compiler, calls = self.compiler()
-        with patch.object(device.subprocess, "run", compiler):
-            mapping = device.precompile_firmware(self.firmware, self.root / "cache")
-        self.assertEqual(set(mapping), {"boot.py", "components/runtime.mpy"})
-        self.assertEqual([command[-1] for command, _ in calls], ["--version", "boot.py", "components/runtime.py"])
-        self.assertEqual(mapping["boot.py"].read_bytes(), (self.firmware / "boot.py").read_bytes())
-        self.assertEqual(mapping["components/runtime.mpy"].read_bytes()[:4], b"M\x06\x00\x1f")
-        manifest = json.loads((mapping["boot.py"].parent / "build-manifest.json").read_text())
-        self.assertEqual(manifest["compiler"], "mpy-cross==1.22.2")
-        self.assertEqual(manifest["format"], "6.2")
-        self.assertFalse(manifest["native"])
-        self.assertEqual(set(manifest["sources"]), {"boot.py", "components/runtime.py"})
-        self.assertNotIn(str(self.root), json.dumps(manifest))
-        self.assertNotIn("private MQTT fixture", json.dumps(manifest))
+        for selector, target, mpy_format in (("1.22.2", "1.22.2", "6.2"),
+                                             ("1.29.0.post2", "1.29.0", "6.3")):
+            with self.subTest(compiler=selector):
+                compiler, calls = self.compiler(mpy_version=selector)
+                with patch.object(device.subprocess, "run", compiler):
+                    mapping = device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+                self.assertEqual(set(mapping), {"boot.py", "components/runtime.mpy"})
+                self.assertEqual([command[-1] for command, _ in calls], ["--version", "boot.py", "components/runtime.py"])
+                self.assertEqual(mapping["boot.py"].read_bytes(), (self.firmware / "boot.py").read_bytes())
+                self.assertEqual(mapping["components/runtime.mpy"].read_bytes()[:4], b"M\x06\x00\x1f")
+                manifest = json.loads((mapping["boot.py"].parent / "build-manifest.json").read_text())
+                self.assertEqual(manifest["compiler"], "mpy-cross==" + selector)
+                self.assertEqual(manifest["micropython"], target)
+                self.assertEqual(manifest["format"], mpy_format)
+                self.assertFalse(manifest["native"])
+                self.assertEqual(set(manifest["sources"]), {"boot.py", "components/runtime.py"})
+                self.assertNotIn(str(self.root), json.dumps(manifest))
+                self.assertNotIn("private MQTT fixture", json.dumps(manifest))
 
     def test_precompile_rejects_wrong_compiler_or_mpy_format_before_upload(self):
-        for version in ("MicroPython v1.23.0; mpy-cross emitting mpy v6.2", "MicroPython v1.22.2; mpy-cross emitting mpy v6.1"):
-            compiler, calls = self.compiler(version=version)
-            with self.subTest(version=version), patch.object(device.subprocess, "run", compiler):
-                with self.assertRaisesRegex(RuntimeError, "Expected mpy-cross"):
-                    device.precompile_firmware(self.firmware, self.root / "cache")
-            self.assertEqual(len(calls), 1)
-        for header in (b"X\x06\x00\x1f", b"M\x05\x00\x1f", b"M\x06\x02\x1f", b"M\x06\x28\x1f", b"M\x06\x00\x1e"):
-            compiler, _ = self.compiler(header=header)
-            with self.subTest(header=header), patch.object(device.subprocess, "run", compiler):
-                with self.assertRaisesRegex(RuntimeError, "pure bytecode"):
-                    device.precompile_firmware(self.firmware, self.root / "cache")
+        invalid = {
+            "1.22.2": ("MicroPython v1.29.0 on 2026-08-24; mpy-cross emitting mpy v6.2",
+                       "MicroPython v1.22.2 on 2024-02-22; mpy-cross emitting mpy v6.3"),
+            "1.29.0.post2": ("MicroPython v1.22.2 on 2024-02-22; mpy-cross emitting mpy v6.3",
+                             "MicroPython v1.29.0 on 2026-08-24; mpy-cross emitting mpy v6.2",
+                             "MicroPython v1.29.0-preview on 2026-08-24; mpy-cross emitting mpy v6.3"),
+        }
+        for selector, versions in invalid.items():
+            for version in versions:
+                compiler, calls = self.compiler(version=version, mpy_version=selector)
+                with self.subTest(compiler=selector, version=version), patch.object(device.subprocess, "run", compiler):
+                    with self.assertRaisesRegex(RuntimeError, "Expected mpy-cross"):
+                        device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+                self.assertEqual(len(calls), 1)
+        for selector in ("1.22.2", "1.29.0.post2"):
+            for header in (b"X\x06\x00\x1f", b"M\x05\x00\x1f", b"M\x06\x02\x1f", b"M\x06\x28\x1f", b"M\x06\x00\x1e"):
+                compiler, _ = self.compiler(header=header, mpy_version=selector)
+                with self.subTest(compiler=selector, header=header), patch.object(device.subprocess, "run", compiler):
+                    with self.assertRaisesRegex(RuntimeError, "pure bytecode"):
+                        device.precompile_firmware(self.firmware, self.root / "cache", mpy_version=selector)
+
+    def test_unsupported_compiler_selection_is_rejected_before_tools_or_device_access(self):
+        for selector in ("1.29.0", "1.23.0", "latest", None, {}):
+            with self.subTest(compiler=selector), patch.object(device.subprocess, "run") as compiler, \
+                    patch.object(device, "backup") as backup, patch.object(device, "mpremote") as transport:
+                with self.assertRaisesRegex(RuntimeError, "Unsupported mpy-cross version"):
+                    device.upload("COM-test", precompile=True, mpy_version=selector)
+                compiler.assert_not_called()
+                backup.assert_not_called()
+                transport.assert_not_called()
+
+    def test_cli_selects_explicit_compilers_and_documents_the_new_default(self):
+        self.assertEqual(device.DEFAULT_MPY_VERSION, "1.29.0.post2")
+        for selector in (None, "1.22.2", "1.29.0.post2"):
+            arguments = ["device.py", "upload", "--precompile", "--port", "COM-test"]
+            if selector is not None:
+                arguments.extend(["--mpy-version", selector])
+            with self.subTest(compiler=selector), patch("sys.argv", arguments), \
+                    patch.object(device, "release_bridge") as release, patch.object(device, "upload") as upload:
+                device.main()
+                release.assert_called_once()
+                upload.assert_called_once_with("COM-test", precompile=True,
+                                               mpy_version=selector or "1.29.0.post2")
+
+    def test_cli_rejects_invalid_or_unused_compiler_flags_before_releasing_bridge(self):
+        for arguments in (("upload", "--precompile", "--mpy-version", "1.29.0"),
+                          ("upload", "--mpy-version", "1.22.2"),
+                          ("status", "--mpy-version", "1.22.2"),
+                          ("backup", "--precompile")):
+            with self.subTest(arguments=arguments), patch("sys.argv", ["device.py", *arguments]), \
+                    patch("sys.stderr", io.StringIO()), patch.object(device, "release_bridge") as release, \
+                    patch.object(device, "upload") as upload:
+                with self.assertRaises(SystemExit) as error:
+                    device.main()
+                self.assertEqual(error.exception.code, 2)
+                release.assert_not_called()
+                upload.assert_not_called()
 
     def test_precompile_relative_names_produce_reproducible_artifacts(self):
         compiler, _ = self.compiler()
@@ -288,6 +353,130 @@ class UploadPlanTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         for remote in first:
             self.assertEqual(first[remote].read_bytes(), second[remote].read_bytes())
+
+
+MISSING_MARKER = object()
+
+
+class BackupTransport:
+    """Execute backup/marker code against byte streams, never a real serial port."""
+
+    def __init__(self, marker=MISSING_MARKER, marker_error=None):
+        self.commands = []
+        self.resets = []
+        self.closed = False
+        self.files = {"/boot.py": b"print('original boot')\n", "/.env": b"private backup fixture\n"}
+        modules = {"one_esp_build": marker, "os": SimpleNamespace(ilistdir=self.ilistdir),
+                   "ubinascii": binascii, "uhashlib": hashlib,
+                   "gc": SimpleNamespace(collect=lambda: None)}
+
+        def import_remote(name, *args):
+            if name == "one_esp_build":
+                if marker_error is not None:
+                    raise marker_error
+                if marker is MISSING_MARKER:
+                    raise ImportError("no module named 'one_esp_build'")
+            return modules[name]
+
+        remote_builtins = vars(builtins).copy()
+        remote_builtins.update(__import__=import_remote,
+                               open=lambda path, mode: io.BytesIO(self.files[path]))
+        self.namespace = {"__builtins__": remote_builtins}
+
+    def ilistdir(self, path):
+        if path != "/":
+            raise OSError(2)
+        return [(name[1:], 0x8000, 0, len(data)) for name, data in self.files.items()]
+
+    def enter_raw_repl(self, soft_reset):
+        self.commands.append("enter_raw_repl")
+
+    def exec(self, code):
+        self.commands.append(code)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            exec(code, self.namespace)
+        return output.getvalue().encode("utf-8")
+
+    def eval(self, code):
+        self.commands.append(code)
+        return eval(code, self.namespace)
+
+    def exec_raw_no_follow(self, code):
+        self.resets.append(code)
+
+    def close(self):
+        self.closed = True
+
+
+class FrozenUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def transport(self, transport):
+        return patch.dict("sys.modules", {
+            "mpremote.transport_serial": SimpleNamespace(SerialTransport=lambda port: transport),
+        })
+
+    def test_frozen_upload_refuses_both_modes_before_backup_reads_or_staged_writes(self):
+        for precompile in (False, True):
+            with self.subTest(precompile=precompile):
+                transport = BackupTransport(SimpleNamespace(FROZEN_APP=True))
+                with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                        patch.object(device, "precompile_firmware", return_value={}), \
+                        patch.object(device, "build_upload_plan") as plan, \
+                        patch.object(device, "mpremote") as upload:
+                    with self.assertRaisesRegex(RuntimeError, "Rebuild and flash the firmware image"):
+                        device.upload("COM-test", precompile=precompile)
+                self.assertEqual(transport.commands, ["enter_raw_repl", device.FROZEN_CHECK])
+                self.assertTrue(transport.closed)
+                self.assertEqual(len(transport.resets), 1)
+                plan.assert_not_called()
+                upload.assert_not_called()
+                self.assertEqual(transport.files["/boot.py"], b"print('original boot')\n")
+
+    def test_full_backup_of_frozen_device_remains_allowed_without_importing_app(self):
+        transport = BackupTransport(SimpleNamespace(FROZEN_APP=True))
+        with patch.object(device, "ROOT", self.root), self.transport(transport), patch("sys.stdout", io.StringIO()):
+            target = device.backup("COM-test")
+        manifest = json.loads((target / "backup-manifest.json").read_text())
+        self.assertEqual(set(manifest), set(transport.files))
+        for name, data in transport.files.items():
+            self.assertEqual((target / name[1:]).read_bytes(), data)
+            self.assertEqual(manifest[name]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertFalse(any("one_esp_build" in command for command in transport.commands))
+        self.assertTrue(transport.closed)
+        self.assertEqual(len(transport.resets), 1)
+
+    def test_absent_marker_and_explicit_mutable_marker_continue_normal_upload(self):
+        for marker in (MISSING_MARKER, SimpleNamespace(FROZEN_APP=False)):
+            with self.subTest(marker_present=marker is not MISSING_MARKER):
+                transport = BackupTransport(marker)
+                with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                        patch.object(device, "build_upload_plan", return_value=["exec", "verified plan"]) as plan, \
+                        patch.object(device, "mpremote") as upload, patch("sys.stdout", io.StringIO()):
+                    device.upload("COM-test")
+                plan.assert_called_once_with(compiled=None)
+                self.assertEqual(upload.call_args_list, [
+                    unittest.mock.call("COM-test", "exec", "verified plan"),
+                    unittest.mock.call("COM-test", "reset"),
+                ])
+                self.assertTrue(transport.closed)
+                # Successful upload backup leaves restart to the upload finally.
+                self.assertFalse(transport.resets)
+
+    def test_marker_import_failure_does_not_masquerade_as_absent_legacy_marker(self):
+        transport = BackupTransport(marker_error=ImportError("marker initialization failed"))
+        with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                patch.object(device, "build_upload_plan") as plan, patch.object(device, "mpremote") as upload:
+            with self.assertRaisesRegex(ImportError, "marker initialization failed"):
+                device.upload("COM-test")
+        plan.assert_not_called()
+        upload.assert_not_called()
+        self.assertEqual(len(transport.resets), 1)
+        self.assertTrue(transport.closed)
 
 
 if __name__ == "__main__":

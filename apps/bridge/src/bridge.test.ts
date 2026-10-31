@@ -114,9 +114,126 @@ describe('bounded serial framing', () => {
     expect(lines).toEqual(['valid']);
     expect(overflow).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    [0xff],
+    [0x80],
+    [0xc0, 0xaf],
+    [0xe2, 0x28, 0xa1],
+    [0xed, 0xa0, 0x80],
+    [0xf4, 0x90, 0x80, 0x80],
+    [0xe2, 0x82],
+  ])(
+    'rejects one whole line for invalid UTF-8 bytes %j and recovers without replacement characters',
+    (...invalid) => {
+      const lines: string[] = [];
+      const overflow = vi.fn();
+      const malformed = vi.fn();
+      const parser = new BoundedLineParser((line) => lines.push(line), overflow, 8192, malformed);
+      const data = Buffer.concat([
+        Buffer.from('{"key":"'),
+        Buffer.from(invalid),
+        Buffer.from('"}\r\n中文\r\n'),
+      ]);
+      for (const byte of data) parser.push(Uint8Array.of(byte));
+      expect(lines).toEqual(['中文']);
+      expect(malformed).toHaveBeenCalledTimes(1);
+      expect(overflow).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('bridge controller without hardware', () => {
+  it('does not accept damaged ACK keys through replacement decoding and preserves bad-line counters after reconnect', async () => {
+    const { controller, transports } = setup();
+    const received: unknown[] = [];
+    controller.subscribe((message) => {
+      if (message.type === 'event' && message.data.type === 'ack') received.push(message.data.data);
+    });
+    await controller.connect('COM-test');
+    const bad = Buffer.from(
+      eventLine('ack', { id: 'damaged', ok: true, result: { values: { slave_address: 15 } } }),
+    );
+    bad[bad.indexOf('slave_address') + 4] = 0xff;
+    transports[0]!.listeners!.data(bad);
+    expect(received).toEqual([]);
+    expect(controller.getState().serialDiagnostics).toEqual({
+      invalidUtf8Lines: 1,
+      invalidProtocolLines: 0,
+      oversizedLines: 0,
+    });
+    transports[0]!.receive(eventLine('ack', { id: 'valid', ok: true, result: {} }));
+    expect(received).toEqual([{ id: 'valid', ok: true, result: {} }]);
+    for (let index = 0; index < 205; index += 1)
+      transports[0]!.listeners!.data(Uint8Array.of(0xff, 10));
+    transports[0]!.receive(WIRE_PREFIX + '{broken}\n');
+    transports[0]!.receive('x'.repeat(8193) + '\n');
+    expect(controller.getState().serialDiagnostics).toEqual({
+      invalidUtf8Lines: 206,
+      invalidProtocolLines: 1,
+      oversizedLines: 1,
+    });
+    expect(controller.getState().logs.length).toBeLessThanOrEqual(200);
+    await controller.disconnect();
+    await controller.connect('COM-test');
+    expect(controller.getState().serialDiagnostics).toEqual({
+      invalidUtf8Lines: 206,
+      invalidProtocolLines: 1,
+      oversizedLines: 1,
+    });
+  });
+
+  it('rejects USB-altered RTU readings while retaining the last verified observation and accepts a genuinely matching 1.5 C frame', async () => {
+    const { controller, transports } = setup();
+    await controller.connect('COM-test');
+    const environment = {
+      enabled: true,
+      phase: 'idle',
+      samples: 1,
+      failures: 0,
+      lastError: null,
+      readAtMs: 1000,
+      ageMs: 0,
+      stale: false,
+      intervalMs: 60000,
+      nextReadInMs: 60000,
+      protocol: 'sht20_rtu',
+      integrity: 'crc_verified',
+      temperatureC: 31.5,
+      relativeHumidityPercent: 50,
+      lastFrameHex: '010404013b01f48ba2',
+    };
+    const status = {
+      uptimeMs: 1000,
+      memFree: 50000,
+      wifi: { connected: true, status: 1010 },
+      sensorEnabled: true,
+      ramPatch: { active: true },
+      environment,
+    };
+    transports[0]!.receive(eventLine('status', status));
+    expect(controller.getState().status?.data.environment).toEqual(environment);
+    transports[0]!.receive(
+      eventLine('status', { ...status, environment: { ...environment, temperatureC: 1.5 } }),
+    );
+    expect(controller.getState().status?.data.environment).toEqual(environment);
+    expect(controller.getState().serialDiagnostics?.invalidProtocolLines).toBe(1);
+    const realLow = { ...environment, temperatureC: 1.5, lastFrameHex: '010404000f01f4cb90' };
+    transports[0]!.receive(eventLine('status', { ...status, environment: realLow }));
+    expect(controller.getState().status?.data.environment).toEqual(realLow);
+    expect(controller.getState().status?.data.ramPatch).toEqual({ active: true });
+    const failed = {
+      ...realLow,
+      integrity: 'none',
+      lastError: 'crc_error',
+      lastFrameHex: '010404000f01f4cb91',
+      failures: 1,
+    };
+    transports[0]!.receive(eventLine('status', { ...status, environment: failed }));
+    expect(controller.getState().status?.data.environment).toEqual(failed);
+    expect(controller.getState().serialDiagnostics?.invalidProtocolLines).toBe(1);
+  });
+
   it('does not open a serial port until explicitly connected', () => {
     const { controller, transports } = setup();
     expect(transports).toHaveLength(0);
@@ -383,6 +500,26 @@ describe('bridge controller without hardware', () => {
     );
     expect(transport.writes).toHaveLength(2);
   });
+
+  it.each(['mqtt.config.set', 'sensor.config.set'] as const)(
+    'allows %s without a debug lease but rejects a stale boot',
+    async (name) => {
+      const { controller, transports } = setup();
+      await controller.connect('COM-test');
+      const transport = transports[0]!;
+      transport.receive(eventLine());
+      const command = {
+        v: 1,
+        id: 'settings',
+        bootId: 'old-boot',
+        command: name,
+        args: { revision: 0, values: { enabled: false } },
+      };
+      await expect(controller.command(command)).rejects.toThrow('已重启');
+      await controller.command({ ...command, bootId: 'test-boot' });
+      expect(transport.writes.at(-1)).toContain(name);
+    },
+  );
 
   it('never forwards GPIO writes outside the reported output whitelist', async () => {
     const { controller, transports } = setup();

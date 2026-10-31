@@ -8,7 +8,7 @@
     "build": "pnpm --filter @one-esp/protocol build && pnpm --filter @one-esp/bridge build && pnpm --filter @one-esp/web build",
     "start": "pnpm --filter @one-esp/bridge start",
     "typecheck": "pnpm --filter @one-esp/protocol build && pnpm --filter @one-esp/bridge typecheck && pnpm --filter @one-esp/web typecheck",
-    "test": "vitest run",
+    "test": "pnpm --filter @one-esp/protocol build && vitest run",
     "test:firmware": "uv run --locked python -B -m unittest discover -s apps/firmware/tests -v",
     "test:tools": "uv run --locked python -B -m unittest discover -s tools/tests -v",
     "test:e2e": "playwright test",

@@ -11,5 +11,6 @@
   "gateway_id": "example-gateway",
   "device_id": "example-esp32-device",
   "interval_seconds": 60,
-  "keepalive_seconds": 60
+  "keepalive_seconds": 60,
+  "commands_enabled": false
 }

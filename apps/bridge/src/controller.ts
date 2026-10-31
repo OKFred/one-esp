@@ -83,6 +83,11 @@ export class BridgeController {
   private readonly activeWrites = new Map<symbol, number>();
   private debugExpiresAt = 0;
   private mutation: Promise<unknown> = Promise.resolve();
+  private readonly serialDiagnostics = {
+    invalidUtf8Lines: 0,
+    invalidProtocolLines: 0,
+    oversizedLines: 0,
+  };
 
   constructor(options: BridgeControllerOptions = {}) {
     this.createTransport = options.createTransport ?? createSerialTransport;
@@ -91,7 +96,7 @@ export class BridgeController {
   }
 
   getState(): BridgeState {
-    return structuredClone(this.state);
+    return { ...structuredClone(this.state), serialDiagnostics: { ...this.serialDiagnostics } };
   }
 
   async listPorts(): Promise<PortDescription[]> {
@@ -303,13 +308,22 @@ export class BridgeController {
             this.accept(event);
           } else this.note('info', line);
         } catch {
-          this.note('warn', '已忽略格式错误的设备遥测消息。');
+          const count = ++this.serialDiagnostics.invalidProtocolLines;
+          this.note('warn', `已忽略格式错误或完整性校验失败的设备遥测消息（累计 ${count} 行）。`);
           recoverSnapshot();
         }
       },
       () => {
         if (!isCurrentSession()) return;
-        this.note('warn', '已丢弃超过 8 KiB 的串口行；等待下一行恢复。');
+        const count = ++this.serialDiagnostics.oversizedLines;
+        this.note('warn', `已丢弃超过 8 KiB 的串口行（累计 ${count} 行）；等待下一行恢复。`);
+        recoverSnapshot();
+      },
+      8192,
+      () => {
+        if (!isCurrentSession()) return;
+        const count = ++this.serialDiagnostics.invalidUtf8Lines;
+        this.note('warn', `已丢弃无效 UTF-8 串口行（累计 ${count} 行）；等待下一行恢复。`);
         recoverSnapshot();
       },
     );
@@ -360,7 +374,7 @@ export class BridgeController {
       if (attempt !== this.attempt || generation !== this.generation) return;
       this.failures = 0;
       this.connection(true, 'usb', path);
-      this.note('info', `串口 ${path} 已连接：115200 / 8N1，温湿度采集未启用。`);
+      this.note('info', `串口 ${path} 已连接：115200 / 8N1，正在读取设备状态。`);
       this.livenessTimer = setInterval(() => {
         if (
           !isCurrentSession() ||
@@ -435,12 +449,24 @@ export class BridgeController {
     }
     const transport = this.transport;
     if (!transport) throw new BridgeError('串口不可用。', 409);
-    if (['debug.renew', 'device.restart', 'config.set', 'gpio.write'].includes(command.command)) {
+    if (
+      [
+        'debug.renew',
+        'device.restart',
+        'config.set',
+        'mqtt.config.set',
+        'sensor.config.set',
+        'gpio.write',
+      ].includes(command.command)
+    ) {
       const bootId = this.state.hello?.bootId ?? this.state.status?.bootId;
       if (!bootId || command.bootId !== bootId) {
         throw new BridgeError('设备已重启或尚未就绪，请刷新快照后重试。', 409);
       }
-      if (this.state.debug?.data.enabled !== true || Date.now() >= this.debugExpiresAt) {
+      if (
+        !['mqtt.config.set', 'sensor.config.set'].includes(command.command) &&
+        (this.state.debug?.data.enabled !== true || Date.now() >= this.debugExpiresAt)
+      ) {
         throw new BridgeError('调试会话未开启或已过期，请重新开启调试。', 403);
       }
       if (command.command === 'debug.renew') {

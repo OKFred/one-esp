@@ -70,6 +70,31 @@ class DebugServiceTests(unittest.TestCase):
     def restart(self):
         self.restart_count += 1
 
+    def test_tls_quiet_period_defers_bulk_snapshots_but_confirms_commands(self):
+        self.service.metrics_provider = self.metrics
+        self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': '12:34:56'})
+        self.service.handle(self.command('debug.set', {'enabled': True}))
+        with patch.object(self.service, '_oled_wire_data', wraps=self.service._oled_wire_data) as encode:
+            for _ in range(12):
+                self.service.tick(quiet=True)
+                self.clock.advance(10)
+            self.assertTrue(self.events('ack')[-1]['data']['ok'])
+            self.assertTrue(self.service.enabled)
+            self.assertFalse(self.events('oled'))
+            self.assertFalse(self.events('metrics'))
+            encode.assert_not_called()
+            for _ in range(80):
+                self.service.tick()
+                self.clock.advance(100)
+            self.assertTrue(self.events('oled'))
+            self.assertTrue(self.events('metrics'))
+
+    def test_tls_quiet_period_still_expires_debug_lease(self):
+        self.service.handle(self.command('debug.set', {'enabled': True, 'ttlSeconds': 1}))
+        self.clock.advance(1001)
+        self.service.tick(quiet=True)
+        self.assertFalse(self.service.enabled)
+
     def metrics(self, interval):
         now = self.service.now()
         return {'sampledAtMs': now, 'intervalMs': interval, 'cpuHz': 160000000,
@@ -434,17 +459,141 @@ class DebugServiceTests(unittest.TestCase):
         self.assertTrue(self.service.emit('oled', self.service._oled))
         self.assertEqual(self.events('oled')[-1]['data']['text'], 'recovered')
 
-    def test_emit_allocation_failures_write_nothing_and_keep_oled_retryable(self):
+    def test_metadata_allocation_failure_writes_nothing_and_keeps_oled_retryable(self):
         raw = bytes(1024)
         self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'latest'})
-        for target, attribute in ((debug_service.binascii, 'b2a_base64'), (debug_service.json, 'dumps')):
-            with patch.object(target, attribute, side_effect=MemoryError):
-                self.assertFalse(self.service.emit('oled', self.service._oled))
-            self.assertEqual(self.frames, [])
-            self.assertEqual(self.service.seq, 0)
-            self.assertIs(self.service._oled['buffer'], raw)
+        with patch.object(debug_service.json, 'dumps', side_effect=MemoryError):
+            self.assertFalse(self.service.emit('oled', self.service._oled))
+        self.assertEqual(self.frames, [])
+        self.assertEqual(self.service.seq, 0)
+        self.assertIs(self.service._oled['buffer'], raw)
         self.assertTrue(self.service.emit('oled', self.service._oled))
         self.assertEqual(binascii.a2b_base64(self.events('oled')[-1]['data']['buffer']), raw)
+
+    def test_oled_stream_uses_only_small_encoder_inputs_and_decodes_all_pixels(self):
+        raw = bytes(range(256)) * 4
+        self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'latest'})
+        original_encode, original_dumps = binascii.b2a_base64, json.dumps
+        inputs, metadata = [], []
+        def encode(value, **kwargs):
+            inputs.append(len(value))
+            return original_encode(value, **kwargs)
+        def dumps(value):
+            metadata.append(value)
+            self.assertEqual(value['data']['buffer'], '')
+            return original_dumps(value)
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=encode), \
+                patch.object(debug_service.json, 'dumps', side_effect=dumps):
+            self.assertTrue(self.service.emit('oled', self.service._oled))
+        self.assertEqual(inputs, [48] * 21 + [16])
+        self.assertEqual(len(metadata), 1)
+        self.assertLessEqual(max(len(part.encode()) for part in self.frames), 256)
+        line = ''.join(self.frames)
+        frame = json.loads(line[len(WIRE_PREFIX):])
+        self.assertEqual(binascii.a2b_base64(frame['data']['buffer']), raw)
+        self.assertEqual(self.service._budget_bytes, len(line.encode()))
+        self.assertEqual(line.count('\n'), 1)
+        self.assertIs(self.service._oled['buffer'], raw)
+
+    def test_oled_budget_and_line_limits_are_checked_before_encoding_or_writing(self):
+        self.service.capture_oled({'available': True, 'buffer': bytes(1024), 'text': 'latest'})
+        self.service._budget_bytes = NORMAL_BYTES_PER_SECOND - 100
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=AssertionError('over budget')) as encode:
+            self.assertFalse(self.service.emit('oled', self.service._oled))
+            encode.assert_not_called()
+        self.assertEqual(self.frames, [])
+        self.service._budget_bytes = 0
+        malformed = dict(self.service._oled, text='x' * MAX_LINE_BYTES)
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=AssertionError('oversize')) as encode:
+            self.assertFalse(self.service.emit('oled', malformed))
+            encode.assert_not_called()
+        self.assertEqual(self.frames, [])
+        self.assertEqual(self.service.seq, 0)
+
+    def test_oled_non_ascii_metadata_and_quote_content_keep_exact_utf8_budget(self):
+        raw = bytes(range(256)) * 4
+        text = '\u6e29\u5ea6 "buffer":"" \U0001f600 \u6062\u590d\n' * 5
+        original_dumps = json.dumps
+        for byte_counts in (False, True):
+            with self.subTest(byte_counts=byte_counts):
+                wire, parts = io.StringIO(), []
+                def write(part):
+                    parts.append(part)
+                    wire.write(part)
+                    return len(part.encode()) if byte_counts else len(part)
+                service = DebugService(write, '\u8bbe\u5907', 'boot-a', lambda: {}, self.pins,
+                                       self.config, clock=self.clock, writer_counts_bytes=byte_counts)
+                service.capture_oled({'available': True, 'buffer': raw, 'text': text})
+                with patch.object(debug_service.json, 'dumps', side_effect=lambda event: original_dumps(event, ensure_ascii=False)):
+                    self.assertTrue(service.emit('oled', service._oled))
+                line = wire.getvalue()
+                value = json.loads(line[len(WIRE_PREFIX):])
+                self.assertEqual(value['data']['text'], text)
+                self.assertEqual(binascii.a2b_base64(value['data']['buffer']), raw)
+                self.assertEqual(service._budget_bytes, len(line.encode()))
+                self.assertLessEqual(max(len(part.encode()) for part in parts), 256)
+
+    def test_partial_write_between_oled_chunks_resynchronizes_with_lf_and_retries(self):
+        raw = bytes(range(256)) * 4
+        failed_chunk = binascii.b2a_base64(raw[144:192], newline=False).decode('ascii')
+        failed = False
+        def write(part):
+            nonlocal failed
+            if part == failed_chunk and not failed:
+                failed = True
+                self.frames.append(part[:10])
+                return 10
+            self.frames.append(part)
+            return len(part)
+        self.service.writer = write
+        self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'latest'})
+        self.assertFalse(self.service.emit('oled', self.service._oled))
+        self.assertTrue(self.service._output_dirty)
+        self.assertEqual(self.service.seq, 0)
+        reserved = self.service._budget_bytes
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        lines = self.wire_frames()
+        self.assertEqual(len(lines), 2)
+        with self.assertRaises(ValueError):
+            json.loads(lines[0][len(WIRE_PREFIX):])
+        restored = json.loads(lines[1][len(WIRE_PREFIX):])
+        self.assertEqual(binascii.a2b_base64(restored['data']['buffer']), raw)
+        self.assertEqual(restored['seq'], 1)
+        self.assertGreater(self.service._budget_bytes, reserved)
+        self.assertFalse(self.service._output_dirty)
+
+    def test_encoder_failure_after_several_oled_chunks_keeps_next_frame_parseable(self):
+        raw = bytes(range(256)) * 4
+        self.service.capture_oled({'available': True, 'buffer': raw, 'text': 'latest'})
+        original_encode = binascii.b2a_base64
+        calls = 0
+        def encode(value, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 5:
+                raise MemoryError
+            return original_encode(value, **kwargs)
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=encode):
+            self.assertFalse(self.service.emit('oled', self.service._oled))
+        self.assertTrue(self.service._output_dirty)
+        self.assertTrue(self.service.emit('oled', self.service._oled))
+        restored = json.loads(self.wire_frames()[-1][len(WIRE_PREFIX):])
+        self.assertEqual(binascii.a2b_base64(restored['data']['buffer']), raw)
+        self.assertEqual(self.service.dropped_events, 1)
+
+    def test_unavailable_oled_never_encodes_and_invalid_available_buffer_is_rejected(self):
+        with patch.object(debug_service.binascii, 'b2a_base64', side_effect=AssertionError('no encoding')) as encode:
+            self.assertTrue(self.service.emit('oled', {'available': False, 'buffer': b'invalid', 'text': 'unavailable'}))
+            event = self.events('oled')[-1]
+            self.assertEqual(event['data']['buffer'], '')
+            self.assertFalse(event['data']['available'])
+            before = len(self.frames)
+            for data in ({'available': True, 'buffer': bytes(1023), 'text': 'bad length'},
+                         {'available': True, 'buffer': bytearray(1024), 'text': 'mutable'},
+                         {'available': 'yes', 'buffer': bytes(1024), 'text': 'bad flag'}):
+                self.assertFalse(self.service.emit('oled', data))
+            self.assertEqual(len(self.frames), before)
+            encode.assert_not_called()
 
     def test_utf8_budget_and_full_writer_counts_match_real_wire_bytes(self):
         original_dumps = json.dumps
@@ -685,6 +834,29 @@ class DebugServiceTests(unittest.TestCase):
             self.service.tick()
         self.assertEqual(len(self.events('ack')), 8)
         self.assertEqual(self.service._pending_acks, [])
+
+    def test_large_settings_ack_cache_is_byte_bounded_and_replacement_releases_budget(self):
+        for index in range(12):
+            self.service.acknowledge('large-' + str(index), True,
+                                     {'values': {'synthetic': 'x' * 1500}})
+        self.assertLessEqual(self.service._ack_bytes, 12288)
+        self.assertLess(len(self.service._acks), 12)
+        self.assertIn('large-11', self.service._acks)
+        before = self.service._ack_bytes
+        self.service.acknowledge('large-11', True, {'stage': 'applied'})
+        self.assertLess(self.service._ack_bytes, before)
+        self.assertEqual(self.service._ack_bytes, sum(self.service._ack_sizes.values()))
+        self.assertEqual(set(self.service._acks), set(self.service._ack_sizes))
+
+    def test_business_secret_redaction_handles_overlapping_replacements_and_fails_closed(self):
+        self.service.secret_provider = lambda: ['synthetic-short', 'synthetic-short-and-long']
+        self.assertEqual(self.service._redact('synthetic-short-and-long synthetic-short'),
+                         '[redacted] [redacted]')
+        def unavailable():
+            raise OSError('synthetic secret provider failure')
+        self.service.secret_provider = unavailable
+        self.assertEqual(self.service._redact('sensitive message'),
+                         'Secret state unavailable; message suppressed')
 
     def test_busy_debug_tick_emits_at_most_one_frame_with_logs_and_commands(self):
         self.service.metrics_provider = self.metrics
