@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from components.device_config import ConfigStore
-from components.debug_service import WIRE_PREFIX
+from components.debug_service import WIRE_PREFIX, MAX_LINE_BYTES
 
 
 class Clock:
@@ -158,6 +158,19 @@ class ClockSynchronizer:
                 'busy': self.busy}
 
 
+class BinaryInput:
+    """Nonblocking host adapter: a read without a ready byte fails the test."""
+    def __init__(self, data=b''):
+        self.data = bytearray(data)
+        self.reads = 0
+
+    def read(self, size):
+        if size != 1 or not self.data:
+            raise AssertionError('A serial read would block')
+        self.reads += 1
+        return bytes([self.data.pop(0)])
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -194,7 +207,8 @@ class RuntimeTests(unittest.TestCase):
         self.output = io.StringIO()
         with patch.object(self.module, 'ConfigStore', return_value=self.config), contextlib.redirect_stdout(self.output):
             self.runtime = self.module.DiagnosticRuntime(mqtt_config_path=str(path.with_name('.mqtt.json')),
-                                                         sensor_config_path=str(path.with_name('.sensor.json')))
+                                                         sensor_config_path=str(path.with_name('.sensor.json')),
+                                                         command_input=io.BytesIO())
         self.display = Mock()
         self.runtime.display = self.display
 
@@ -202,6 +216,147 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.service.handle({'v': 1, 'id': identifier, 'command': name,
                                      'bootId': self.runtime.service.boot_id, 'args': args or {}})
         self.runtime.service.tick()
+
+    def serial_input(self, data=b''):
+        stream = BinaryInput(data)
+        self.runtime._command_input = stream
+        self.runtime.command_input_available = True
+        self.runtime.poller = Mock()
+        self.runtime.poller.poll.side_effect = lambda _: [(stream, 1)] if stream.data else []
+        return stream
+
+    def serial_frame(self, command='debug.set', args=None, identifier='serial'):
+        value = {'v': 1, 'id': identifier, 'command': command,
+                 'bootId': self.runtime.service.boot_id, 'args': args or {'enabled': True}}
+        return (WIRE_PREFIX + json.dumps(value, ensure_ascii=False) + '\n').encode('utf-8')
+
+    def drain_serial(self, stream):
+        for _ in range(100):
+            if not stream.data:
+                return
+            self.runtime.poll_commands()
+        self.fail('Serial input did not make bounded progress')
+
+    def test_binary_stdin_is_preferred_without_touching_text_reader(self):
+        stream = BinaryInput()
+        text = types.SimpleNamespace(buffer=stream, read=Mock(side_effect=AssertionError('Text read')))
+        with patch.object(self.module.sys, 'stdin', text), \
+                patch.object(self.module, 'ConfigStore', return_value=self.config), \
+                contextlib.redirect_stdout(self.output):
+            runtime = self.module.DiagnosticRuntime()
+        self.assertIs(runtime._command_input, stream)
+        runtime.poller.register.assert_called_once_with(stream, 1)
+        text.read.assert_not_called()
+
+    def test_missing_binary_stdin_disables_debug_explicitly_without_text_fallback(self):
+        text = types.SimpleNamespace(read=Mock(side_effect=AssertionError('Text read')))
+        with patch.object(self.module.sys, 'stdin', text), \
+                patch.object(self.module, 'ConfigStore', return_value=self.config), \
+                contextlib.redirect_stdout(self.output):
+            runtime = self.module.DiagnosticRuntime()
+        runtime.poll_commands()
+        self.assertFalse(runtime.command_input_available)
+        self.assertFalse(runtime.status()['usbCommandInputAvailable'])
+        self.assertFalse(runtime.service.enabled)
+        self.assertTrue(any('binary command input unavailable' in row['message']
+                            for row in runtime.service.logs))
+        text.read.assert_not_called()
+
+    def test_truncated_utf8_reads_only_ready_byte_and_other_stages_continue(self):
+        stream = self.serial_input(b'\xc2')
+        with patch.object(self.runtime, 'sensor_tick'), \
+                patch.object(self.runtime, '_network_step'), \
+                patch.object(self.runtime, 'maintenance_tick'), \
+                patch.object(self.runtime, 'clock_tick') as clock, \
+                patch.object(self.runtime, 'debug_telemetry_tick'), \
+                patch.object(self.runtime, 'mqtt_tick'), \
+                patch.object(self.runtime, '_restart_step'):
+            self.runtime.tick_once()
+            self.runtime.tick_once()
+        self.assertEqual(stream.reads, 1)
+        self.assertEqual(clock.call_count, 2)
+        self.assertEqual(self.runtime._command_line, bytearray(b'\xc2'))
+
+    def test_utf8_configuration_split_inside_character_preserves_chinese_ssid(self):
+        self.command('debug.set', {'enabled': True}, 'enable')
+        value = '客厅无线'
+        frame = self.serial_frame('config.set', {'revision': 0, 'values': {'SSID': value}})
+        split = frame.index(value.encode('utf-8')) + 1
+        stream = self.serial_input(frame[:split])
+        self.runtime.poll_commands()
+        self.assertIsNone(self.config.pending)
+        for byte in frame[split:]:
+            stream.data.append(byte)
+            self.runtime.poll_commands()
+        self.assertEqual(self.config.pending['SSID'], value)
+        self.assertTrue(self.runtime.service._acks['serial']['ok'])
+
+    def test_error_hangup_and_unrelated_poll_events_never_read(self):
+        for flags in (4, 8, 16, 32, 1 | 8, 1 | 16, 1 | 32):
+            with self.subTest(flags=flags):
+                stream = self.serial_input(b'x')
+                self.runtime.poller.poll.side_effect = None
+                self.runtime.poller.poll.return_value = [(stream, flags)]
+                self.runtime.poll_commands()
+                self.assertEqual(stream.reads, 0)
+
+    def test_invalid_utf8_drops_whole_line_then_next_command_recovers(self):
+        stream = self.serial_input(b'@one-esp private-invalid-\xc2\n' + self.serial_frame())
+        self.drain_serial(stream)
+        self.assertTrue(self.runtime.service.enabled)
+        self.assertTrue(self.runtime.service._acks['serial']['ok'])
+        self.assertTrue(any('Invalid UTF-8 command frame ignored' == row['message']
+                            for row in self.runtime.service.logs))
+        self.assertNotIn('private-invalid', repr(self.runtime.service.logs))
+
+    def test_binary_command_work_is_limited_to_512_bytes_per_tick(self):
+        stream = self.serial_input(b'x' * 600)
+        self.runtime.poll_commands()
+        self.assertEqual(stream.reads, 512)
+        self.assertEqual(len(stream.data), 88)
+        self.runtime.poll_commands()
+        self.assertEqual(stream.reads, 600)
+
+    def test_text_returning_adapter_is_disabled_instead_of_reading_again(self):
+        stream = self.serial_input()
+        stream.read = Mock(return_value='x')
+        self.runtime.poller.poll.side_effect = None
+        self.runtime.poller.poll.return_value = [(stream, 1)]
+        self.runtime.service.enabled = True
+        self.runtime.poll_commands()
+        self.assertFalse(self.runtime.command_input_available)
+        self.assertFalse(self.runtime.service.enabled)
+        stream.read.assert_called_once_with(1)
+
+    def test_binary_crlf_command_is_still_accepted(self):
+        frame = self.serial_frame().rstrip(b'\n') + b'\r\n'
+        stream = self.serial_input(frame)
+        self.drain_serial(stream)
+        self.assertTrue(self.runtime.service.enabled)
+        self.assertTrue(self.runtime.service._acks['serial']['ok'])
+
+    def test_binary_framing_does_not_require_bytearray_decode_method(self):
+        class PortBytearray(bytearray):
+            decode = None
+
+        self.runtime._command_line = PortBytearray()
+        stream = self.serial_input(self.serial_frame())
+        self.drain_serial(stream)
+        self.assertTrue(self.runtime.service.enabled)
+        self.assertTrue(self.runtime.service._acks['serial']['ok'])
+
+    def test_line_limit_counts_utf8_bytes_accepts_boundary_and_discards_overflow(self):
+        exact = '中' * (MAX_LINE_BYTES // 3) + 'x' * (MAX_LINE_BYTES % 3)
+        with patch.object(self.runtime.service, 'feed') as feed:
+            stream = self.serial_input(exact.encode('utf-8') + b'\n')
+            self.drain_serial(stream)
+            self.assertEqual([call.args for call in feed.call_args_list], [(exact,), ('\n',)])
+            feed.reset_mock()
+            stream.data.extend(('中' * (MAX_LINE_BYTES // 3 + 1)).encode('utf-8') + b'\nOK\n')
+            self.drain_serial(stream)
+            self.assertEqual([call.args for call in feed.call_args_list], [('OK',), ('\n',)])
+        self.assertFalse(self.runtime._command_overflow)
+        self.assertEqual(self.runtime._command_line, bytearray())
 
     def test_initialization_never_claims_sensor_or_uart_pins(self):
         self.assertEqual([call.args for call in self.machine.Pin.call_args_list], [(36,), (39,)])

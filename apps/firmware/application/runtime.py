@@ -17,7 +17,7 @@ import os
 
 from components.board_profile import DEBUG_OUTPUTS, PinRegistry
 from components.device_config import ConfigStore
-from components.debug_service import DebugService
+from components.debug_service import DebugService, MAX_LINE_BYTES
 from components.time_sync import get_local_time
 from components.network_probe import NetworkProbe
 from components.clock_sync import ClockSync
@@ -34,7 +34,8 @@ MQTT_GC_THRESHOLD_BYTES = 8192
 
 
 class DiagnosticRuntime:
-    def __init__(self, mqtt_config_path='.mqtt.json', sensor_config_path='.sensor.json'):
+    def __init__(self, mqtt_config_path='.mqtt.json', sensor_config_path='.sensor.json',
+                 command_input=None):
         self._mqtt_gc_previous = None
         # Collect temporary diagnostics before split heaps grow into memory
         # needed by Wi-Fi/TLS. Waiting until MQTT construction is too late.
@@ -51,8 +52,23 @@ class DiagnosticRuntime:
                                     self.apply_config, self.schedule_restart, clock=time,
                                     metrics_provider=lambda interval: self.metrics.sample(interval))
         self.metrics = SystemMetrics(self.service.now, wlan=self.wlan)
-        self.poller = select.poll()
-        self.poller.register(sys.stdin, select.POLLIN)
+        # A text read(1) can wait for UTF-8 continuation bytes after POLLIN.
+        # Explicit binary adapters also support host tests without real stdin.
+        self._command_input = (getattr(sys.stdin, 'buffer', None)
+                               if command_input is None else command_input)
+        self._command_line = bytearray()
+        self._command_overflow = False
+        self.command_input_available = False
+        self.poller = None
+        if callable(getattr(self._command_input, 'read', None)):
+            try:
+                self.poller = select.poll()
+                self.poller.register(self._command_input, select.POLLIN)
+                self.command_input_available = True
+            except Exception:
+                pass
+        if not self.command_input_available:
+            self._disable_command_input()
         self.display = None
         self.wifi_started = None
         self.wifi_timeout = 20000
@@ -119,6 +135,7 @@ class DiagnosticRuntime:
         # two large summaries in every one-second USB status frame.
         mqtt_status.pop('lastSample', None)
         return {'uptimeMs': self.service.now(), 'memFree': gc.mem_free(),
+                'usbCommandInputAvailable': self.command_input_available,
                 'wifi': wifi, 'sensorEnabled': self.sensor is not None,
                 'environment': self.sensor.status() if self.sensor else {
                     'enabled': self._sensor_requested is True, 'phase': self._sensor_state,
@@ -395,15 +412,57 @@ class DiagnosticRuntime:
         self.service.log('info' if self.tcp_ok else 'warn',
                          'TCP connection test completed' if self.tcp_ok else 'TCP connection test failed')
 
+    def _disable_command_input(self):
+        self.command_input_available = False
+        self._command_input = None
+        self._command_line = bytearray()
+        self._command_overflow = False
+        self.service.stop()
+        self.service.log('error', 'USB binary command input unavailable; live debug disabled')
+
+    def _command_byte(self, value):
+        if value == 10:
+            raw, overflow = self._command_line, self._command_overflow
+            self._command_line = bytearray()
+            self._command_overflow = False
+            if not overflow:
+                try:
+                    # MicroPython bytearray lacks bytes.decode on some ports.
+                    line = str(raw, 'utf-8')
+                except (UnicodeError, ValueError):
+                    self.service.log('warn', 'Invalid UTF-8 command frame ignored')
+                else:
+                    self.service.feed(line)
+                    self.service.feed('\n')
+        elif not self._command_overflow:
+            if len(self._command_line) >= MAX_LINE_BYTES:
+                self._command_line = bytearray()
+                self._command_overflow = True
+            else:
+                self._command_line.append(value)
+
     def poll_commands(self):
-        # Bound per-loop work. Do not consume the UART through a second driver.
+        if not self.command_input_available:
+            return
+        errors = (getattr(select, 'POLLERR', 8) | getattr(select, 'POLLHUP', 16)
+                  | getattr(select, 'POLLNVAL', 32))
+        # Bound bytes per loop, and never ask the stream for unavailable bytes.
         for _ in range(512):
-            if not self.poller.poll(0):
+            ready = False
+            for event in self.poller.poll(0):
+                flags = event[1]
+                if flags & select.POLLIN and not flags & errors:
+                    ready = True
+                    break
+            if not ready:
                 break
-            char = sys.stdin.read(1)
-            if not char:
+            chunk = self._command_input.read(1)
+            if not chunk:
                 break
-            self.service.feed(char)
+            if not isinstance(chunk, (bytes, bytearray)) or len(chunk) != 1:
+                self._disable_command_input()
+                break
+            self._command_byte(chunk[0])
 
     def _network_step(self):
         try:

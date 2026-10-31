@@ -10,6 +10,10 @@ except Exception:
     pass
 
 try:
+    import sys
+    if '.frozen' in sys.path:
+        sys.path.remove('.frozen')
+    sys.path.insert(0, '.frozen')
     from application.runtime import run
     run()
 finally:
