@@ -126,7 +126,7 @@ class UploadPlanTests(unittest.TestCase):
                 with patch.object(device, "backup", backup), patch.object(device, "build_upload_plan", plan), patch.object(device, "mpremote", transport):
                     with self.assertRaises((RuntimeError, OSError)):
                         device.upload("COM3")
-                backup.assert_called_once_with("COM3", restart=False)
+                backup.assert_called_once_with("COM3", restart=False, require_mutable=True)
                 self.assertEqual(transport.call_args.args, ("COM3", "reset"))
 
     def compiled(self):
@@ -210,7 +210,7 @@ class UploadPlanTests(unittest.TestCase):
                 patch.object(device, "mpremote") as transport, patch.object(device, "build_upload_plan") as plan:
             with self.assertRaisesRegex(RuntimeError, "upload --precompile"):
                 device.upload("COM-test")
-        backup.assert_called_once_with("COM-test", restart=False)
+        backup.assert_called_once_with("COM-test", restart=False, require_mutable=True)
         plan.assert_not_called()
         transport.assert_called_once_with("COM-test", "reset")
 
@@ -353,6 +353,130 @@ class UploadPlanTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         for remote in first:
             self.assertEqual(first[remote].read_bytes(), second[remote].read_bytes())
+
+
+MISSING_MARKER = object()
+
+
+class BackupTransport:
+    """Execute backup/marker code against byte streams, never a real serial port."""
+
+    def __init__(self, marker=MISSING_MARKER, marker_error=None):
+        self.commands = []
+        self.resets = []
+        self.closed = False
+        self.files = {"/boot.py": b"print('original boot')\n", "/.env": b"private backup fixture\n"}
+        modules = {"one_esp_build": marker, "os": SimpleNamespace(ilistdir=self.ilistdir),
+                   "ubinascii": binascii, "uhashlib": hashlib,
+                   "gc": SimpleNamespace(collect=lambda: None)}
+
+        def import_remote(name, *args):
+            if name == "one_esp_build":
+                if marker_error is not None:
+                    raise marker_error
+                if marker is MISSING_MARKER:
+                    raise ImportError("no module named 'one_esp_build'")
+            return modules[name]
+
+        remote_builtins = vars(builtins).copy()
+        remote_builtins.update(__import__=import_remote,
+                               open=lambda path, mode: io.BytesIO(self.files[path]))
+        self.namespace = {"__builtins__": remote_builtins}
+
+    def ilistdir(self, path):
+        if path != "/":
+            raise OSError(2)
+        return [(name[1:], 0x8000, 0, len(data)) for name, data in self.files.items()]
+
+    def enter_raw_repl(self, soft_reset):
+        self.commands.append("enter_raw_repl")
+
+    def exec(self, code):
+        self.commands.append(code)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            exec(code, self.namespace)
+        return output.getvalue().encode("utf-8")
+
+    def eval(self, code):
+        self.commands.append(code)
+        return eval(code, self.namespace)
+
+    def exec_raw_no_follow(self, code):
+        self.resets.append(code)
+
+    def close(self):
+        self.closed = True
+
+
+class FrozenUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def transport(self, transport):
+        return patch.dict("sys.modules", {
+            "mpremote.transport_serial": SimpleNamespace(SerialTransport=lambda port: transport),
+        })
+
+    def test_frozen_upload_refuses_both_modes_before_backup_reads_or_staged_writes(self):
+        for precompile in (False, True):
+            with self.subTest(precompile=precompile):
+                transport = BackupTransport(SimpleNamespace(FROZEN_APP=True))
+                with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                        patch.object(device, "precompile_firmware", return_value={}), \
+                        patch.object(device, "build_upload_plan") as plan, \
+                        patch.object(device, "mpremote") as upload:
+                    with self.assertRaisesRegex(RuntimeError, "Rebuild and flash the firmware image"):
+                        device.upload("COM-test", precompile=precompile)
+                self.assertEqual(transport.commands, ["enter_raw_repl", device.FROZEN_CHECK])
+                self.assertTrue(transport.closed)
+                self.assertEqual(len(transport.resets), 1)
+                plan.assert_not_called()
+                upload.assert_not_called()
+                self.assertEqual(transport.files["/boot.py"], b"print('original boot')\n")
+
+    def test_full_backup_of_frozen_device_remains_allowed_without_importing_app(self):
+        transport = BackupTransport(SimpleNamespace(FROZEN_APP=True))
+        with patch.object(device, "ROOT", self.root), self.transport(transport), patch("sys.stdout", io.StringIO()):
+            target = device.backup("COM-test")
+        manifest = json.loads((target / "backup-manifest.json").read_text())
+        self.assertEqual(set(manifest), set(transport.files))
+        for name, data in transport.files.items():
+            self.assertEqual((target / name[1:]).read_bytes(), data)
+            self.assertEqual(manifest[name]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertFalse(any("one_esp_build" in command for command in transport.commands))
+        self.assertTrue(transport.closed)
+        self.assertEqual(len(transport.resets), 1)
+
+    def test_absent_marker_and_explicit_mutable_marker_continue_normal_upload(self):
+        for marker in (MISSING_MARKER, SimpleNamespace(FROZEN_APP=False)):
+            with self.subTest(marker_present=marker is not MISSING_MARKER):
+                transport = BackupTransport(marker)
+                with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                        patch.object(device, "build_upload_plan", return_value=["exec", "verified plan"]) as plan, \
+                        patch.object(device, "mpremote") as upload, patch("sys.stdout", io.StringIO()):
+                    device.upload("COM-test")
+                plan.assert_called_once_with(compiled=None)
+                self.assertEqual(upload.call_args_list, [
+                    unittest.mock.call("COM-test", "exec", "verified plan"),
+                    unittest.mock.call("COM-test", "reset"),
+                ])
+                self.assertTrue(transport.closed)
+                # Successful upload backup leaves restart to the upload finally.
+                self.assertFalse(transport.resets)
+
+    def test_marker_import_failure_does_not_masquerade_as_absent_legacy_marker(self):
+        transport = BackupTransport(marker_error=ImportError("marker initialization failed"))
+        with patch.object(device, "ROOT", self.root), self.transport(transport), \
+                patch.object(device, "build_upload_plan") as plan, patch.object(device, "mpremote") as upload:
+            with self.assertRaisesRegex(ImportError, "marker initialization failed"):
+                device.upload("COM-test")
+        plan.assert_not_called()
+        upload.assert_not_called()
+        self.assertEqual(len(transport.resets), 1)
+        self.assertTrue(transport.closed)
 
 
 if __name__ == "__main__":

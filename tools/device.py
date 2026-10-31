@@ -27,6 +27,18 @@ MPY_COMPILERS = {
 # Both formats encode this same pure-bytecode header: native sub-version and
 # architecture flags are absent. ESP32 uses 31-bit small integers.
 MPY_HEADER = b"M\x06\x00\x1f"
+FROZEN_UPLOAD_ERROR = (
+    "This device uses a frozen application. Rebuild and flash the firmware image; "
+    "filesystem upload would not update the running application."
+)
+FROZEN_CHECK = """try:
+ import one_esp_build as _upload_build
+except ImportError as _upload_error:
+ if str(_upload_error) not in ("no module named 'one_esp_build'", "No module named 'one_esp_build'"):
+  raise
+ _upload_build=None
+print('frozen' if _upload_build is not None and getattr(_upload_build,'FROZEN_APP',False) else 'mutable')
+"""
 
 
 def release_bridge(url):
@@ -49,7 +61,7 @@ def mpremote(port, *arguments):
                    check=True, cwd=ROOT)
 
 
-def backup(port, restart=True):
+def backup(port, restart=True, require_mutable=False):
     from mpremote.transport_serial import SerialTransport
 
     target = ROOT / ".device-backups" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -61,6 +73,15 @@ def backup(port, restart=True):
     try:
         transport.enter_raw_repl(soft_reset=False)
         entered = True
+        if require_mutable:
+            # Only the tiny build marker is imported. Frozen-first boot paths
+            # would silently ignore filesystem app updates; reject before even
+            # reading device configuration or preparing any staged writes.
+            mode = transport.exec(FROZEN_CHECK).strip()
+            if mode == b"frozen":
+                raise RuntimeError(FROZEN_UPLOAD_ERROR)
+            if mode != b"mutable":
+                raise RuntimeError("Could not verify mutable firmware; no files were uploaded")
         transport.exec("import os, ubinascii, uhashlib, gc; gc.collect()")
 
         def copy_directory(remote, local):
@@ -247,7 +268,7 @@ def _has_source_shadows(backup_directory, firmware=FIRMWARE):
 
 def upload(port, precompile=False, mpy_version=DEFAULT_MPY_VERSION):
     compiled = precompile_firmware(mpy_version=mpy_version) if precompile else None
-    snapshot = backup(port, restart=False)
+    snapshot = backup(port, restart=False, require_mutable=True)
     try:
         if not precompile and _has_source_shadows(snapshot):
             raise RuntimeError("Device has precompiled modules; use upload --precompile to avoid source shadowing")
