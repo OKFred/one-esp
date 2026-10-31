@@ -2,3 +2,5 @@
 *.png -text
 *.jpg -text
 *.jpeg -text
+# Unified patches contain a required space on empty context lines.
+tools/micropython/patches/*.patch -whitespace

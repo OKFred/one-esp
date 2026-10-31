@@ -45,7 +45,7 @@ pnpm dev
 
 「环境温湿度」卡片显示最后真实读数和读取年龄。未启用、读取失败、数据过期、设备失联和网页更新暂停分别提示；其他遥测刷新不会把旧环境读数变成新采样。MQTT 投递另列连接 / 重连待发 / 等待条件及实际确认数；旧状态标为“上次MQTT状态”，不把本地读取正常等同于上报成功。
 
-实机已有三次临时 `READ` 的 28.8°C / 48.4%RH 回包，以及后续持续环境采样和六次 PUBACK。服务端踢线后的重连与 24 小时稳定门槛仍未通过，未接入 PG / Grafana。当前仍运行 MicroPython 1.22.2，计划对照升级到 1.29.0，尚未刷写；详见 [分阶段验证记录](docs/validation.md)。
+MicroPython 1.22.2 的历史实机窗口已有三次临时 `READ` 的 28.8°C / 48.4%RH 回包，以及后续持续环境采样和六次 PUBACK；该版本服务端踢线后的重连与 24 小时稳定门槛未通过，未接入 PG / Grafana。当前设备已启动 MicroPython 1.29.0 并确认版本、模块接口与私有配置；新版本的业务 TLS、真实环境 PUBACK 和稳定性仍待验收，不能据此认定旧故障已修复。详见 [分阶段验证记录](docs/validation.md)。
 
 「自动续期」默认开启，仅对已开启的调试采集生效，不会自动启动停止中的会话。续期保留档位与频率，不重复发送全量快照。本页成功应用的会话时长会跨同设备、同启动会话的连接重连保留；整页刷新或新开页面使用默认 600 秒续期。手动停止立即生效；关闭网页、断开连接或关闭自动续期后，本页不再续期，没有其他页面继续续期时设备在当前会话到期后暂停网页实时更新。电脑休眠或浏览器冻结时仍可能到期，恢复后重新开启即可。实时调试采集面板显示续期状态和上次成功时间，运行日志记录设备报告的开启、续期与停止。
 
@@ -63,7 +63,7 @@ OLED 按 `128×64 MONO_VLSB` 原始 1024 字节绘制 Canvas，顶部黄 / 下�
 
 网页的设备健康卡片通过独立 `metrics` 低频帧显示 CPU 主频、Python 内存、ESP-IDF 堆、Wi-Fi RSSI、文件系统容量和芯片温度。FULL 每 5 秒、LITE 每 15 秒采集常规指标；温度缓存 30 秒、文件系统每 60 秒刷新，物理 Flash 容量只读取一次。常规资源采集仅由 debug 或显式只读快照触发；快照复用缓存，最短 5 秒，慢指标失败也不会被频繁重试。独立 MQTT 和环境采样可另行读取 MCU 温度。关闭 debug 后停止常规资源周期采集；采集器不主动触发 GC、不写文件、不做下载测速，只保留最新指标帧，不塞进每秒 status。旧固件不提供 `metrics` 时仍可使用原有调试功能。
 
-CPU 主频不代表占用率；当前 MicroPython 没有整机 CPU 使用率或 Wi-Fi 流量速率接口，网络卡片以 RSSI 和已有 TCP 延迟辅助判断连接质量。Python 的空闲加已分配内存是动态分配预算，不是物理 RAM；它与 ESP-IDF 堆统计存在重叠，不能相加。文件系统分区容量和物理 Flash 总量分别显示。原版 ESP32 温度接口返回华氏度，转换后的摄氏度仅作芯片内部温度参考，不能代替环境温湿度传感器，见 [官方硬件说明](https://docs.micropython.org/en/v1.22.0/esp32/quickref.html#general-board-control) 与 [内存统计说明](https://docs.micropython.org/en/v1.22.0/library/esp32.html#esp32.idf_heap_info)。
+CPU 主频不代表占用率；当前采集器不报告整机 CPU 使用率或 Wi-Fi 流量速率，网络卡片以 RSSI 和已有 TCP 延迟辅助判断连接质量。Python 的空闲加已分配内存是动态分配预算，不是物理 RAM；它与 ESP-IDF 堆统计存在重叠，不能相加。文件系统分区容量和物理 Flash 总量分别显示。原版 ESP32 温度接口返回华氏度，转换后的摄氏度仅作芯片内部温度参考，不能代替环境温湿度传感器，见 [官方硬件说明](https://docs.micropython.org/en/v1.29.0/esp32/quickref.html#general-board-control) 与 [内存统计说明](https://docs.micropython.org/en/v1.29.0/library/esp32.html#esp32.idf_heap_info)。
 
 ## 配置
 
@@ -83,7 +83,7 @@ CPU 主频不代表占用率；当前 MicroPython 没有整机 CPU 使用率或 
 
 ## 备份与上传
 
-主机上的上传工具和固件回归测试统一由 **uv** 管理。`.python-version` 固定 **CPython 3.14.2**，`pyproject.toml` 声明依赖，`uv.lock` 锁定直接与传递依赖；依赖安装在根目录 `.venv/`，无需手动激活环境，也不向全局 Python 安装包。主机 CPython 用于工具和测试，ESP32 仍运行 **MicroPython 1.22.2**。尚未安装 uv 时，按 [官方安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装。
+主机上的上传工具和固件回归测试统一由 **uv** 管理。`.python-version` 固定 **CPython 3.14.2**，`pyproject.toml` 声明依赖，`uv.lock` 锁定直接与传递依赖；依赖安装在根目录 `.venv/`，无需手动激活环境，也不向全局 Python 安装包。主机 CPython 用于工具和测试，ESP32 当前已启动 **MicroPython 1.29.0**，业务采集和投递另行验收。尚未安装 uv 时，按 [官方安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装。
 
 工具先请求 bridge 释放串口，再备份完整设备到 Git 忽略的 `.device-backups/`，逐文件 SHA-256 校验后上传。备份含私有配置，仅保存在本机。
 
@@ -97,13 +97,15 @@ uv run --locked python tools/device.py upload --precompile --port COM3
 
 也可使用 `pnpm device backup --port COM3`、`pnpm device upload --precompile --port COM3`；这两个入口同样使用 `uv run --locked`，按锁文件同步项目环境后调用其中的 Python。
 
-上传中断当前程序；`--precompile` 使用隔离的固定版本 `mpy-cross==1.22.2` 生成纯字节码，`boot.py` 保留源码入口。先完整备份，再暂存全部文件，逐文件核对 SHA-256 和格式 / 编译校验后才替换、归档会遮蔽字节码的旧源码并重启。跨文件替换不具事务性，中途失败需由完整备份恢复。不上传测试、本地 `.env`、实际 `.sensor.json` / `.mqtt.json` 或 CA，保留设备凭据；私有配置须单独备份和部署，旧备份继续保留。仅改网页 / bridge 不需上传固件。
+上传中断当前程序；`--precompile` 默认通过隔离的 `uv tool run --from mpy-cross==1.29.0.post2` 调用 MicroPython 1.29.0 编译器，生成 MPY 6.3 纯字节码。仓库共 21 个运行源码，已包含 `lib/ssd1306.py`；`boot.py` 保留源码入口。旧固件回退时，使用 `pnpm device upload --precompile --mpy-version 1.22.2 --port COM3` 选择对应的 `mpy-cross==1.22.2` / MPY 6.2；该参数只选择编译器，不刷写或降级设备上的 MicroPython。
+
+先完整备份，再暂存全部文件，逐文件核对 SHA-256 和格式 / 编译校验后才替换、归档会遮蔽字节码的旧源码并重启。跨文件替换不具事务性，中途失败需由完整备份恢复。不上传测试、本地 `.env`、实际 `.sensor.json` / `.mqtt.json` 或 CA，保留设备凭据；私有配置须单独备份和部署，旧备份继续保留。仅改网页 / bridge 不需上传固件。
 
 ## 检查
 
 首次运行前先执行 `uv sync --locked`。`pnpm test:firmware` 通过 `uv run --locked` 使用同一项目环境运行主机回归测试。
 
-当前主机检查为 134 项 JS / 协议 / 网页测试、293 项固件测试、16 项上传工具测试；主机测试通过与上述实机长稳门槛分开记录。
+当前主机检查为 134 项 JS / 协议 / 网页测试、309 项固件测试、24 项上传工具测试；主机测试通过与上述实机长稳门槛分开记录。
 
 ```powershell
 pnpm typecheck
