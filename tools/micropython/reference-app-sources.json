@@ -1,0 +1,102 @@
+[
+  {
+    "path": "application/main.py",
+    "bytes": 2226,
+    "sha256": "3684d579c2f596c7d2d92b72191f61a32413fffe62cead159f8175e5a1c3482c"
+  },
+  {
+    "path": "application/runtime.py",
+    "bytes": 35912,
+    "sha256": "68ea1d6dd26382935f79d786e75c48f97f2ef4f6e239442be3a619958e189449"
+  },
+  {
+    "path": "components/board_profile.py",
+    "bytes": 4045,
+    "sha256": "8b6c3f406aa65fee3dab98a4a68c1d704699618fd163273599b8ab76b1cdabfe"
+  },
+  {
+    "path": "components/clock_sync.py",
+    "bytes": 12227,
+    "sha256": "3dea3fdb7a504a36ceda17e236c7eb6187ae848fa807fa01e565aa77f6f52860"
+  },
+  {
+    "path": "components/debug_service.py",
+    "bytes": 23077,
+    "sha256": "ab8b2b0b62d3e7e6a4e864f95d60daf87cdbe322cc86dc3c384df010c6d6e788"
+  },
+  {
+    "path": "components/device_addr_scanner.py",
+    "bytes": 359,
+    "sha256": "6093ca695e4765cf25c3e54ff54001a5b4b7c4130a09bac7857b6e4dc6600c63"
+  },
+  {
+    "path": "components/device_config.py",
+    "bytes": 7556,
+    "sha256": "5d52a7e35df8d9fc7e5f44134f192118b44cc0fdcd88b29ed598c0b14ae3a74d"
+  },
+  {
+    "path": "components/env_reader.py",
+    "bytes": 710,
+    "sha256": "c8243e6a8b62179fd4b6b651ab0d23a2da90c66fc9de7d202247586db37e4e91"
+  },
+  {
+    "path": "components/modbus_talker.py",
+    "bytes": 2684,
+    "sha256": "5d2f3a024068ac2c34bf473f02631892b2515e753cff6fb81cd330ac0590eb74"
+  },
+  {
+    "path": "components/mqtt_telemetry.py",
+    "bytes": 17934,
+    "sha256": "6c9020a6c1a1e5eb497af8aed924fb36adf1dd06ffd0e2a7fcc181129e4abe3d"
+  },
+  {
+    "path": "components/mqtt_transport.py",
+    "bytes": 22668,
+    "sha256": "1c9ab5b9b5628648c33fe388dcfefe8a815e49fbce92b02a1a5da9dd6d650486"
+  },
+  {
+    "path": "components/mqtt_wire.py",
+    "bytes": 7245,
+    "sha256": "9c2f65a05d69b85a6bbd1baf5858b5100f4aa33c80a5276ca15d1ba7c7ce6067"
+  },
+  {
+    "path": "components/network_probe.py",
+    "bytes": 5222,
+    "sha256": "92f6fba150917afd712be3a888f9e7ad8ae0983ec9afc66c9a2db9a90124da5f"
+  },
+  {
+    "path": "components/screen_display.py",
+    "bytes": 4150,
+    "sha256": "5c23629e70378996cb83381379fe85427babd3acc240422a9a1742ca69c2191e"
+  },
+  {
+    "path": "components/socket_test.py",
+    "bytes": 1254,
+    "sha256": "c763f5af6113096805e36d3fb090645b59731a9d7280d6866e24f2f24efb7902"
+  },
+  {
+    "path": "components/system_metrics.py",
+    "bytes": 6684,
+    "sha256": "b2f0501c843c42a3d57f1691fe2812f208933d8f4b7b83894edd5fe324543912"
+  },
+  {
+    "path": "components/temperature_humidity.py",
+    "bytes": 10777,
+    "sha256": "4fca1fcd0e47ace32e00a4dbb456616e12fb33fefee920ae8efa172482f2a1ee"
+  },
+  {
+    "path": "components/time_sync.py",
+    "bytes": 2108,
+    "sha256": "becf718fa1e974ba9d3cd13ea97441ad69371e2fea13f43f3d5666c4a33dffb1"
+  },
+  {
+    "path": "components/wifi_connector.py",
+    "bytes": 2129,
+    "sha256": "ae2caa5254fbc679cea573ccac1b0a1b38d25192a2537fe2ecd3b2a635a8ad3a"
+  },
+  {
+    "path": "lib/ssd1306.py",
+    "bytes": 4946,
+    "sha256": "156dcec110abede4b36eefb5667b787240f662e8ec173b3414854398afb9b5df"
+  }
+]

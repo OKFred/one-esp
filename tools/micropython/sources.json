@@ -1,0 +1,56 @@
+{
+  "profile": "one-esp-wroom32-frozen-dynamic-tls",
+  "micropython": {
+    "url": "https://github.com/micropython/micropython.git",
+    "tag": "v1.29.0",
+    "commit": "0fd6c573ea815774668bbb16b8e197c8822368b2"
+  },
+  "espIdf": {
+    "url": "https://github.com/espressif/esp-idf.git",
+    "tag": "v5.5.2",
+    "commit": "30aaf64524299d3bde422ca9a2848090d1bc5d0f"
+  },
+  "mpyCross": {
+    "package": "mpy-cross==1.29.0.post2",
+    "implementation": "MicroPython v1.29.0",
+    "format": "6.3"
+  },
+  "referenceNativeWindows": {
+    "python": "3.12.12",
+    "idfTools": {
+      "xtensa-esp-elf": "esp-14.2.0_20251107",
+      "esp32ulp-elf": "2.38_20240113",
+      "cmake": "3.30.2",
+      "ninja": "1.12.1"
+    },
+    "applicationBytes": 1796864,
+    "applicationSha256": "b997b51204a4a1209147a5348c421a6e7a55a85c2e15d8cf0593915bc99e6359",
+    "mergedImageBytes": 1858304,
+    "mergedImageSha256": "e004f63daa8a1c93eec3eac19dbde2dbdaf95ecb3d5c14cd3fa2d82bf8c47e66",
+    "exactPrivateManifestSha256": "9016d9644a72ea61ebda06c736ef0865c43cd5644c46b6e237696f58ff71e416",
+    "exactPrivateHostPatchSha256": "143ded499b3b5b052980a069e8d1271517eed5057bfbf72f1df076a6fca11241",
+    "sdkconfigSha256": "c81a4e8e805f26ada8db38d5d1146e69d8ddae961ac72857f3259d61db804687",
+    "evidenceSha256": "989eaf2e60003abf53f43eb1452666d55c724a756d562ff897f234dfe984af4f"
+  },
+  "moduleCounts": {
+    "application": 20,
+    "buildMetadata": 1
+  },
+  "factoryPartition": {
+    "offset": 65536,
+    "bytes": 2031616
+  },
+  "parameterizedRecipeValidation": {
+    "fullBuildExecuted": false,
+    "linuxExecuted": false,
+    "upstreamPatchApplyCheck": true,
+    "manifestApplicationModules": 20,
+    "manifestBuildMetadataModules": 1,
+    "manifestDefaultStdlibModules": 28,
+    "sourceHashesMatchReference": true,
+    "isolatedCmakeArgumentGeneration": true,
+    "longLiteralArguments": true,
+    "qstrHeaderMatchesReferenceBytes": true,
+    "qstrHeaderSha256": "3ca50d82c1279bfe2241a72685caafd81e7177fb94698813492bd4bd25df2ede"
+  }
+}
