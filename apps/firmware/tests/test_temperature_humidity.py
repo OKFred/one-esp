@@ -10,10 +10,18 @@ sys.path.insert(0, str(ROOT))
 from components.temperature_humidity import (
     TemperatureHumidityReader, parse_reading, MAX_FRAME_BYTES, QUIET_MS,
     TX_TIMEOUT_MS, RX_TIMEOUT_MS, DRAIN_TIMEOUT_MS,
+    crc16_modbus, build_rtu_request, parse_rtu_reading, SensorCrcError,
+    SensorModbusException,
 )
 
 
 FRAME = bytes.fromhex('32382e38a1e62c34382e34250a')
+RTU_FRAME = bytes.fromhex('010404013102222ace')
+
+
+def with_crc(body):
+    crc = crc16_modbus(body)
+    return body + bytes((crc & 255, crc >> 8))
 
 
 class Clock:
@@ -106,6 +114,68 @@ class ParseReadingTests(unittest.TestCase):
                 parse_reading(raw)
 
 
+class ModbusParseTests(unittest.TestCase):
+    def test_vendor_vectors_use_low_crc_byte_first_and_tenths(self):
+        self.assertEqual(crc16_modbus(bytes.fromhex('010400010002')), 0x0b20)
+        self.assertEqual(build_rtu_request(), bytes.fromhex('010400010002200b'))
+        self.assertEqual(crc16_modbus(bytes.fromhex('01040401310222')), 0xce2a)
+        self.assertEqual(parse_rtu_reading(RTU_FRAME),
+                         {'temperatureC': 30.5, 'relativeHumidityPercent': 54.6})
+        with self.assertRaises(SensorCrcError):
+            parse_rtu_reading(RTU_FRAME[:-2] + RTU_FRAME[-2:][::-1])
+
+    def test_negative_temperature_and_fractional_humidity_preserve_tenths(self):
+        for temperature_raw, humidity_raw, expected in (
+                (0xff85, 567, (-12.3, 56.7)), (0xfe70, 1000, (-40, 100)),
+                (1250, 0, (125, 0)), (0, 1, (0, 0.1))):
+            body = bytes((17, 4, 4, temperature_raw >> 8, temperature_raw & 255,
+                          humidity_raw >> 8, humidity_raw & 255))
+            value = parse_rtu_reading(with_crc(body), 17)
+            self.assertEqual((value['temperatureC'], value['relativeHumidityPercent']), expected)
+
+    def test_every_single_bit_corruption_is_rejected(self):
+        for offset in range(len(RTU_FRAME)):
+            for bit in range(8):
+                damaged = bytearray(RTU_FRAME)
+                damaged[offset] ^= 1 << bit
+                with self.subTest(offset=offset, bit=bit), self.assertRaises(SensorCrcError):
+                    parse_rtu_reading(damaged)
+
+    def test_wrong_slave_function_and_byte_count_with_valid_crc_are_rejected(self):
+        for body in (bytes.fromhex('02040401310222'), bytes.fromhex('01030401310222'),
+                     bytes.fromhex('01040601310222'), bytes.fromhex('018302')):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                parse_rtu_reading(with_crc(body))
+
+    def test_modbus_exception_with_valid_crc_never_becomes_a_reading(self):
+        with self.assertRaises(SensorModbusException):
+            parse_rtu_reading(with_crc(bytes.fromhex('018402')))
+        damaged = bytearray(with_crc(bytes.fromhex('018402')))
+        damaged[-1] ^= 1
+        with self.assertRaises(SensorCrcError):
+            parse_rtu_reading(damaged)
+
+    def test_truncation_multiple_frames_and_ascii_never_fall_back(self):
+        for frame in (RTU_FRAME[:size] for size in range(len(RTU_FRAME))):
+            with self.subTest(length=len(frame)), self.assertRaises(ValueError):
+                parse_rtu_reading(frame)
+        for frame in (RTU_FRAME + RTU_FRAME, RTU_FRAME + b'\n', FRAME, b'', 'bad'):
+            with self.subTest(frame=frame), self.assertRaises(ValueError):
+                parse_rtu_reading(frame)
+
+    def test_crc_valid_out_of_range_values_are_not_measurements(self):
+        for temperature_raw, humidity_raw in ((1251, 500), (0xfe6f, 500), (200, 1001),
+                                                (0x8000, 500), (200, 0xffff)):
+            body = bytes((1, 4, 4, temperature_raw >> 8, temperature_raw & 255,
+                          humidity_raw >> 8, humidity_raw & 255))
+            with self.subTest(raw=(temperature_raw, humidity_raw)), self.assertRaises(ValueError):
+                parse_rtu_reading(with_crc(body))
+
+    def test_broadcast_and_invalid_slave_addresses_are_rejected(self):
+        for address in (0, 248, True, 1.0, '1'):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                build_rtu_request(address)
+
 class ReaderTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -151,6 +221,9 @@ class ReaderTests(unittest.TestCase):
         self.assertIsNone(state['relativeHumidityPercent'])
         self.assertIsNone(state['readAtMs'])
         self.assertIsNone(self.reader.reading())
+        self.assertEqual(state['protocol'], 'ascii_read')
+        self.assertEqual(state['integrity'], 'none')
+        self.assertEqual(state['crcFailures'], 0)
 
     def test_initializes_only_uart1_and_verified_pins(self):
         self.reader.tick()
@@ -206,6 +279,8 @@ class ReaderTests(unittest.TestCase):
                                   'sample': 1, 'readAtMs': 57})
         self.assertFalse(self.reader.busy)
         self.assertFalse(self.reader.status()['stale'])
+        self.assertEqual(self.reader.status()['integrity'], 'format_only')
+        self.assertEqual(self.reader.status()['lastFrameHex'], FRAME.hex())
         self.assertEqual(self.reader.status()['ageMs'], 0)
         result['temperatureC'] = 999
         self.assertEqual(self.reader.reading()['temperatureC'], 28.8)
@@ -380,6 +455,137 @@ class ReaderTests(unittest.TestCase):
     def test_tick_has_no_sleep_dependency(self):
         with patch('time.sleep', side_effect=AssertionError('must not block')):
             self.sample()
+
+
+class RtuReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.uart = UART()
+        self.uart.write_count = 8
+        self.direction = Pin(13, Pin.OUT, value=0)
+        self.pin_factory = Mock(return_value=self.direction)
+        self.pin_factory.OUT = Pin.OUT
+        self.uart_factory = Mock(return_value=self.uart)
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
+                                                self.pin_factory, protocol='sht20_rtu')
+
+    def start_rx(self):
+        self.reader.tick()
+        self.clock.value += QUIET_MS
+        self.reader.tick()
+        self.assertEqual(self.reader.phase, 'tx')
+        self.uart.done = True
+        self.clock.value += 10
+        self.reader.tick()
+        self.assertEqual(self.reader.phase, 'rx')
+
+    def deliver(self, frame=RTU_FRAME):
+        self.start_rx()
+        self.uart.incoming.extend(frame)
+        self.clock.value += 10
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += 4
+        return self.reader.tick()
+
+    def test_default_rtu_read_request_and_crc_verified_status_after_response(self):
+        self.uart_factory.assert_not_called()
+        result = self.deliver()
+        self.assertEqual(self.uart.writes, [bytes.fromhex('010400010002200b')])
+        self.assertEqual(result['temperatureC'], 30.5)
+        self.assertEqual(result['relativeHumidityPercent'], 54.6)
+        self.assertEqual(result['readAtMs'], 34)
+        state = self.reader.status()
+        self.assertEqual(state['integrity'], 'crc_verified')
+        self.assertEqual(state['lastFrameHex'], RTU_FRAME.hex())
+        self.assertEqual(state['crcFailures'], 0)
+        self.assertFalse(state['stale'])
+        self.assertEqual(self.direction.values[-1], 0)
+
+    def test_fragmented_response_waits_for_last_byte_and_rtu_silence(self):
+        self.start_rx()
+        for part in (RTU_FRAME[:3], RTU_FRAME[3:5], RTU_FRAME[5:]):
+            self.uart.incoming.extend(part)
+            self.clock.value += 2
+            self.assertIsNone(self.reader.tick())
+            self.assertIsNone(self.reader.reading())
+        self.clock.value += 3
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += 1
+        self.assertEqual(self.reader.tick()['relativeHumidityPercent'], 54.6)
+
+    def test_crc_corruption_is_counted_and_never_substitutes_or_falls_back(self):
+        damaged = bytearray(RTU_FRAME)
+        damaged[4] ^= 1
+        self.assertIsNone(self.deliver(damaged))
+        state = self.reader.status()
+        self.assertEqual(state['lastError'], 'crc_mismatch')
+        self.assertEqual(state['crcFailures'], 1)
+        self.assertEqual(state['integrity'], 'none')
+        self.assertEqual(state['samples'], 0)
+        self.assertIsNone(self.reader.reading())
+        self.assertEqual(state['lastFrameHex'], bytes(damaged).hex())
+        self.assertEqual(self.uart.writes, [build_rtu_request()])
+
+    def test_extra_frame_fragment_inside_silent_interval_is_rejected(self):
+        self.start_rx()
+        self.uart.incoming.extend(RTU_FRAME)
+        self.clock.value += 10
+        self.assertIsNone(self.reader.tick())
+        self.uart.incoming.extend(b'\x01')
+        self.clock.value += 1
+        self.assertIsNone(self.reader.tick())
+        self.assertEqual(self.reader.status()['lastError'], 'invalid_frame')
+        self.assertIsNone(self.reader.reading())
+
+    def test_exception_frame_has_safe_error_and_does_not_count_as_crc_failure(self):
+        self.assertIsNone(self.deliver(with_crc(bytes.fromhex('018402'))))
+        state = self.reader.status()
+        self.assertEqual(state['lastError'], 'modbus_exception')
+        self.assertEqual(state['crcFailures'], 0)
+        self.assertEqual(state['integrity'], 'none')
+        self.assertEqual(state['samples'], 0)
+
+    def test_timeout_is_configurable_and_preserves_partial_hex_without_fake_data(self):
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
+            self.pin_factory, protocol='sht20_rtu', slave_address=17, baudrate=19200,
+            timeout_ms=200)
+        self.start_rx()
+        self.uart_factory.assert_called_once_with(
+            1, baudrate=19200, bits=8, parity=None, stop=1, tx=15, rx=14,
+            timeout=0, timeout_char=2, flow=0, txbuf=256, rxbuf=256)
+        self.assertEqual(self.uart.writes, [build_rtu_request(17)])
+        self.uart.incoming.extend(b'\x11\x04\x04')
+        self.reader.tick()
+        self.clock.value += 200
+        self.reader.tick()
+        self.assertEqual(self.reader.status()['lastError'], 'rx_timeout')
+        self.assertEqual(self.reader.status()['lastFrameHex'], '110404')
+        self.assertIsNone(self.reader.reading())
+
+    def test_ascii_response_is_not_accepted_in_explicit_rtu_mode(self):
+        self.assertIsNone(self.deliver(FRAME))
+        self.assertEqual(self.reader.status()['lastError'], 'invalid_frame')
+        self.assertEqual(self.reader.status()['samples'], 0)
+
+    def test_constructor_bounds_protocol_address_baudrate_and_timeout(self):
+        for options in ({'protocol': 'auto'}, {'protocol': None}, {'slave_address': 0},
+                        {'slave_address': True}, {'baudrate': 115200}, {'baudrate': 9600.0},
+                        {'timeout_ms': 199}, {'timeout_ms': 5001}, {'timeout_ms': True}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                TemperatureHumidityReader(self.clock.now, **options)
+
+    def test_ascii_bad_frame_trace_is_bounded_and_never_claims_crc(self):
+        self.uart.write_count = 4
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory, self.pin_factory)
+        self.start_rx()
+        self.uart.incoming.extend(b'x' * MAX_FRAME_BYTES)
+        self.reader.tick()
+        self.reader.tick()
+        state = self.reader.status()
+        self.assertEqual(state['lastError'], 'buffer_overflow')
+        self.assertEqual(len(state['lastFrameHex']), 2 * MAX_FRAME_BYTES)
+        self.assertEqual(state['crcFailures'], 0)
+        self.assertEqual(state['integrity'], 'none')
 
 
 if __name__ == '__main__':

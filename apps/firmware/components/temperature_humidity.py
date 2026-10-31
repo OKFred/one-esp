@@ -1,13 +1,20 @@
-"""Polled READ-only sensor UART; construction never configures hardware.
+"""Polled read-only sensor UART; construction never configures hardware.
 
 The verified device replies with GB2312 ``<temperature>\xa1\xe6,<humidity>%\n``.
-Only that unit-marked format is accepted. No AUTO/STOP, sensor configuration,
-Modbus writes, UART0 access or clock setting is performed by this module.
+ASCII mode accepts only that unit-marked format, without claiming a checksum.
+SHT20 RTU mode reads input registers 1/2 with FC04 and mandatory Modbus CRC16.
+No AUTO/STOP, sensor configuration, Modbus writes, UART0 access or clock setting
+is performed by this module. Protocols are explicit; there is no fallback.
 
 ``now_ms`` must be a monotonic, non-wrapping millisecond callback. While phase
-is ``tx``, poll promptly: the four-byte request takes about 4.2 ms at 9600 baud,
-and DE must return low before a fast sensor starts its reply.
+is ``tx``, poll promptly: at 9600 baud requests take about 4.2 ms for ASCII or
+8.3 ms for RTU, and DE must return low before a fast sensor starts its reply.
 """
+
+try:
+    import ubinascii as binascii
+except ImportError:
+    import binascii
 
 
 DEFAULT_INTERVAL_MS = 60000
@@ -19,6 +26,56 @@ QUIET_MS = 10
 MAX_FRAME_BYTES = 128
 READ_CHUNK_BYTES = 64
 REQUEST = b'READ'
+
+
+class SensorCrcError(ValueError):
+    pass
+
+
+class SensorModbusException(ValueError):
+    pass
+
+
+def crc16_modbus(raw):
+    """Return the Modbus CRC16 integer; its low byte goes first on the wire."""
+    crc = 0xffff
+    for value in raw:
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xa001 if crc & 1 else crc >> 1
+    return crc
+
+
+def build_rtu_request(slave_address=1):
+    if type(slave_address) is not int or not 1 <= slave_address <= 247:
+        raise ValueError('Invalid sensor slave address')
+    body = bytes((slave_address, 4, 0, 1, 0, 2))
+    crc = crc16_modbus(body)
+    return body + bytes((crc & 255, crc >> 8))
+
+
+def parse_rtu_reading(raw, slave_address=1):
+    """Decode exactly one CRC-verified SHT20 FC04 response, never an exception."""
+    if (type(slave_address) is not int or not 1 <= slave_address <= 247 or
+            not isinstance(raw, (bytes, bytearray)) or len(raw) not in (5, 9)):
+        raise ValueError('Invalid sensor RTU frame')
+    raw = bytes(raw)
+    if crc16_modbus(raw[:-2]) != (raw[-2] | (raw[-1] << 8)):
+        raise SensorCrcError('Sensor CRC mismatch')
+    if raw[0] != slave_address:
+        raise ValueError('Unexpected sensor slave address')
+    if raw[1] == 0x84 and len(raw) == 5:
+        raise SensorModbusException('Sensor Modbus exception')
+    if len(raw) != 9 or raw[1] != 4 or raw[2] != 4:
+        raise ValueError('Unexpected sensor response')
+    temperature_raw = (raw[3] << 8) | raw[4]
+    if temperature_raw & 0x8000:
+        temperature_raw -= 0x10000
+    temperature = temperature_raw / 10
+    humidity = ((raw[5] << 8) | raw[6]) / 10
+    if not -40 <= temperature <= 125 or not 0 <= humidity <= 100:
+        raise ValueError('Sensor reading outside range')
+    return {'temperatureC': temperature, 'relativeHumidityPercent': humidity}
 
 
 def _decimal(raw, signed):
@@ -70,11 +127,21 @@ def parse_reading(raw):
 
 class TemperatureHumidityReader:
     def __init__(self, now_ms, uart_factory=None, pin_factory=None,
-                 interval_ms=DEFAULT_INTERVAL_MS, stale_after_ms=None):
+                 interval_ms=DEFAULT_INTERVAL_MS, stale_after_ms=None,
+                 protocol='ascii_read', slave_address=1, baudrate=9600,
+                 timeout_ms=RX_TIMEOUT_MS):
         if type(interval_ms) is not int or interval_ms < MIN_INTERVAL_MS:
             raise ValueError('Sensor interval must be at least 5000 ms')
+        if type(protocol) is not str or protocol not in ('ascii_read', 'sht20_rtu'):
+            raise ValueError('Invalid sensor protocol')
+        if type(slave_address) is not int or not 1 <= slave_address <= 247:
+            raise ValueError('Invalid sensor slave address')
+        if type(baudrate) is not int or baudrate not in (9600, 14400, 19200):
+            raise ValueError('Invalid sensor baud rate')
+        if type(timeout_ms) is not int or not 200 <= timeout_ms <= 5000:
+            raise ValueError('Invalid sensor receive timeout')
         if stale_after_ms is None:
-            stale_after_ms = interval_ms + RX_TIMEOUT_MS + TX_TIMEOUT_MS + DRAIN_TIMEOUT_MS
+            stale_after_ms = interval_ms + timeout_ms + TX_TIMEOUT_MS + DRAIN_TIMEOUT_MS
         if type(stale_after_ms) is not int or stale_after_ms < interval_ms:
             raise ValueError('Invalid sensor staleness interval')
         self._now = now_ms
@@ -85,6 +152,16 @@ class TemperatureHumidityReader:
         self.enabled = True
         self.phase = 'idle'
         self.interval_ms = interval_ms
+        self.protocol = protocol
+        self.slave_address = slave_address
+        self.baudrate = baudrate
+        self.timeout_ms = timeout_ms
+        self._request = REQUEST if protocol == 'ascii_read' else build_rtu_request(slave_address)
+        self._rtu_quiet_ms = (35000 + baudrate - 1) // baudrate
+        self._rx_last_data_at = None
+        self._integrity = 'none'
+        self._crc_failures = 0
+        self._last_frame_hex = ''
         self._stale_after_ms = stale_after_ms
         self._next_due = self._now()
         self._deadline = 0
@@ -109,7 +186,7 @@ class TemperatureHumidityReader:
             if self._pin_factory is None:
                 self._pin_factory = Pin
         self._direction = self._pin_factory(13, getattr(self._pin_factory, 'OUT', 1), value=0)
-        self._uart = self._uart_factory(1, baudrate=9600, bits=8, parity=None,
+        self._uart = self._uart_factory(1, baudrate=self.baudrate, bits=8, parity=None,
                                        stop=1, tx=15, rx=14, timeout=0,
                                        timeout_char=2, flow=0, txbuf=256, rxbuf=256)
         if not callable(getattr(self._uart, 'txdone', None)):
@@ -132,6 +209,11 @@ class TemperatureHumidityReader:
                     pass
 
     def _fail(self, category, release=False):
+        self._remember_frame(self._buffer or b'')
+        self._integrity = 'none'
+        self._rx_last_data_at = None
+        if category == 'crc_mismatch':
+            self._crc_failures += 1
         self._failures += 1
         self._last_error = category
         self.phase = 'idle'
@@ -147,21 +229,28 @@ class TemperatureHumidityReader:
         # A late or failed attempt never triggers a catch-up burst.
         self._next_due = max(self._next_due, self._now() + self.interval_ms)
 
+    def _remember_frame(self, frame):
+        try:
+            self._last_frame_hex = binascii.hexlify(frame[:MAX_FRAME_BYTES]).decode()
+        except Exception:
+            self._last_frame_hex = ''
+
     def _receive(self, now):
         if now >= self._deadline:
             self._fail('rx_timeout')
             return None
         available = self._uart.any()
-        if not available:
-            return None
-        remaining = MAX_FRAME_BYTES - len(self._buffer)
-        chunk = self._uart.read(min(available, remaining, READ_CHUNK_BYTES))
-        if not chunk:
-            return None
-        if len(chunk) > remaining:
-            self._fail('buffer_overflow')
-            return None
-        self._buffer.extend(chunk)
+        if available:
+            remaining = MAX_FRAME_BYTES - len(self._buffer)
+            chunk = self._uart.read(min(available, remaining, READ_CHUNK_BYTES))
+            if chunk:
+                if len(chunk) > remaining:
+                    self._fail('buffer_overflow')
+                    return None
+                self._buffer.extend(chunk)
+                self._rx_last_data_at = now
+        if self.protocol == 'sht20_rtu':
+            return self._receive_rtu(now)
         # ESP32 MicroPython 1.22.2 lacks bytearray membership operations.
         # find checks the bounded buffer in place, including fragmented input.
         if self._buffer.find(b'\n') < 0:
@@ -179,12 +268,46 @@ class TemperatureHumidityReader:
         except ValueError:
             self._fail('invalid_frame')
             return None
+        self._integrity = 'format_only'
+        return self._complete(values, frame, now)
+
+    def _receive_rtu(self, now):
+        if len(self._buffer) < 2:
+            return None
+        expected = 5 if self._buffer[1] & 0x80 else 9
+        if len(self._buffer) > expected:
+            self._fail('invalid_frame')
+            return None
+        if len(self._buffer) < expected:
+            return None
+        # RTU has no newline: require a full inter-frame silent interval before
+        # accepting, so a following fragment cannot become a second response.
+        if self._rx_last_data_at is None or now - self._rx_last_data_at < self._rtu_quiet_ms:
+            return None
+        frame = bytes(self._buffer)
+        try:
+            values = parse_rtu_reading(frame, self.slave_address)
+        except SensorCrcError:
+            self._fail('crc_mismatch')
+            return None
+        except SensorModbusException:
+            self._fail('modbus_exception')
+            return None
+        except ValueError:
+            self._fail('invalid_frame')
+            return None
+        self._integrity = 'crc_verified'
+        return self._complete(values, frame, now)
+
+    def _complete(self, values, frame, now):
+        self._remember_frame(frame)
         self._samples += 1
         values['sample'] = self._samples
         values['readAtMs'] = now
         self._latest = values
         self._last_error = None
         self._buffer = None
+        self._rx_last_data_at = None
         self.phase = 'idle'
         return dict(values)
 
@@ -192,7 +315,7 @@ class TemperatureHumidityReader:
         if self._uart.txdone():
             self._direction.value(0)
             self.phase = 'rx'
-            self._deadline = now + RX_TIMEOUT_MS
+            self._deadline = now + self.timeout_ms
             return self._receive(now)
         if now >= self._deadline:
             self._fail('tx_timeout')
@@ -211,6 +334,9 @@ class TemperatureHumidityReader:
                 self._next_due = now + self.interval_ms
                 self._direction.value(0)
                 self._buffer = bytearray()
+                self._rx_last_data_at = None
+                self._integrity = 'none'
+                self._last_frame_hex = ''
                 self._quiet_since = None
                 self._deadline = now + DRAIN_TIMEOUT_MS
                 self.phase = 'draining'
@@ -230,7 +356,7 @@ class TemperatureHumidityReader:
                 self._direction.value(1)
                 self.phase = 'tx'
                 self._deadline = now + TX_TIMEOUT_MS
-                if self._uart.write(REQUEST) != len(REQUEST):
+                if self._uart.write(self._request) != len(self._request):
                     self._fail('tx_short_write')
                     return None
                 return self._transmit_tick(now)
@@ -260,6 +386,8 @@ class TemperatureHumidityReader:
         now = self._now()
         latest = self._latest
         return {'enabled': self.enabled, 'phase': self.phase,
+                'protocol': self.protocol, 'integrity': self._integrity,
+                'crcFailures': self._crc_failures, 'lastFrameHex': self._last_frame_hex,
                 'samples': self._samples, 'failures': self._failures,
                 'lastError': self._last_error,
                 'readAtMs': latest['readAtMs'] if latest is not None else None,
@@ -275,4 +403,6 @@ class TemperatureHumidityReader:
         self.enabled = False
         self.phase = 'closed'
         self._buffer = None
+        self._integrity = 'none'
+        self._rx_last_data_at = None
         self._release_hardware()

@@ -129,10 +129,38 @@ function value(number: number | null | undefined) {
       <template v-else>设备尚未启用环境传感器。</template>
       环境温度与下方芯片内部温度分别显示；设备采样和 MQTT 上报独立于网页调试开关。
     </p>
+    <p class="ambient-note" aria-label="采集协议与校验">
+      {{
+        environment?.protocol === 'sht20_rtu'
+          ? 'SHT20 Modbus RTU'
+          : environment?.protocol === 'ascii_read'
+            ? 'ASCII READ'
+            : '协议待设备报告'
+      }}
+      ·
+      {{
+        environment?.protocol === 'sht20_rtu' && environment?.integrity === 'crc_verified'
+          ? '最近报文 CRC16 校验通过'
+          : environment?.protocol === 'ascii_read'
+            ? '协议未提供 CRC · 仅格式/范围校验'
+            : '校验结果待确认'
+      }}
+      <template v-if="environment?.crcFailures !== undefined">
+        · CRC 错误 {{ environment.crcFailures }}</template
+      >
+    </p>
+    <details v-if="environment?.lastFrameHex" class="ambient-note">
+      <summary>最近原始报文（十六进制）</summary>
+      <code class="raw-frame">{{ environment.lastFrameHex }}</code>
+    </details>
   </section>
 </template>
 
 <style scoped>
+.raw-frame {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
 .ambient-panel {
   margin-bottom: 20px;
 }

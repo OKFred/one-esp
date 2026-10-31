@@ -185,3 +185,87 @@ it('distinguishes disabled MQTT, waiting on prerequisites and invalid configurat
   await wrapper.setProps({ mqtt: { state: 'configuration_error' } });
   expect(wrapper.find('.ambient-delivery').text()).toBe('MQTT 配置异常');
 });
+
+it('labels a CRC-verified RTU reading and exposes its bounded raw frame separately', () => {
+  const raw = '010404013102222ace';
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      environment: {
+        ...environment,
+        protocol: 'sht20_rtu',
+        integrity: 'crc_verified',
+        crcFailures: 2,
+        lastFrameHex: raw,
+      },
+    },
+  });
+  const integrity = wrapper.find('[aria-label="采集协议与校验"]');
+  expect(integrity.text()).toContain('SHT20 Modbus RTU');
+  expect(integrity.text()).toContain('CRC16 校验通过');
+  expect(integrity.text()).toContain('CRC 错误 2');
+  expect(wrapper.find('details summary').text()).toContain('最近原始报文');
+  expect(wrapper.find('code.raw-frame').text()).toBe(raw);
+  expect(wrapper.text()).toContain('48.4 %RH');
+});
+
+it('never presents ASCII format checks or missing integrity as successful CRC', async () => {
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      environment: {
+        ...environment,
+        protocol: 'ascii_read',
+        integrity: 'format_only',
+        crcFailures: 0,
+      },
+    },
+  });
+  expect(wrapper.find('[aria-label="采集协议与校验"]').text()).toContain('协议未提供 CRC');
+  expect(wrapper.text()).not.toContain('CRC16 校验通过');
+  expect(wrapper.find('details').exists()).toBe(false);
+  await wrapper.setProps({
+    environment: { ...environment, protocol: 'sht20_rtu', integrity: 'none' },
+  });
+  expect(wrapper.find('[aria-label="采集协议与校验"]').text()).toContain('校验结果待确认');
+  expect(wrapper.text()).not.toContain('CRC16 校验通过');
+  await wrapper.setProps({ environment });
+  expect(wrapper.find('[aria-label="采集协议与校验"]').text()).toContain('协议待设备报告');
+  expect(wrapper.text()).not.toContain('CRC16 校验通过');
+});
+
+it('keeps a CRC failure distinct from link freshness and does not invent a usable value', () => {
+  const wrapper = mount(AmbientReadings, {
+    props: {
+      ...props,
+      environment: {
+        ...environment,
+        protocol: 'sht20_rtu',
+        integrity: 'none',
+        crcFailures: 1,
+        lastError: 'crc_mismatch',
+        stale: true,
+        temperatureC: null,
+        relativeHumidityPercent: null,
+        lastFrameHex: '010404013002222ace',
+      },
+    },
+  });
+  expect(wrapper.find('.ambient-freshness').text()).toBe('最近读取失败 · 等待重试');
+  expect(wrapper.find('[aria-label="采集协议与校验"]').text()).toContain('CRC 错误 1');
+  expect(wrapper.text()).not.toContain('CRC16 校验通过');
+  expect(wrapper.findAll('strong').every((item) => item.text().startsWith('—'))).toBe(true);
+  expect(wrapper.find('code').text()).toBe('010404013002222ace');
+});
+
+it('does not claim verified CRC for an ASCII or unidentified protocol with inconsistent fields', () => {
+  for (const protocol of ['ascii_read', undefined] as const) {
+    const wrapper = mount(AmbientReadings, {
+      props: {
+        ...props,
+        environment: { ...environment, protocol, integrity: 'crc_verified' },
+      },
+    });
+    expect(wrapper.find('[aria-label="采集协议与校验"]').text()).not.toContain('CRC16 校验通过');
+  }
+});

@@ -70,6 +70,10 @@ export const EnvironmentSchema = z
     nextReadInMs: bytes,
     temperatureC: z.number().min(-40).max(125).nullable(),
     relativeHumidityPercent: z.number().min(0).max(100).nullable(),
+    protocol: z.enum(['ascii_read', 'sht20_rtu']).optional(),
+    integrity: z.enum(['none', 'format_only', 'crc_verified']).optional(),
+    crcFailures: bytes.optional(),
+    lastFrameHex: z.string().max(256).regex(/^[0-9a-f]*$/i).nullable().optional(),
   })
   .strict();
 export type EnvironmentData = z.infer<typeof EnvironmentSchema>;
