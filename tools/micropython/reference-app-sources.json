@@ -6,8 +6,8 @@
   },
   {
     "path": "application/runtime.py",
-    "bytes": 55636,
-    "sha256": "174a1622b74d7b491835841c9663aca490ee0dc2faf07b0ae04b07cea19d3bbf"
+    "bytes": 56578,
+    "sha256": "a574100c8c84778fb35a19cf130b069d22dfadae414a33bcecdd3f2d1d255d38"
   },
   {
     "path": "components/board_profile.py",
@@ -56,8 +56,8 @@
   },
   {
     "path": "components/mqtt_telemetry.py",
-    "bytes": 19711,
-    "sha256": "78b4599939e46ff5f145c059328cbd8fec93ac414841fc9692448716476de162"
+    "bytes": 21066,
+    "sha256": "7d0cfb7012ccb5fe897afdc2bd41ba8c0ca5f017e871a1d76727edf6b6752c7b"
   },
   {
     "path": "components/mqtt_transport.py",
