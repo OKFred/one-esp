@@ -6,8 +6,8 @@
   },
   {
     "path": "application/runtime.py",
-    "bytes": 40576,
-    "sha256": "3b7af6cc73345f0dae3717cb8da01fdc8af5d6feaa8f75587dc1e522e71b9596"
+    "bytes": 55636,
+    "sha256": "174a1622b74d7b491835841c9663aca490ee0dc2faf07b0ae04b07cea19d3bbf"
   },
   {
     "path": "components/board_profile.py",
@@ -21,8 +21,8 @@
   },
   {
     "path": "components/debug_service.py",
-    "bytes": 23077,
-    "sha256": "ab8b2b0b62d3e7e6a4e864f95d60daf87cdbe322cc86dc3c384df010c6d6e788"
+    "bytes": 25062,
+    "sha256": "571a91481ce826c8b92292c85d547e4560e3b9db3a541aa603a1ef5244428f2c"
   },
   {
     "path": "components/device_addr_scanner.py",
@@ -31,8 +31,13 @@
   },
   {
     "path": "components/device_config.py",
-    "bytes": 7556,
-    "sha256": "5d52a7e35df8d9fc7e5f44134f192118b44cc0fdcd88b29ed598c0b14ae3a74d"
+    "bytes": 7664,
+    "sha256": "a53df06304cb36dbbccef7837c1994a34acdd1e75a19fde2dd746d4f33bc25e4"
+  },
+  {
+    "path": "components/device_settings.py",
+    "bytes": 10795,
+    "sha256": "fc6c35bfeeb94420f657f439367bfb44be48f75ca205642dd43f3459d5d854dd"
   },
   {
     "path": "components/env_reader.py",
@@ -45,19 +50,24 @@
     "sha256": "5d2f3a024068ac2c34bf473f02631892b2515e753cff6fb81cd330ac0590eb74"
   },
   {
+    "path": "components/mqtt_commands.py",
+    "bytes": 9072,
+    "sha256": "32dbcc5fc098fd35d98f4171e09d36fd96064d844b95a57694d1cd84b69a9c2f"
+  },
+  {
     "path": "components/mqtt_telemetry.py",
-    "bytes": 17934,
-    "sha256": "6c9020a6c1a1e5eb497af8aed924fb36adf1dd06ffd0e2a7fcc181129e4abe3d"
+    "bytes": 19711,
+    "sha256": "78b4599939e46ff5f145c059328cbd8fec93ac414841fc9692448716476de162"
   },
   {
     "path": "components/mqtt_transport.py",
-    "bytes": 22668,
-    "sha256": "1c9ab5b9b5628648c33fe388dcfefe8a815e49fbce92b02a1a5da9dd6d650486"
+    "bytes": 34172,
+    "sha256": "1b83e20965529b0b65646221a631328dc1b5be38ff277e12f9b4f1602b0a11c8"
   },
   {
     "path": "components/mqtt_wire.py",
-    "bytes": 7245,
-    "sha256": "9c2f65a05d69b85a6bbd1baf5858b5100f4aa33c80a5276ca15d1ba7c7ce6067"
+    "bytes": 9426,
+    "sha256": "92f348bb371894970b2dc5e4c50d8704963885aa41ec18034b0346aed192a72b"
   },
   {
     "path": "components/network_probe.py",
@@ -81,8 +91,8 @@
   },
   {
     "path": "components/temperature_humidity.py",
-    "bytes": 10777,
-    "sha256": "4fca1fcd0e47ace32e00a4dbb456616e12fb33fefee920ae8efa172482f2a1ee"
+    "bytes": 16163,
+    "sha256": "b1ed603acc8ae92a9e0bedfa115c921ee94889caa64e31145473537992e3379a"
   },
   {
     "path": "components/time_sync.py",

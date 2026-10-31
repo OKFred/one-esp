@@ -23,21 +23,21 @@
       "cmake": "3.30.2",
       "ninja": "1.12.1"
     },
-    "applicationBytes": 1796096,
-    "applicationSha256": "6661e86c92baa695317ffb6f366f95c12ca02cd3a866eaadd4cd5eaad6c5d5ff",
-    "mergedImageBytes": 1857536,
-    "mergedImageSha256": "3a0226134b83d4be71e54318c804979d427c7057de187544c66f47245aaaf092",
-    "exactPrivateManifestSha256": "5c9d942a9cd2fddc5081f92ef31d3f7f354684d01d48d9ffe89124a58b6fd756",
+    "applicationBytes": 1819296,
+    "applicationSha256": "865e05f27d73210306de5eaef4f9569dfb3ddb53b1252097c7b872c5e65ff739",
+    "mergedImageBytes": 1880736,
+    "mergedImageSha256": "6dc13597e05d80d8f63fa27712dff608d793fae85dc02f1ba785a68b1245241e",
+    "exactPrivateManifestSha256": "42f8ac9464d2f6fdc1ae35897640dd074cf8e781d5091a99a355050179e69a12",
     "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
     "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
-    "evidenceSha256": "69036997537031bbd1f25b8996f4fcf4d581806467cd25e70e7bdcc3b975eb44",
-    "elfSha256": "c73c10ab50f8faf5a1af3be82f27bfe989eab9878e10e87991b18fc0c4b8b6e1",
+    "evidenceSha256": "e032edfe542485aa40ffce4d47d214316dd32da514a5838837828982e90ad893",
+    "elfSha256": "9cc3a3c8a5beabde0fa4dff69c2c31f2ad64044431239d95d5ff965ad42c94bb",
     "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
     "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
-    "buildMethod": "incremental final application rebuild after a separately archived full parameterized Windows build"
+    "buildMethod": "incremental 22-module feature build after canonical preservation of the accepted OLED build and earlier full parameterized Windows build"
   },
   "moduleCounts": {
-    "application": 20,
+    "application": 22,
     "buildMetadata": 1
   },
   "factoryPartition": {
@@ -48,15 +48,16 @@
     "fullBuildExecuted": true,
     "linuxExecuted": false,
     "upstreamPatchApplyCheck": true,
-    "manifestApplicationModules": 20,
+    "manifestApplicationModules": 22,
     "manifestBuildMetadataModules": 1,
     "manifestDefaultStdlibModules": 28,
+    "manifestTotalModules": 51,
     "sourceHashesMatchReference": true,
     "staticProfileSemanticManifestCheck": true,
-    "staticSdkconfigMatchesInitialControl": true,
+    "staticSdkconfigMatchesAcceptedOled": true,
     "nativeWindowsArgumentFilesUsed": true,
     "finalSourceRebuiltIncrementally": true,
-    "qstrHeaderByteComparison": "not repeated for this source revision; historical dynamic comparison retained in referenceHistory",
+    "qstrHeaderByteComparison": "not repeated for this feature revision; historical dynamic comparison retained in referenceHistory",
     "relocatedByteIdenticalBuildClaimed": false
   },
   "referenceHistory": [
@@ -132,6 +133,51 @@
         "qstrHeaderByteComparison": "not repeated for static profile; historical dynamic comparison retained in referenceHistory",
         "staticProfileSemanticManifestCheck": true
       }
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "accepted task-oriented OLED before MQTT settings, RS485 RTU and remote configuration",
+      "referenceAppSourcesSha256": "37acc8856f8085f2b06cb91149b611f3cab6d0e9daf6073c37b7cee322aecb04",
+      "moduleCounts": {
+        "application": 20,
+        "buildMetadata": 1
+      },
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1796096,
+        "applicationSha256": "6661e86c92baa695317ffb6f366f95c12ca02cd3a866eaadd4cd5eaad6c5d5ff",
+        "mergedImageBytes": 1857536,
+        "mergedImageSha256": "3a0226134b83d4be71e54318c804979d427c7057de187544c66f47245aaaf092",
+        "exactPrivateManifestSha256": "5c9d942a9cd2fddc5081f92ef31d3f7f354684d01d48d9ffe89124a58b6fd756",
+        "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "69036997537031bbd1f25b8996f4fcf4d581806467cd25e70e7bdcc3b975eb44",
+        "elfSha256": "c73c10ab50f8faf5a1af3be82f27bfe989eab9878e10e87991b18fc0c4b8b6e1",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+        "buildMethod": "incremental final application rebuild after a separately archived full parameterized Windows build"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": true,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 20,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "sourceHashesMatchReference": true,
+        "staticProfileSemanticManifestCheck": true,
+        "staticSdkconfigMatchesInitialControl": true,
+        "nativeWindowsArgumentFilesUsed": true,
+        "finalSourceRebuiltIncrementally": true,
+        "qstrHeaderByteComparison": "not repeated for this source revision; historical dynamic comparison retained in referenceHistory",
+        "relocatedByteIdenticalBuildClaimed": false
+      }
     }
   ],
   "tlsConfiguration": {
@@ -142,5 +188,5 @@
     "certificateVerificationRequired": true,
     "certificateTimeChecks": true
   },
-  "referenceAppSourcesSha256": "37acc8856f8085f2b06cb91149b611f3cab6d0e9daf6073c37b7cee322aecb04"
+  "referenceAppSourcesSha256": "b792cd3ef3d590b306f52a778640b8748c4c9652d23ed9449a538ec1dfc08132"
 }
