@@ -111,6 +111,101 @@ describe('portable device protocol', () => {
             .success,
         ).toBe(true);
   });
+  it.each([
+    [30.5, 54.6, '010404013102222ace'],
+    [31.5, 50, '010404013b01f48ba2'],
+    [1.5, 50, '010404000f01f4cb90'],
+    [-40, 0, '010404fe700000cbb7'],
+    [125, 100, '01040404e203e85a3c'],
+    [0, 0, '01040400000000fb84'],
+    [-20.5, 54.6, '010404ff330222bae6'],
+  ] as const)(
+    'independently verifies RTU reading %s C / %s RH against its CRC-valid frame',
+    (temperatureC, relativeHumidityPercent, lastFrameHex) => {
+      expect(
+        EnvironmentSchema.safeParse({
+          ...environment,
+          protocol: 'sht20_rtu',
+          integrity: 'crc_verified',
+          temperatureC,
+          relativeHumidityPercent,
+          lastFrameHex,
+        }).success,
+      ).toBe(true);
+    },
+  );
+  it('rejects a valid-looking USB temperature digit loss while the verified RTU frame still says 31.5 C', () => {
+    const verified = {
+      ...environment,
+      protocol: 'sht20_rtu',
+      integrity: 'crc_verified',
+      temperatureC: 31.5,
+      relativeHumidityPercent: 50,
+      lastFrameHex: '010404013b01f48ba2',
+    };
+    expect(EnvironmentSchema.safeParse(verified).success).toBe(true);
+    for (const changed of [
+      { temperatureC: 1.5 },
+      { relativeHumidityPercent: 5 },
+      { temperatureC: null },
+      { relativeHumidityPercent: null },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...verified, ...changed }).success).toBe(false);
+    expect(
+      EnvironmentSchema.safeParse({
+        ...verified,
+        temperatureC: 31.500003,
+        relativeHumidityPercent: 49.999999,
+      }).success,
+    ).toBe(true);
+    expect(EnvironmentSchema.safeParse({ ...verified, temperatureC: 31.5002 }).success).toBe(false);
+  });
+  it('requires the exact successful FC04 frame and rejects every single-bit corruption', () => {
+    const verified = {
+      ...environment,
+      protocol: 'sht20_rtu',
+      integrity: 'crc_verified',
+      temperatureC: 30.5,
+      relativeHumidityPercent: 54.6,
+      lastFrameHex: '010404013102222ace',
+    };
+    const frame = Uint8Array.from(verified.lastFrameHex.match(/../g)!, (byte) =>
+      Number.parseInt(byte, 16),
+    );
+    for (let bit = 0; bit < frame.length * 8; bit += 1) {
+      const corrupt = frame.slice();
+      corrupt[bit >> 3]! ^= 1 << (bit & 7);
+      const lastFrameHex = Array.from(corrupt, (byte) => byte.toString(16).padStart(2, '0')).join(
+        '',
+      );
+      expect(EnvironmentSchema.safeParse({ ...verified, lastFrameHex }).success, 'bit ' + bit).toBe(
+        false,
+      );
+    }
+    for (const lastFrameHex of [
+      undefined,
+      null,
+      '',
+      verified.lastFrameHex.slice(2),
+      verified.lastFrameHex + '00',
+      '01040401310222ce2a',
+    ])
+      expect(EnvironmentSchema.safeParse({ ...verified, lastFrameHex }).success).toBe(false);
+  });
+  it('preserves legacy, ASCII and failed RTU states with old values instead of checking a failed raw frame as successful', () => {
+    for (const changed of [
+      {},
+      { protocol: 'ascii_read', integrity: 'format_only', lastFrameHex: '312e35' },
+      {
+        protocol: 'sht20_rtu',
+        integrity: 'none',
+        lastError: 'crc_error',
+        lastFrameHex: '010404013102222acf',
+      },
+      { protocol: 'sht20_rtu', integrity: 'none', lastError: 'timeout', lastFrameHex: null },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...environment, ...changed }).success).toBe(true);
+  });
   it('does not interpret ordinary boot logs as protocol', () => {
     expect(parseDeviceLine('ets Jul 29 2019')).toBeNull();
     expect(parseDeviceLine(WIRE_PREFIX + JSON.stringify(event))).toEqual(event);

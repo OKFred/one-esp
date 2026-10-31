@@ -56,6 +56,15 @@ export const MetricsSchema = z.object({
 });
 export type MetricsData = z.infer<typeof MetricsSchema>;
 
+function modbusCrc16(frame: number[]): number {
+  let crc = 0xffff;
+  for (const byte of frame) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) === 1 ? (crc >>> 1) ^ 0xa001 : crc >>> 1;
+  }
+  return crc;
+}
+
 export const EnvironmentSchema = z
   .object({
     enabled: z.boolean(),
@@ -80,7 +89,53 @@ export const EnvironmentSchema = z
       .nullable()
       .optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((environment, ctx) => {
+    if (environment.protocol !== 'sht20_rtu' || environment.integrity !== 'crc_verified') return;
+    const hex = environment.lastFrameHex;
+    if (typeof hex !== 'string' || hex.length !== 18) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['lastFrameHex'],
+        message: 'Verified RTU frame is required',
+      });
+      return;
+    }
+    const frame = Array.from({ length: 9 }, (_, index) =>
+      Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+    );
+    if (
+      frame[0]! < 1 ||
+      frame[0]! > 247 ||
+      frame[1] !== 4 ||
+      frame[2] !== 4 ||
+      modbusCrc16(frame.slice(0, 7)) !== (frame[7]! | (frame[8]! << 8))
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['lastFrameHex'],
+        message: 'Invalid verified RTU frame',
+      });
+      return;
+    }
+    const rawTemperature = (frame[3]! << 8) | frame[4]!;
+    const temperature = (rawTemperature >= 0x8000 ? rawTemperature - 0x10000 : rawTemperature) / 10;
+    const humidity = ((frame[5]! << 8) | frame[6]!) / 10;
+    // ESP32 float32 JSON can differ by a few microdegrees. This is only a
+    // serialization tolerance, not the sensor's accuracy specification.
+    for (const [key, expected] of [
+      ['temperatureC', temperature],
+      ['relativeHumidityPercent', humidity],
+    ] as const) {
+      const value = environment[key];
+      if (value === null || Math.abs(value - expected) > 0.0001)
+        ctx.addIssue({
+          code: 'custom',
+          path: [key],
+          message: 'Reading disagrees with verified RTU frame',
+        });
+    }
+  });
 export type EnvironmentData = z.infer<typeof EnvironmentSchema>;
 
 const eventDataSchemas = {
@@ -276,6 +331,11 @@ export interface BridgeState {
   metrics: DeviceEvent | null;
   logs: DeviceEvent[];
   lastSeen: number | null;
+  serialDiagnostics?: {
+    invalidUtf8Lines: number;
+    invalidProtocolLines: number;
+    oversizedLines: number;
+  };
 }
 export type BridgeMessage =
   | { type: 'snapshot'; data: BridgeState }
