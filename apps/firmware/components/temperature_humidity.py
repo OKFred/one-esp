@@ -6,9 +6,10 @@ SHT20 RTU mode reads input registers 1/2 with FC04 and mandatory Modbus CRC16.
 No AUTO/STOP, sensor configuration, Modbus writes, UART0 access or clock setting
 is performed by this module. Protocols are explicit; there is no fallback.
 
-``now_ms`` must be a monotonic, non-wrapping millisecond callback. While phase
-is ``tx``, poll promptly: at 9600 baud requests take about 4.2 ms for ASCII or
-8.3 ms for RTU, and DE must return low before a fast sensor starts its reply.
+``now_ms`` must be a monotonic, non-wrapping millisecond callback. Reception is
+polled without waiting. TX deliberately waits in the same call (usually about
+4.2 ms for ASCII or 8.3 ms for RTU at 9600 baud, at most 100 ms), so a scheduler
+delay cannot leave DE high and lose the beginning of a fast sensor's reply.
 """
 
 try:
@@ -20,6 +21,7 @@ except ImportError:
 DEFAULT_INTERVAL_MS = 60000
 MIN_INTERVAL_MS = 5000
 TX_TIMEOUT_MS = 100
+TX_POLL_US = 50
 RX_TIMEOUT_MS = 2000
 DRAIN_TIMEOUT_MS = 100
 QUIET_MS = 10
@@ -129,7 +131,7 @@ class TemperatureHumidityReader:
     def __init__(self, now_ms, uart_factory=None, pin_factory=None,
                  interval_ms=DEFAULT_INTERVAL_MS, stale_after_ms=None,
                  protocol='ascii_read', slave_address=1, baudrate=9600,
-                 timeout_ms=RX_TIMEOUT_MS):
+                 timeout_ms=RX_TIMEOUT_MS, time_module=None):
         if type(interval_ms) is not int or interval_ms < MIN_INTERVAL_MS:
             raise ValueError('Sensor interval must be at least 5000 ms')
         if type(protocol) is not str or protocol not in ('ascii_read', 'sht20_rtu'):
@@ -147,8 +149,15 @@ class TemperatureHumidityReader:
         self._now = now_ms
         self._uart_factory = uart_factory
         self._pin_factory = pin_factory
+        self._time_module = time_module
         self._uart = None
         self._direction = None
+        self._tx_write = None
+        self._tx_done = None
+        self._set_direction = None
+        self._ticks_us = None
+        self._ticks_diff = None
+        self._sleep_us = None
         self.enabled = True
         self.phase = 'idle'
         self.interval_ms = interval_ms
@@ -157,6 +166,7 @@ class TemperatureHumidityReader:
         self.baudrate = baudrate
         self.timeout_ms = timeout_ms
         self._request = REQUEST if protocol == 'ascii_read' else build_rtu_request(slave_address)
+        self._request_len = len(self._request)
         self._rtu_quiet_ms = (35000 + baudrate - 1) // baudrate
         self._rx_last_data_at = None
         self._integrity = 'none'
@@ -179,6 +189,16 @@ class TemperatureHumidityReader:
     def _initialize(self):
         if self._uart is not None:
             return
+        clock = self._time_module
+        if clock is None:
+            import time
+            clock = time
+        self._ticks_us = clock.ticks_us
+        self._ticks_diff = clock.ticks_diff
+        self._sleep_us = clock.sleep_us
+        if not all(callable(method) for method in
+                   (self._ticks_us, self._ticks_diff, self._sleep_us)):
+            raise ValueError('Microsecond clock unavailable')
         if self._uart_factory is None or self._pin_factory is None:
             from machine import Pin, UART
             if self._uart_factory is None:
@@ -191,10 +211,16 @@ class TemperatureHumidityReader:
                                        timeout_char=2, flow=0, txbuf=256, rxbuf=256)
         if not callable(getattr(self._uart, 'txdone', None)):
             raise ValueError('UART completion check unavailable')
+        # Allocate bound methods before asserting DE, where even a GC pause
+        # could miss the sensor's first response bytes.
+        self._tx_write = self._uart.write
+        self._tx_done = self._uart.txdone
+        self._set_direction = self._direction.value
 
     def _release_hardware(self):
         direction, uart = self._direction, self._uart
         self._direction, self._uart = None, None
+        self._tx_write = self._tx_done = self._set_direction = None
         try:
             if direction is not None:
                 try:
@@ -311,18 +337,40 @@ class TemperatureHumidityReader:
         self.phase = 'idle'
         return dict(values)
 
-    def _transmit_tick(self, now):
-        if self._uart.txdone():
-            self._direction.value(0)
-            self.phase = 'rx'
-            self._deadline = now + self.timeout_ms
-            return self._receive(now)
-        if now >= self._deadline:
-            self._fail('tx_timeout')
-        return None
+    def _transmit(self):
+        # Resolve every bound method and request before DE rises. No status,
+        # logs, frame construction or outer runtime work runs while TX is live.
+        write, done, direction = self._tx_write, self._tx_done, self._set_direction
+        ticks, diff, pause = self._ticks_us, self._ticks_diff, self._sleep_us
+        request, size = self._request, self._request_len
+        limit, poll = TX_TIMEOUT_MS * 1000, TX_POLL_US
+        category = None
+        self.phase = 'tx'
+        started = ticks()
+        try:
+            direction(1)
+            if write(request) != size:
+                category = 'tx_short_write'
+            else:
+                while not done():
+                    if diff(ticks(), started) >= limit:
+                        category = 'tx_timeout'
+                        break
+                    pause(poll)
+        finally:
+            # This must precede failure reporting, allocations and every return,
+            # including exceptions and maintenance KeyboardInterrupt/SystemExit.
+            direction(0)
+        if category is not None:
+            self._fail(category)
+            return None
+        now = self._now()
+        self.phase = 'rx'
+        self._deadline = now + self.timeout_ms
+        return self._receive(now)
 
     def tick(self):
-        """Perform bounded work once; return only a newly verified observation."""
+        """Poll RX or finish bounded synchronous TX; return only a new reading."""
         if not self.enabled:
             return None
         now = self._now()
@@ -353,15 +401,7 @@ class TemperatureHumidityReader:
                     self._quiet_since = now
                 if now - self._quiet_since < QUIET_MS:
                     return None
-                self._direction.value(1)
-                self.phase = 'tx'
-                self._deadline = now + TX_TIMEOUT_MS
-                if self._uart.write(self._request) != len(self._request):
-                    self._fail('tx_short_write')
-                    return None
-                return self._transmit_tick(now)
-            if self.phase == 'tx':
-                return self._transmit_tick(now)
+                return self._transmit()
             if self.phase == 'rx':
                 return self._receive(now)
         except (KeyboardInterrupt, SystemExit):

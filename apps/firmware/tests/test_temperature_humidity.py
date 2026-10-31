@@ -25,33 +25,68 @@ def with_crc(body):
 
 
 class Clock:
+    PERIOD = 1 << 30
+
     def __init__(self):
-        self.value = 0
+        self.elapsed_us = 0
+        self.sleep_calls = 0
+        self.max_sleep_us = 0
+        self.sleep_failure = None
+
+    @property
+    def value(self):
+        return self.elapsed_us // 1000
+
+    @value.setter
+    def value(self, value):
+        self.elapsed_us = value * 1000
 
     def now(self):
         return self.value
+
+    def ticks_us(self):
+        return self.elapsed_us % self.PERIOD
+
+    def ticks_diff(self, new, old):
+        half = self.PERIOD // 2
+        return ((new - old + half) % self.PERIOD) - half
+
+    def sleep_us(self, duration):
+        if self.sleep_failure is not None:
+            raise self.sleep_failure
+        self.sleep_calls += 1
+        self.max_sleep_us = max(self.max_sleep_us, duration)
+        self.elapsed_us += duration
 
 
 class Pin:
     OUT = 1
 
-    def __init__(self, number, mode, value):
+    def __init__(self, number, mode, value, clock=None):
         self.number, self.mode = number, mode
         self.values = [value]
         self.failure = None
+        self.clock = clock
+        self.transitions = [(clock.elapsed_us, value)] if clock else []
 
     def value(self, value):
         self.values.append(value)
+        if self.clock:
+            self.transitions.append((self.clock.elapsed_us, value))
         if self.failure is not None:
             raise self.failure
 
 
 class UART:
-    def __init__(self):
+    def __init__(self, clock):
+        self.clock = clock
         self.incoming = bytearray()
         self.writes = []
         self.read_sizes = []
-        self.done = False
+        self.done = None
+        self.tx_duration_us = 5000
+        self.tx_started_us = 0
+        self.done_failure = None
         self.write_count = 4
         self.read_failure = None
         self.write_failure = None
@@ -70,15 +105,54 @@ class UART:
 
     def write(self, data):
         self.writes.append(bytes(data))
+        self.tx_started_us = self.clock.elapsed_us
         if self.write_failure is not None:
             raise self.write_failure
         return self.write_count
 
     def txdone(self):
-        return self.done
+        if self.done_failure is not None:
+            raise self.done_failure
+        if self.done is not None:
+            return self.done
+        return self.clock.elapsed_us - self.tx_started_us >= self.tx_duration_us
 
     def deinit(self):
         self.deinitialized = True
+
+
+class FastReplyUART(UART):
+    """UART + half-duplex receiver: bytes arriving with DE high are lost."""
+    def __init__(self, clock, direction, reply):
+        super().__init__(clock)
+        self.direction = direction
+        self.reply = reply
+        self.tx_duration_us = 8300
+        self.write_count = 8
+        self.reply_index = 0
+        self.reply_started_us = None
+
+    def write(self, data):
+        count = super().write(data)
+        self.reply_index = 0
+        self.reply_started_us = self.tx_started_us + self.tx_duration_us + 250
+        return count
+
+    def any(self):
+        if self.reply_started_us is not None:
+            while self.reply_index < len(self.reply):
+                byte_start = self.reply_started_us + self.reply_index * 1042
+                if self.clock.elapsed_us < byte_start + 1042:
+                    break
+                level = 0
+                for when, value in self.direction.transitions:
+                    if when > byte_start:
+                        break
+                    level = value
+                if level == 0:
+                    self.incoming.append(self.reply[self.reply_index])
+                self.reply_index += 1
+        return super().any()
 
 
 class ParseReadingTests(unittest.TestCase):
@@ -94,6 +168,16 @@ class ParseReadingTests(unittest.TestCase):
             with self.subTest(frame=frame):
                 value = parse_reading(bytearray(frame))
                 self.assertEqual((value['temperatureC'], value['relativeHumidityPercent']), expected)
+
+    def test_ascii_has_no_checksum_to_detect_a_lost_leading_temperature_digit(self):
+        # Both are legal readings: do not hide transport corruption with a
+        # room-temperature/season threshold or claim ASCII checksum integrity.
+        for frame, temperature in ((b'31.5\xa1\xe6,43.7%\n', 31.5),
+                                   (b'1.5\xa1\xe6,43.7%\n', 1.5),
+                                   (b'0\xa1\xe6,0%\n', 0),
+                                   (b'-1.5\xa1\xe6,43.7%\n', -1.5)):
+            with self.subTest(frame=frame):
+                self.assertEqual(parse_reading(frame)['temperatureC'], temperature)
 
     def test_rejects_incomplete_wrong_units_and_multiple_frames(self):
         for raw in (FRAME[:-1], b'28.8C,48.4%\n', b'28.8\xc2\xb0C,48.4%\n',
@@ -127,7 +211,7 @@ class ModbusParseTests(unittest.TestCase):
     def test_negative_temperature_and_fractional_humidity_preserve_tenths(self):
         for temperature_raw, humidity_raw, expected in (
                 (0xff85, 567, (-12.3, 56.7)), (0xfe70, 1000, (-40, 100)),
-                (1250, 0, (125, 0)), (0, 1, (0, 0.1))):
+                (1250, 0, (125, 0)), (0, 1, (0, 0.1)), (15, 400, (1.5, 40))):
             body = bytes((17, 4, 4, temperature_raw >> 8, temperature_raw & 255,
                           humidity_raw >> 8, humidity_raw & 255))
             value = parse_rtu_reading(with_crc(body), 17)
@@ -179,29 +263,23 @@ class ModbusParseTests(unittest.TestCase):
 class ReaderTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.uart = UART()
+        self.uart = UART(self.clock)
         self.uart_factory = Mock(return_value=self.uart)
         self.pins = []
 
         def pin_factory(*args, **kwargs):
-            pin = Pin(*args, **kwargs)
+            pin = Pin(*args, **kwargs, clock=self.clock)
             self.pins.append(pin)
             return pin
 
         self.pin_factory = Mock(side_effect=pin_factory)
         self.pin_factory.OUT = Pin.OUT
-        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory, self.pin_factory)
-
-    def start_tx(self):
-        self.assertIsNone(self.reader.tick())
-        self.clock.value += QUIET_MS
-        self.assertIsNone(self.reader.tick())
-        self.assertEqual(self.reader.phase, 'tx')
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
+                                                self.pin_factory, time_module=self.clock)
 
     def start_rx(self):
-        self.start_tx()
-        self.uart.done = True
-        self.clock.value += 5
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += QUIET_MS
         self.assertIsNone(self.reader.tick())
         self.assertEqual(self.reader.phase, 'rx')
 
@@ -244,7 +322,8 @@ class ReaderTests(unittest.TestCase):
         self.clock.value += QUIET_MS
         self.reader.tick()
         self.assertEqual(self.uart.writes, [b'READ'])
-        self.assertEqual(self.pins[0].values[-1], 1)
+        self.assertEqual(self.pins[0].values[-1], 0)
+        self.assertEqual(self.reader.phase, 'rx')
 
     def test_noisy_input_drain_has_deadline_and_bounded_work(self):
         self.uart.incoming.extend(b'x' * 1000)
@@ -257,12 +336,12 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(self.pins[0].values[-1], 0)
 
     def test_direction_waits_for_true_tx_completion_then_receives(self):
-        self.start_tx()
-        self.clock.value += 3
-        self.reader.tick()
-        self.assertEqual(self.pins[0].values[-1], 1)
-        self.uart.done = True
-        self.reader.tick()
+        self.uart.tx_duration_us = 4200
+        self.start_rx()
+        high, low = self.pins[0].transitions[-2:]
+        self.assertEqual((high[1], low[1]), (1, 0))
+        self.assertEqual(low[0] - high[0], 4200)
+        self.assertEqual(self.clock.max_sleep_us, 50)
         self.assertEqual(self.pins[0].values[-1], 0)
         self.assertEqual(self.reader.phase, 'rx')
 
@@ -308,12 +387,12 @@ class ReaderTests(unittest.TestCase):
         self.reader.tick()
         self.assertEqual(self.uart.writes, [b'READ'])
         self.clock.value = 180000
-        self.uart.done = False
+        self.uart.done = None
         self.reader.tick()
         self.clock.value += QUIET_MS
         self.reader.tick()
         self.assertEqual(self.uart.writes, [b'READ', b'READ'])
-        self.assertEqual(self.reader.status()['nextReadInMs'], 59990)
+        self.assertEqual(self.reader.status()['nextReadInMs'], 59985)
 
     def test_short_or_missing_write_never_produces_sample_and_lowers_direction(self):
         for count in (None, 0, 3):
@@ -325,17 +404,102 @@ class ReaderTests(unittest.TestCase):
                 self.reader.tick()
                 self.assertEqual(self.reader.status()['lastError'], 'tx_short_write')
                 self.assertEqual(self.pins[0].values[-1], 0)
+                self.assertEqual(self.clock.sleep_calls, 0)
                 self.assertIsNone(self.reader.reading())
 
-    def test_tx_timeout_lowers_direction_without_spinning(self):
-        self.start_tx()
-        self.clock.value += TX_TIMEOUT_MS
+    def test_tx_timeout_is_bounded_and_lowers_direction_in_the_same_call(self):
+        self.uart.done = False
+        self.reader.tick()
+        self.clock.value += QUIET_MS
+        before = self.clock.elapsed_us
         self.reader.tick()
         state = self.reader.status()
         self.assertEqual(state['lastError'], 'tx_timeout')
+        self.assertEqual(self.clock.elapsed_us - before, TX_TIMEOUT_MS * 1000)
+        self.assertEqual(self.clock.max_sleep_us, 50)
         self.assertEqual(state['samples'], 0)
         self.assertEqual(self.pins[0].values[-1], 0)
         self.assertFalse(self.reader.busy)
+        self.clock.value += state['nextReadInMs'] - 1
+        self.reader.tick()
+        self.assertEqual(len(self.uart.writes), 1)
+
+    def test_tx_timeout_can_recover_at_the_next_interval_without_replay_burst(self):
+        self.uart.done = False
+        self.reader.tick()
+        self.clock.value += QUIET_MS
+        self.reader.tick()
+        self.assertEqual(self.reader.status()['lastError'], 'tx_timeout')
+        self.clock.value += self.reader.status()['nextReadInMs']
+        self.uart.done = None
+        reading = self.sample()
+        self.assertEqual(len(self.uart.writes), 2)
+        self.assertEqual(reading['sample'], 1)
+        self.assertEqual(self.reader.status()['failures'], 1)
+        self.assertIsNone(self.reader.status()['lastError'])
+
+    def test_microsecond_counter_wrap_keeps_tx_bounded_and_complete(self):
+        self.clock.elapsed_us = self.clock.PERIOD - 12000
+        self.uart.tx_duration_us = 4200
+        self.start_rx()
+        high, low = self.pins[0].transitions[-2:]
+        self.assertLess(high[0], self.clock.PERIOD)
+        self.assertGreater(low[0], self.clock.PERIOD)
+        self.assertEqual(low[0] - high[0], 4200)
+        self.assertIsNone(self.reader.status()['lastError'])
+
+    def test_tx_timeout_across_microsecond_counter_wrap_still_lowers_de(self):
+        self.clock.elapsed_us = self.clock.PERIOD - 12000
+        self.uart.done = False
+        self.reader.tick()
+        self.clock.value += QUIET_MS
+        before = self.clock.elapsed_us
+        self.reader.tick()
+        self.assertEqual(self.clock.elapsed_us - before, TX_TIMEOUT_MS * 1000)
+        self.assertEqual(self.reader.status()['lastError'], 'tx_timeout')
+        self.assertEqual(self.pins[0].values[-1], 0)
+
+    def test_tx_io_or_sleep_failure_releases_bus_before_hardware_cleanup(self):
+        for operation in ('write', 'done', 'sleep'):
+            with self.subTest(operation=operation):
+                self.setUp()
+                if operation == 'write':
+                    self.uart.write_failure = OSError('private UART information')
+                elif operation == 'done':
+                    self.uart.done_failure = OSError('private UART information')
+                else:
+                    self.clock.sleep_failure = OSError('private clock information')
+                self.reader.tick()
+                deinit = self.uart.deinit
+
+                def cleanup():
+                    self.assertEqual(self.pins[0].values[-1], 0)
+                    deinit()
+
+                self.uart.deinit = cleanup
+                self.clock.value += QUIET_MS
+                self.reader.tick()
+                self.assertTrue(self.uart.deinitialized)
+                self.assertEqual(self.reader.status()['lastError'], 'io_failed')
+                self.assertIsNone(self.reader.reading())
+                self.assertNotIn('private', repr(self.reader.status()))
+
+    def test_tx_wait_maintenance_interrupt_always_lowers_de_and_propagates(self):
+        for operation in ('done', 'sleep'):
+            for error in (KeyboardInterrupt, SystemExit):
+                with self.subTest(operation=operation, error=error):
+                    self.setUp()
+                    if operation == 'done':
+                        self.uart.done_failure = error()
+                    else:
+                        self.clock.sleep_failure = error()
+                    self.reader.tick()
+                    self.clock.value += QUIET_MS
+                    with self.assertRaises(error):
+                        self.reader.tick()
+                    self.assertEqual(self.pins[0].values[-1], 0)
+                    self.assertTrue(self.uart.deinitialized)
+                    self.assertFalse(self.reader.enabled)
 
     def test_rx_timeout_never_turns_missing_data_into_zero(self):
         self.start_rx()
@@ -364,7 +528,7 @@ class ReaderTests(unittest.TestCase):
     def test_failure_retains_old_value_but_marks_it_stale_until_new_success(self):
         self.sample()
         self.clock.value = 60000
-        self.uart.done = False
+        self.uart.done = None
         self.start_rx()
         self.clock.value += RX_TIMEOUT_MS
         self.reader.tick()
@@ -375,7 +539,7 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(state['stale'])
         self.assertIsNone(self.reader.reading())
         self.clock.value += state['nextReadInMs']
-        self.uart.done = False
+        self.uart.done = None
         result = self.sample(b'29.1\xa1\xe6,49.0%\n')
         self.assertEqual(result['sample'], 2)
         self.assertEqual(self.reader.reading()['temperatureC'], 29.1)
@@ -452,30 +616,32 @@ class ReaderTests(unittest.TestCase):
         reader = TemperatureHumidityReader(self.clock.now, interval_ms=5000)
         self.assertEqual(reader.status()['intervalMs'], 5000)
 
-    def test_tick_has_no_sleep_dependency(self):
+    def test_receive_does_not_add_blocking_sleep_after_bounded_tx(self):
+        self.start_rx()
+        waits = self.clock.sleep_calls
+        self.uart.incoming.extend(FRAME)
         with patch('time.sleep', side_effect=AssertionError('must not block')):
-            self.sample()
+            self.assertEqual(self.reader.tick()['temperatureC'], 28.8)
+        self.assertEqual(self.clock.sleep_calls, waits)
 
 
 class RtuReaderTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.uart = UART()
+        self.uart = UART(self.clock)
+        self.uart.tx_duration_us = 10000
         self.uart.write_count = 8
-        self.direction = Pin(13, Pin.OUT, value=0)
+        self.direction = Pin(13, Pin.OUT, value=0, clock=self.clock)
         self.pin_factory = Mock(return_value=self.direction)
         self.pin_factory.OUT = Pin.OUT
         self.uart_factory = Mock(return_value=self.uart)
         self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
-                                                self.pin_factory, protocol='sht20_rtu')
+                                                self.pin_factory, protocol='sht20_rtu',
+                                                time_module=self.clock)
 
     def start_rx(self):
         self.reader.tick()
         self.clock.value += QUIET_MS
-        self.reader.tick()
-        self.assertEqual(self.reader.phase, 'tx')
-        self.uart.done = True
-        self.clock.value += 10
         self.reader.tick()
         self.assertEqual(self.reader.phase, 'rx')
 
@@ -500,6 +666,51 @@ class RtuReaderTests(unittest.TestCase):
         self.assertEqual(state['crcFailures'], 0)
         self.assertFalse(state['stale'])
         self.assertEqual(self.direction.values[-1], 0)
+
+    def test_fast_reply_survives_slow_outer_loop_after_same_call_turnaround(self):
+        self.uart = FastReplyUART(self.clock, self.direction, RTU_FRAME)
+        self.uart_factory.return_value = self.uart
+        self.start_rx()
+        high, low = self.direction.transitions[-2:]
+        self.assertEqual(low[0] - high[0], 8300)
+        self.assertLess(low[0], self.uart.reply_started_us)
+        # OLED/USB/network may take time after TX. The receiver is already on,
+        # so its UART buffer retains the whole fast response during that work.
+        self.clock.value += 30
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += 4
+        reading = self.reader.tick()
+        self.assertEqual(reading['temperatureC'], 30.5)
+        self.assertEqual(self.reader.status()['integrity'], 'crc_verified')
+        self.assertEqual(self.reader.status()['lastFrameHex'], RTU_FRAME.hex())
+        self.assertEqual(self.reader.status()['failures'], 0)
+
+    def test_fast_reply_fixture_loses_header_when_direction_release_is_delayed(self):
+        # Demonstrate the physical failure the regression fixture models:
+        # waiting for another 10ms outer tick after an 8.3ms request loses bytes.
+        uart = FastReplyUART(self.clock, self.direction, RTU_FRAME)
+        self.direction.value(1)
+        uart.write(build_rtu_request())
+        self.clock.sleep_us(10000)
+        self.direction.value(0)
+        self.clock.sleep_us(30000)
+        uart.any()
+        self.assertLess(len(uart.incoming), len(RTU_FRAME))
+        with self.assertRaises(ValueError):
+            parse_rtu_reading(uart.incoming)
+
+    def test_receive_timeout_budget_starts_after_tx_turnaround(self):
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
+            self.pin_factory, protocol='sht20_rtu', timeout_ms=200,
+            time_module=self.clock)
+        self.uart.tx_duration_us = 80000
+        self.start_rx()
+        self.clock.value += 195
+        self.uart.incoming.extend(RTU_FRAME)
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += 4
+        self.assertEqual(self.reader.tick()['temperatureC'], 30.5)
+        self.assertIsNone(self.reader.status()['lastError'])
 
     def test_fragmented_response_waits_for_last_byte_and_rtu_silence(self):
         self.start_rx()
@@ -548,7 +759,7 @@ class RtuReaderTests(unittest.TestCase):
     def test_timeout_is_configurable_and_preserves_partial_hex_without_fake_data(self):
         self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
             self.pin_factory, protocol='sht20_rtu', slave_address=17, baudrate=19200,
-            timeout_ms=200)
+            timeout_ms=200, time_module=self.clock)
         self.start_rx()
         self.uart_factory.assert_called_once_with(
             1, baudrate=19200, bits=8, parity=None, stop=1, tx=15, rx=14,
@@ -569,7 +780,7 @@ class RtuReaderTests(unittest.TestCase):
         self.assertEqual(self.reader.status()['lastError'], 'rx_timeout')
         self.uart.incoming.extend(RTU_FRAME)
         self.clock.value += self.reader.status()['nextReadInMs']
-        self.uart.done = False
+        self.uart.done = None
         self.reader.tick()
         self.assertEqual(self.uart.incoming, b'')
         self.assertEqual(self.reader.phase, 'draining')
@@ -580,9 +791,6 @@ class RtuReaderTests(unittest.TestCase):
         self.clock.value += QUIET_MS
         self.reader.tick()
         self.assertEqual(len(self.uart.writes), 2)
-        self.uart.done = True
-        self.clock.value += 10
-        self.reader.tick()
         changed = with_crc(bytes.fromhex('010404ff8503e8'))
         self.uart.incoming.extend(changed)
         self.clock.value += 10
@@ -598,7 +806,7 @@ class RtuReaderTests(unittest.TestCase):
     def test_crc_failure_after_a_success_retains_stale_evidence_then_recovers(self):
         first = self.deliver()
         self.clock.value += self.reader.status()['nextReadInMs']
-        self.uart.done = False
+        self.uart.done = None
         damaged = bytearray(RTU_FRAME)
         damaged[-1] ^= 1
         self.assertIsNone(self.deliver(damaged))
@@ -609,7 +817,7 @@ class RtuReaderTests(unittest.TestCase):
         self.assertEqual(failed['crcFailures'], 1)
         self.assertIsNone(self.reader.reading())
         self.clock.value += failed['nextReadInMs']
-        self.uart.done = False
+        self.uart.done = None
         second = self.deliver(with_crc(bytes.fromhex('01040400000000')))
         self.assertEqual(second['sample'], 2)
         self.assertEqual(second['temperatureC'], 0)
@@ -645,7 +853,8 @@ class RtuReaderTests(unittest.TestCase):
 
     def test_ascii_bad_frame_trace_is_bounded_and_never_claims_crc(self):
         self.uart.write_count = 4
-        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory, self.pin_factory)
+        self.reader = TemperatureHumidityReader(self.clock.now, self.uart_factory,
+                                                self.pin_factory, time_module=self.clock)
         self.start_rx()
         self.uart.incoming.extend(b'x' * MAX_FRAME_BYTES)
         self.reader.tick()

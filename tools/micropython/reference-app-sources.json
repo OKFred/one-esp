@@ -91,8 +91,8 @@
   },
   {
     "path": "components/temperature_humidity.py",
-    "bytes": 16163,
-    "sha256": "b1ed603acc8ae92a9e0bedfa115c921ee94889caa64e31145473537992e3379a"
+    "bytes": 17912,
+    "sha256": "7086fd7ff6f117650d31d4b1c29f878dd43033b63294ef6c6d40f680aaebc8f3"
   },
   {
     "path": "components/time_sync.py",
