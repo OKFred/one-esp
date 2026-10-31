@@ -562,6 +562,75 @@ class RtuReaderTests(unittest.TestCase):
         self.assertEqual(self.reader.status()['lastFrameHex'], '110404')
         self.assertIsNone(self.reader.reading())
 
+    def test_late_rtu_response_after_timeout_is_drained_before_the_next_request(self):
+        self.start_rx()
+        self.clock.value += RX_TIMEOUT_MS
+        self.reader.tick()
+        self.assertEqual(self.reader.status()['lastError'], 'rx_timeout')
+        self.uart.incoming.extend(RTU_FRAME)
+        self.clock.value += self.reader.status()['nextReadInMs']
+        self.uart.done = False
+        self.reader.tick()
+        self.assertEqual(self.uart.incoming, b'')
+        self.assertEqual(self.reader.phase, 'draining')
+        self.assertEqual(self.reader.status()['samples'], 0)
+        self.assertIsNone(self.reader.reading())
+        self.clock.value += 1
+        self.reader.tick()
+        self.clock.value += QUIET_MS
+        self.reader.tick()
+        self.assertEqual(len(self.uart.writes), 2)
+        self.uart.done = True
+        self.clock.value += 10
+        self.reader.tick()
+        changed = with_crc(bytes.fromhex('010404ff8503e8'))
+        self.uart.incoming.extend(changed)
+        self.clock.value += 10
+        self.assertIsNone(self.reader.tick())
+        self.clock.value += 4
+        reading = self.reader.tick()
+        self.assertEqual(reading['temperatureC'], -12.3)
+        self.assertEqual(reading['relativeHumidityPercent'], 100)
+        self.assertEqual(reading['sample'], 1)
+        self.assertEqual(self.reader.status()['failures'], 1)
+        self.assertIsNone(self.reader.status()['lastError'])
+
+    def test_crc_failure_after_a_success_retains_stale_evidence_then_recovers(self):
+        first = self.deliver()
+        self.clock.value += self.reader.status()['nextReadInMs']
+        self.uart.done = False
+        damaged = bytearray(RTU_FRAME)
+        damaged[-1] ^= 1
+        self.assertIsNone(self.deliver(damaged))
+        failed = self.reader.status()
+        self.assertTrue(failed['stale'])
+        self.assertEqual(failed['temperatureC'], first['temperatureC'])
+        self.assertEqual(failed['readAtMs'], first['readAtMs'])
+        self.assertEqual(failed['crcFailures'], 1)
+        self.assertIsNone(self.reader.reading())
+        self.clock.value += failed['nextReadInMs']
+        self.uart.done = False
+        second = self.deliver(with_crc(bytes.fromhex('01040400000000')))
+        self.assertEqual(second['sample'], 2)
+        self.assertEqual(second['temperatureC'], 0)
+        self.assertEqual(second['relativeHumidityPercent'], 0)
+        self.assertGreater(second['readAtMs'], first['readAtMs'])
+        recovered = self.reader.status()
+        self.assertFalse(recovered['stale'])
+        self.assertEqual(recovered['crcFailures'], 1)
+        self.assertEqual(recovered['integrity'], 'crc_verified')
+        self.assertIsNone(recovered['lastError'])
+
+    def test_valid_frame_at_receive_deadline_is_not_accepted_after_timeout(self):
+        self.start_rx()
+        self.clock.value += RX_TIMEOUT_MS
+        self.uart.incoming.extend(RTU_FRAME)
+        self.assertIsNone(self.reader.tick())
+        self.assertEqual(self.reader.status()['lastError'], 'rx_timeout')
+        self.assertEqual(self.reader.status()['samples'], 0)
+        self.assertIsNone(self.reader.reading())
+        self.assertEqual(self.direction.values[-1], 0)
+
     def test_ascii_response_is_not_accepted_in_explicit_rtu_mode(self):
         self.assertIsNone(self.deliver(FRAME))
         self.assertEqual(self.reader.status()['lastError'], 'invalid_frame')

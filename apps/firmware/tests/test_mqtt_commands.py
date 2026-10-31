@@ -78,6 +78,43 @@ class MqttCommandTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.drain(), [])
 
+    def test_exact_expiry_and_identifier_limits_accept_only_the_documented_boundary(self):
+        cases = ((300, 'r' * 64, True), (301, 'r' * 64, False),
+                 (0, 'r' * 64, False), (1, 'r' * 65, False), (1, '', False))
+        for seconds, identifier, expected in cases:
+            with self.subTest(seconds=seconds, id_length=len(identifier)):
+                self.setUp()
+                expiry = '2026-10-31T14:%02d:%02dZ' % (seconds // 60, seconds % 60)
+                accepted = self.processor.receive(self.request(identifier=identifier, expiresAtUtc=expiry))
+                self.assertEqual(accepted, expected)
+                self.assertEqual(len(self.calls), int(expected))
+
+    def test_cached_duplicate_after_expiry_or_clock_loss_only_replies_and_never_reapplies(self):
+        request = self.request()
+        self.assertTrue(self.processor.receive(request))
+        original = self.drain()[0][1]
+        self.now += 31
+        self.synchronized = False
+        self.assertTrue(self.processor.receive(request))
+        self.assertIs(self.drain()[0][1], original)
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.processor.receive(self.request(identifier='new-request')))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_oversized_result_becomes_bounded_failure_without_dropping_duplicate_protection(self):
+        self.processor = CommandProcessor(
+            lambda command, finish: {'ok': True, 'result': {'unbounded': 'x' * 4096}},
+            lambda: (self.now, True))
+        request = self.request()
+        self.assertTrue(self.processor.receive(request))
+        reply = self.drain()[0][1]
+        self.assertFalse(json.loads(reply)['ok'])
+        self.assertLessEqual(len(reply), MAX_REPLY_BYTES)
+        self.assertNotIn(b'x' * 100, reply)
+        self.assertTrue(self.processor.receive(request))
+        self.assertIs(self.drain()[0][1], reply)
+        self.assertEqual(self.processor.status()['duplicates'], 1)
+
     def test_async_final_ack_is_retained_under_queue_pressure_and_cannot_regress(self):
         def handle(command, finish):
             self.finishes.append(finish)

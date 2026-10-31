@@ -241,6 +241,52 @@ class TemperatureTelemetryTests(unittest.TestCase):
         self.assertEqual(self.sampler.status()['acknowledged'], 1)
         self.assertEqual(len(self.client.ticks), calls)
 
+    def test_reconfigure_and_reenable_keep_today_count_but_restart_begins_at_zero(self):
+        day = [10]
+        self.sampler = self.make(local_day=lambda: day[0])
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        replacement = Client()
+        self.sampler.reconfigure(configuration(host='repair.example.invalid'), replacement)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        self.sampler.reconfigure({'enabled': False}, replacement)
+        self.sampler.reconfigure(configuration(), replacement)
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+        self.assertEqual(self.sampler.status()['acknowledged'], 1)
+        restarted = self.make(local_day=lambda: day[0])
+        self.assertEqual(restarted.status()['dailyAcknowledged'], 0)
+        self.assertEqual(restarted.status()['acknowledged'], 0)
+
+    def test_day_provider_failure_does_not_drop_pending_or_erase_a_known_day(self):
+        provider = Mock(return_value=10)
+        self.sampler = self.make(local_day=provider)
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        self.now = 60000
+        self.sampler.tick(True, True)
+        pending = self.sampler._pending
+        provider.side_effect = OSError('private-clock-detail')
+        self.sampler.tick(False, False)
+        self.assertIsNone(self.sampler.status()['dailyAcknowledged'])
+        self.assertIs(self.sampler._pending, pending)
+        self.assertEqual(self.sampler.status()['acknowledged'], 1)
+        self.assertNotIn('private-clock-detail', repr(self.logs))
+        provider.side_effect = None
+        self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+
+    def test_repeated_status_and_stray_puback_do_not_inflate_confirmed_count(self):
+        self.sampler = self.make(local_day=lambda: 10)
+        self.sampler.tick(True, True)
+        self.client.ack = True
+        self.sampler.tick(True, True)
+        for _ in range(10):
+            self.client.ack = True
+            self.sampler.tick(True, False)
+            self.assertEqual(self.sampler.status()['dailyAcknowledged'], 1)
+            self.assertEqual(self.sampler.status()['acknowledged'], 1)
+
     def test_schema_v2_uses_actual_utc_and_explicit_internal_temperature(self):
         self.sampler.tick(True, True)
         topic, wire = self.client.published[0]

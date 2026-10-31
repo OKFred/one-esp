@@ -212,6 +212,81 @@ class MqttDownlinkTests(unittest.TestCase):
         self.assertEqual(self.client.status()['commands']['state'], 'ready')
         self.assertEqual(self.client.status()['connections'], 2)
 
+    def test_packet_id_wrap_and_reconnect_keep_reply_ack_separate_from_business_ack(self):
+        self.connect()
+        self.client._next_packet_id = 65534
+        payload = b'original business at packet ID wrap'
+        self.assertTrue(self.client.publish(self.telemetry_topic, payload))
+        self.stream.reads.append(self.incoming(qos=0))
+        self.tick(3)
+        pending, reply = self.client._pending, self.client._reply_inflight
+        self.assertEqual(pending[2], 65535)
+        self.assertEqual(reply[2], 1)
+        self.client.close()
+        self.stream = CapturingStream()
+        raw = RawSocket()
+        self.stream.raw = raw
+        self.client._sockets.socket.return_value = raw
+        self.client._ssl.wrap_socket.return_value = self.stream
+        self.connect()
+        self.assertEqual(self.client._next_packet_id, 2)
+        start = len(self.stream.sent)
+        self.tick(2)
+        self.assertIs(self.client._pending, pending)
+        self.assertIs(self.client._reply_inflight, reply)
+        self.assertIn(publish_packet(self.reply_topic, reply[1], 1, duplicate=True), self.stream.sent[start:])
+        self.assertIn(publish_packet(self.telemetry_topic, payload, 65535, duplicate=True), self.stream.sent[start:])
+        self.stream.reads.append(puback_packet(3) + puback_packet(1) + puback_packet(1))
+        self.tick()
+        self.assertFalse(self.client.take_ack())
+        self.assertIs(self.client._pending, pending)
+        self.assertEqual(self.client.status()['commands']['replyAcknowledged'], 1)
+        self.stream.reads.append(puback_packet(65535) + puback_packet(65535))
+        self.tick()
+        self.assertTrue(self.client.take_ack())
+        self.assertFalse(self.client.take_ack())
+        self.assertEqual(self.client.status()['acks'], 1)
+
+    def test_inbound_puback_queue_overflow_fails_closed_without_losing_business_payload(self):
+        self.connect()
+        payload = b'original while commands are flooded'
+        self.client.publish(self.telemetry_topic, payload)
+        self.tick()
+        pending = self.client._pending
+        burst = b''.join(self.incoming(b'{}', packet_id=index, topic='other') for index in range(1, 10))
+        self.assertLessEqual(len(burst), 256)
+        self.stream.reads.append(burst)
+        self.tick()
+        self.assertEqual(self.client.status()['phase'], 'backoff')
+        self.assertTrue(self.stream.closed)
+        self.assertIs(self.client._pending, pending)
+        self.assertIs(self.client._pending[1], payload)
+        self.assertFalse(self.client.take_ack())
+        self.assertEqual(self.calls, [])
+
+    def test_reply_queue_pressure_eventually_delivers_every_accepted_final_response(self):
+        self.connect()
+        for index in range(4):
+            self.stream.reads.append(self.incoming(self.request(identifier='pressure-' + str(index)), qos=0))
+            self.tick(2)
+        self.assertEqual(len(self.calls), 4)
+        status = self.client.status()['commands']
+        self.assertEqual(status['replyPending'], 3)
+        self.assertEqual(status['pendingResponses'], 1)
+        delivered = []
+        for _ in range(4):
+            self.tick()
+            inflight = self.client._reply_inflight
+            self.assertIsNotNone(inflight)
+            delivered.append(json.loads(inflight[1])['id'])
+            self.stream.reads.append(puback_packet(inflight[2]))
+            self.tick()
+        self.assertEqual(set(delivered), {'pressure-' + str(index) for index in range(4)})
+        self.assertEqual(len(set(delivered)), 4)
+        self.assertEqual(self.client.status()['commands']['replyAcknowledged'], 4)
+        self.assertEqual(self.client.status()['commands']['pendingResponses'], 0)
+        self.assertEqual(self.client.status()['commands']['replyPending'], 0)
+
     def test_subscription_timeout_preserves_telemetry_for_retry(self):
         self.client.publish(self.telemetry_topic, b'pending')
         self.client.tick(True, True)

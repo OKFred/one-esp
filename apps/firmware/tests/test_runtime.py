@@ -1,6 +1,7 @@
 """Runtime ownership, Wi-Fi rollback and maintenance scheduling regressions."""
 
 import contextlib
+from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
@@ -856,6 +857,22 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(self.runtime._mqtt_local_day(), 99)
             with patch.object(self.clock, 'time', return_value=midnight):
                 self.assertEqual(self.runtime._mqtt_local_day(), 100)
+
+    def test_calendar_midnights_across_month_year_and_leap_days_for_both_epochs(self):
+        self.runtime.ntp_synced = True
+        for epoch_year in (1970, 2000):
+            epoch = datetime(epoch_year, 1, 1, tzinfo=timezone.utc)
+            for date in ((2026, 2, 1), (2027, 1, 1), (2028, 2, 29), (2028, 3, 1)):
+                for offset in (-12, -3.5, 5.75, 14):
+                    with self.subTest(epoch=epoch_year, date=date, timezone=offset):
+                        self.config.values['TIMEZONE_HOURS'] = str(offset)
+                        boundary = datetime(*date, tzinfo=timezone(timedelta(hours=offset)))
+                        seconds = int((boundary - epoch).total_seconds())
+                        expected_day = (boundary.date() - epoch.date()).days
+                        for delta in (-1, 0, 1):
+                            with patch.object(self.clock, 'time', return_value=seconds + delta):
+                                self.assertEqual(self.runtime._mqtt_local_day(),
+                                                 expected_day - (1 if delta < 0 else 0))
 
     def test_task_screen_distinguishes_pending_reconnect_and_clock_wait(self):
         self.runtime.network_state = 'connected'
