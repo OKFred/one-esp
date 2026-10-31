@@ -789,10 +789,70 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.network_tick()
         self.assertEqual(self.runtime.network_state, 'failed')
         self.assertIn('Check password', self.display.screen_display.call_args.args[0])
+        self.local_time.side_effect = [
+            {'formatted_time': '12:34:56'}, {'formatted_time': '12:34:57'},
+        ]
+        screens = []
+        for tick in (21000, 22000):
+            self.clock.value = tick
+            self.runtime.clock_tick()
+            screens.append(self.display.screen_display.call_args.args[0].split('\n'))
+        self.assertEqual([screen[-1] for screen in screens], ['RTC 12:34:56', 'RTC 12:34:57'])
+        self.assertTrue(all(len(screen) == 4 and screen[2] == 'Check password' for screen in screens))
         self.command('debug.set', {'enabled': True})
         self.assertTrue(self.runtime.service.enabled)
         self.assertIn('"type": "ack"', self.output.getvalue())
         self.assertNotIn('original-private', self.output.getvalue())
+
+    def test_task_screen_keeps_observation_delivery_and_time_in_four_rows(self):
+        self.runtime.network_state = 'connected'
+        self.runtime.ntp_synced = True
+        sensor = {'temperatureC': 28.8, 'relativeHumidityPercent': 50.4,
+                  'stale': False, 'lastError': None, 'phase': 'idle'}
+        self.runtime.sensor = Mock(status=Mock(return_value=sensor))
+        self.runtime.mqtt = Mock(status=Mock(return_value={
+            'enabled': True, 'clockReady': True, 'pending': False,
+            'acknowledged': 5, 'transport': {'connected': True}}))
+        for temperature, humidity, expected in ((28.8, 50.4, 'T:28.8C H:50%'),
+                                                (-40, 100, 'T:-40.0C H:100%'),
+                                                (125, 0, 'T:125.0C H:0%')):
+            sensor.update(temperatureC=temperature, relativeHumidityPercent=humidity)
+            lines = self.runtime.task_screen().split('\n')
+            self.assertEqual(lines, ['Env telemetry', expected, 'MQTT: sent 5', '10-30 12:34:56'])
+            self.assertTrue(all(len(line) <= 16 and line.isascii() for line in lines))
+        sensor['lastError'] = 'invalid_frame'
+        self.assertEqual(self.runtime.task_screen().split('\n')[1], 'Sensor read err')
+        sensor.update(lastError=None, stale=True)
+        self.assertEqual(self.runtime.task_screen().split('\n')[1], 'Sensor stale')
+
+    def test_task_screen_distinguishes_pending_reconnect_and_clock_wait(self):
+        self.runtime.network_state = 'connected'
+        self.runtime._sensor_requested = True
+        mqtt = {'enabled': True, 'clockReady': True, 'pending': True,
+                'acknowledged': 5, 'transport': {'connected': True}}
+        self.runtime.mqtt = Mock(status=Mock(return_value=mqtt))
+        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'MQTT: pending')
+        mqtt['transport'] = {'connected': False, 'phase': 'backoff'}
+        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'MQTT reconnect')
+        mqtt['clockReady'] = False
+        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'Syncing clock')
+        self.runtime.network_state = 'reconnecting'
+        self.assertEqual(self.runtime.task_screen().split('\n')[2], 'WiFi offline')
+
+    def test_task_screen_disabled_sensor_does_not_invent_environment_readings(self):
+        self.runtime.network_state = 'connected'
+        self.runtime._sensor_requested = False
+        self.assertEqual(self.runtime.task_screen().split('\n'),
+                         ['USB diagnostics', 'Sensor disabled', 'TCP: pending', 'RTC 12:34:56'])
+
+    def test_task_screen_keeps_mqtt_setup_failure_visible_after_enabled_flag_changes(self):
+        self.runtime.network_state = 'connected'
+        for permanent, expected in ((True, 'MQTT config err'), (False, 'MQTT retry')):
+            self.runtime._mqtt_enabled = None
+            self.runtime._mqtt_init_failed(None, permanent)
+            lines = self.runtime.task_screen().split('\n')
+            self.assertEqual(lines[0], 'System telemetry')
+            self.assertEqual(lines[2], expected)
 
     def test_failed_trial_restores_previous_credentials_and_reports_rollback(self):
         self.command('debug.set', {'enabled': True}, 'enable')

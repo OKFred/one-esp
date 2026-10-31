@@ -184,14 +184,14 @@ export function createReplaySession(
     const clock = new Date(Date.now() + 8 * 3600_000).toISOString();
     const lines =
       scenario === 'wifi-error'
-        ? ['WiFi failed', 'Check password', 'Edit .env', 'Restart to retry']
+        ? ['USB diagnostics', 'WiFi failed', 'Check password', `RTC ${clock.slice(11, 19)}`]
         : scenario === 'offline'
-          ? ['DEVICE OFFLINE', 'LAST KNOWN FRAME', 'CHECK CONNECTION', 'SENSOR DISABLED']
+          ? ['USB diagnostics', 'Last known frame', 'Device offline', `RTC ${clock.slice(11, 19)}`]
           : [
-              'WiFi Connected!',
-              '192.0.2.100',
-              `${clock.slice(5, 10)} ${clock.slice(11, 19)}`,
+              'USB diagnostics',
+              'Sensor disabled',
               'TCP: 42ms',
+              `${clock.slice(5, 10)} ${clock.slice(11, 19)}`,
             ];
     send('oled', {
       width: 128,
@@ -262,7 +262,7 @@ export function createReplaySession(
           if (enabled) {
             if (Date.now() - lastDebugAt >= 5000) debug();
             status();
-            if (scenario === 'normal') screen();
+            screen();
             if (Date.now() - started - lastMetricsAt >= (profile === 'full' ? 5000 : 15000))
               metrics();
           }

@@ -1,4 +1,4 @@
-"""USB diagnostic runtime. Disconnected sensor peripherals are never started."""
+"""Device runtime for USB diagnostics and explicitly configured telemetry."""
 
 import gc
 import sys
@@ -74,6 +74,7 @@ class DiagnosticRuntime:
         self.wifi_timeout = 20000
         self.wifi_values = None
         self.network_state = 'idle'
+        self.network_reason = None
         self.trial_id = None
         self.restart_at = None
         self.maintenance_busy = None
@@ -212,8 +213,9 @@ class DiagnosticRuntime:
         self.wifi_timeout = timeout_ms
         self.wifi_started = self.service.now()
         self.network_state = 'disconnecting'
+        self.network_reason = None
         self.wifi_values = dict(values)
-        self.show('Connecting WiFi\nPlease wait...')
+        self.show(self.task_screen())
         ssid = values.get('SSID', '')
         if not ssid:
             self.network_failure('SSID missing')
@@ -243,7 +245,8 @@ class DiagnosticRuntime:
         except OSError:
             pass
         self.network_state = 'failed'
-        self.show('WiFi failed\n' + reason + '\nEdit .env\nRestart to retry')
+        self.network_reason = reason
+        self.show(self.task_screen())
         self.service.log('warn', 'WiFi failed: ' + reason)
         if self.trial_id:
             command_id, self.trial_id = self.trial_id, None
@@ -283,7 +286,7 @@ class DiagnosticRuntime:
                                                  error='Configuration save failed; reconnecting previous network')
                         self.start_wifi(self.config.values)
                         return
-                self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nDiagnostics ready')
+                self.show(self.task_screen())
                 self.schedule_network_jobs()
                 self.service.log('info', 'WiFi connected; diagnostics ready')
                 self.service.emit('status', self.status(), True)
@@ -302,11 +305,11 @@ class DiagnosticRuntime:
         elif self.network_state == 'connected' and not connected:
             self.cancel_network_jobs()
             self.network_state = 'reconnecting'
-            self.show('WiFi offline\nReconnecting...\nUSB debug ready')
+            self.show(self.task_screen())
             self.service.log('warn', 'WiFi disconnected; USB diagnostics remain available')
         elif self.network_state == 'reconnecting' and connected:
             self.network_state = 'connected'
-            self.show('WiFi Connected!\n' + self.wlan.ifconfig()[0] + '\nUSB debug ready\nDiagnostics ready')
+            self.show(self.task_screen())
             self.service.log('info', 'WiFi connection restored')
             self.schedule_network_jobs()
 
@@ -321,9 +324,67 @@ class DiagnosticRuntime:
         self.clock_sync.cancel()
         self.maintenance_busy = None
 
+    def task_screen(self):
+        # Four physical 16-character rows: job, observation, delivery, time.
+        # Build this only at a visible second/state change, not every loop.
+        environment = (self.sensor is not None or self._sensor_requested is True or
+                       self._sensor_state in ('configuration_error', 'initialization_retry'))
+        mqtt = self.mqtt.status() if self.mqtt else None
+        mqtt_problem = self._mqtt_state in ('configuration_error', 'initialization_retry')
+        title = 'Env telemetry' if environment else (
+            'System telemetry' if self._mqtt_enabled or mqtt_problem or (mqtt and mqtt.get('enabled'))
+            else 'USB diagnostics')
+        if self.sensor:
+            sensor = self.sensor.status()
+            temperature, humidity = sensor.get('temperatureC'), sensor.get('relativeHumidityPercent')
+            if sensor.get('lastError'):
+                detail = 'Sensor read err'
+            elif sensor.get('stale') and temperature is not None:
+                detail = 'Sensor stale'
+            elif temperature is not None and humidity is not None:
+                detail = 'T:%.1fC H:%d%%' % (temperature, int(humidity + 0.5))
+            else:
+                detail = 'Reading sensor' if sensor.get('phase') in ('drain', 'tx', 'rx') else 'Awaiting reading'
+        elif environment:
+            detail = 'Sensor cfg error' if self._sensor_state == 'configuration_error' else (
+                'Sensor retry' if self._sensor_state == 'initialization_retry' else 'Starting sensor')
+        else:
+            detail = 'Sensor disabled'
+
+        if self.network_state == 'failed':
+            delivery = 'WiFi timeout' if self.network_reason in ('Connect timeout', 'Disconnect timeout') else (
+                self.network_reason or 'WiFi failed')
+        elif self.network_state == 'reconnecting':
+            delivery = 'WiFi offline'
+        elif self.network_state in ('disconnecting', 'connecting'):
+            delivery = 'WiFi connecting'
+        elif self.network_state != 'connected':
+            delivery = 'WiFi pending'
+        elif mqtt and mqtt.get('enabled'):
+            transport = mqtt.get('transport') or {}
+            if not mqtt.get('clockReady'):
+                delivery = 'Syncing clock'
+            elif transport.get('connected'):
+                delivery = 'MQTT: pending' if mqtt.get('pending') else 'MQTT: sent ' + str(mqtt.get('acknowledged', 0))
+            else:
+                delivery = 'MQTT reconnect' if transport.get('phase') == 'backoff' else 'MQTT connecting'
+        elif self._mqtt_enabled or mqtt_problem:
+            delivery = {'waiting_clock': 'Syncing clock',
+                        'configuration_error': 'MQTT config err',
+                        'initialization_retry': 'MQTT retry'}.get(self._mqtt_state, 'Starting MQTT')
+        elif environment:
+            delivery = 'Local sampling'
+        else:
+            delivery = ('TCP: ' + str(self.tcp_ms) + 'ms') if self.tcp_ok else (
+                'TCP: failed' if self.tcp_ok is False else 'TCP: pending')
+        local = get_local_time(float(self.config.values['TIMEZONE_HOURS']))
+        stamp = local['formatted_simple_date_time'] if self.ntp_synced else 'RTC ' + local['formatted_time']
+        # Keep overflow out of adjacent rows, especially the final clock row.
+        return '\n'.join((title[:16], detail[:16], delivery[:16], stamp[:16]))
+
     def clock_tick(self):
         now = self.service.now()
-        if self.network_state != 'connected' or now - self.last_clock < 100:
+        if now - self.last_clock < 100:
             return
         self.last_clock = now
         if now < self._stage_retry_at.get('display', 0):
@@ -331,16 +392,11 @@ class DiagnosticRuntime:
         # Observe the RTC second boundary cheaply instead of refreshing at an
         # arbitrary one-second phase, which could leave displayed seconds late.
         # Formatting/I2C still occur only when the visible second/state changes.
-        ip = self.wlan.ifconfig()[0]
         view = (time.time(), self.tcp_ok, self.tcp_ms, self.ntp_synced,
-                self.config.values['TIMEZONE_HOURS'], ip)
+                self.config.values['TIMEZONE_HOURS'], self.network_state)
         if view == self._last_clock_view:
             return
-        local = get_local_time(float(self.config.values['TIMEZONE_HOURS']))
-        stamp = local['formatted_simple_date_time'] if self.ntp_synced else 'RTC ' + local['formatted_time']
-        tcp = ('TCP: ' + str(self.tcp_ms) + 'ms') if self.tcp_ok else (
-            'TCP: failed' if self.tcp_ok is False else 'TCP: pending')
-        if self.show('WiFi Connected!\n' + ip + '\n' + stamp + '\n' + tcp):
+        if self.show(self.task_screen()):
             self._last_clock_view = view
 
     def maintenance_tick(self):
