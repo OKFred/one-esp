@@ -1,6 +1,6 @@
 # 直接依赖清单
 
-版本与用途按工作区清单组织；Node.js 依赖的传递版本和完整性哈希见 `pnpm-lock.yaml`，主机 Python 依赖见 `uv.lock`。运行时 Node.js 26.13.0 / pnpm 11.5.0；主机 CPython 3.14.2 由 `.python-version` 固定，uv 按根目录 `pyproject.toml` 和锁文件管理项目 `.venv/`。当前设备运行 MicroPython 1.29.0 正式冻结修复镜像，私有配置保留；业务 TLS、RTU CRC 和环境 PUBACK 已有独立短窗证据，真实远程命令、服务端踢线及长期稳定性仍待验收，见 [验证记录](validation.md)。仓库的 21 个运行源码已包含 `lib/ssd1306.py`，无需另计一个驱动文件。
+版本与用途按工作区清单组织；Node.js 依赖的传递版本和完整性哈希见 `pnpm-lock.yaml`，主机 Python 依赖见 `uv.lock`。运行时 Node.js 26.13.0 / pnpm 11.5.0；主机 CPython 3.14.2 由 `.python-version` 固定，uv 按根目录 `pyproject.toml` 和锁文件管理项目 `.venv/`。当前设备运行 MicroPython 1.29.0 正式冻结修复镜像，私有配置保留；业务 TLS、RTU CRC、环境 PUBACK 及限定的 MQTT 配置命令已有独立运行证据，USB 链路仍有拒收坏帧，服务端踢线及长期稳定性仍待验收，见 [验证记录](validation.md)。仓库的 21 个运行源码已包含 `lib/ssd1306.py`，无需另计一个驱动文件。
 
 ## 主机 Python 工具
 
