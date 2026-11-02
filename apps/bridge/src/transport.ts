@@ -30,6 +30,7 @@ export function createSerialTransport(path: string): DeviceTransport {
     dataBits: 8,
     stopBits: 1,
     parity: 'none',
+    hupcl: false, // Windows otherwise asserts DTR before the later set(false).
     rtscts: false,
     xon: false,
     xoff: false,
