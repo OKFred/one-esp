@@ -100,9 +100,10 @@ class ConfigStore:
                 'NTP_SERVER': 'new non-blocking clock synchronization when the value changes',
                 'NETWORK_TEST_HOST': 'new non-blocking TCP probe when the value changes',
                 'NETWORK_TEST_PORT': 'new non-blocking TCP probe when the value changes',
-                'POLL_INTERVAL_MS': 'saved; inactive while sensor acquisition is disabled',
+                'POLL_INTERVAL_MS': 'legacy saved field; sensor.config controls acquisition cadence',
             },
-            'unsupported': ['MQTT'],
+            'unsupported': [],
+            'separateConfiguration': {'MQTT': 'mqtt.config.get/set', 'RS485': 'sensor.config.get/set'},
         }
 
     def validate(self, changes):

@@ -4,29 +4,54 @@ import type { DeviceEvent } from '@one-esp/protocol';
 
 afterEach(() => vi.useRealTimers());
 
-it('normal replay emits changing framebuffer seconds and pauses when debug is off', () => {
-  vi.useFakeTimers();
-  vi.setSystemTime(new Date('2026-10-29T19:20:59Z'));
-  const events: DeviceEvent[] = [];
-  const session = createReplaySession(
-    'normal',
-    (event) => events.push(event),
-    () => {},
-  );
-  session.start();
-  const first = events.find((event) => event.type === 'oled')!;
-  expect(first.data.text).toContain('10-30 03:20:59');
-  vi.advanceTimersByTime(1000);
-  const next = events.filter((event) => event.type === 'oled').at(-1)!;
-  expect(next.data.text).toContain('10-30 03:21:00');
-  expect(next.data.buffer).not.toBe(first.data.buffer);
-  session.command({ v: 1, id: 'pause', command: 'debug.set', args: { enabled: false } });
-  const count = events.filter((event) => event.type === 'oled').length;
-  vi.advanceTimersByTime(3000);
-  expect(events.filter((event) => event.type === 'oled')).toHaveLength(count);
-  session.stop();
-  expect(vi.getTimerCount()).toBe(0);
-});
+it.each([
+  ['normal', 'USB diagnostics', 'Sensor disabled', 'TCP: 42ms', '10-30 03:20:59', '10-30 03:21:00'],
+  [
+    'wifi-error',
+    'WiFi failed',
+    'Check password',
+    'Edit WiFi config',
+    'RTC 03:20:59',
+    'RTC 03:21:00',
+  ],
+  [
+    'offline',
+    'USB diagnostics',
+    'Last known frame',
+    'Device offline',
+    'RTC 03:20:59',
+    'RTC 03:20:59',
+  ],
+] as const)(
+  '%s replay keeps the task layout and truthful clock progress',
+  (scenario, title, detail, state, stamp, nextStamp) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-29T19:20:59Z'));
+    const events: DeviceEvent[] = [];
+    const session = createReplaySession(
+      scenario,
+      (event) => events.push(event),
+      () => {},
+    );
+    session.start();
+    const first = events.find((event) => event.type === 'oled')!;
+    const firstLines = String(first.data.text).split('\n');
+    expect(firstLines).toEqual([title, detail, state, stamp]);
+    expect(firstLines.every((line) => /^[\x20-\x7e]{1,16}$/.test(line))).toBe(true);
+    expect(events.find((event) => event.type === 'status')!.data.sensorEnabled).toBe(false);
+    vi.advanceTimersByTime(1000);
+    const next = events.filter((event) => event.type === 'oled').at(-1)!;
+    expect(String(next.data.text).split('\n')).toEqual([title, detail, state, nextStamp]);
+    if (scenario === 'offline') expect(next.data.buffer).toBe(first.data.buffer);
+    else expect(next.data.buffer).not.toBe(first.data.buffer);
+    session.command({ v: 1, id: 'pause', command: 'debug.set', args: { enabled: false } });
+    const count = events.filter((event) => event.type === 'oled').length;
+    vi.advanceTimersByTime(3000);
+    expect(events.filter((event) => event.type === 'oled')).toHaveLength(count);
+    session.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  },
+);
 
 it('replays resource metrics at 5/15 second cadence and stops on debug expiry', () => {
   vi.useFakeTimers();

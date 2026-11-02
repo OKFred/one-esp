@@ -17,11 +17,28 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 FIRMWARE = ROOT / "apps" / "firmware"
-MPY_CROSS_PACKAGE = "mpy-cross==1.22.2"
-MPY_CROSS_COMMAND = ("uv", "tool", "run", "--from", MPY_CROSS_PACKAGE, "mpy-cross")
-# mpy-cross 1.22.2 emits format v6.2; bytecode-only files deliberately encode no
-# native sub-version/architecture in the feature byte. ESP32 uses 31-bit ints.
+DEFAULT_MPY_VERSION = "1.29.0.post2"
+# Package post-releases describe the host packaging, not the emitted firmware
+# version. Check both the actual compiler version and format before compiling.
+MPY_COMPILERS = {
+    "1.22.2": ("1.22.2", "6.2"),
+    "1.29.0.post2": ("1.29.0", "6.3"),
+}
+# Both formats encode this same pure-bytecode header: native sub-version and
+# architecture flags are absent. ESP32 uses 31-bit small integers.
 MPY_HEADER = b"M\x06\x00\x1f"
+FROZEN_UPLOAD_ERROR = (
+    "This device uses a frozen application. Rebuild and flash the firmware image; "
+    "filesystem upload would not update the running application."
+)
+FROZEN_CHECK = """try:
+ import one_esp_build as _upload_build
+except ImportError as _upload_error:
+ if str(_upload_error) not in ("no module named 'one_esp_build'", "No module named 'one_esp_build'"):
+  raise
+ _upload_build=None
+print('frozen' if _upload_build is not None and getattr(_upload_build,'FROZEN_APP',False) else 'mutable')
+"""
 
 
 def release_bridge(url):
@@ -44,7 +61,7 @@ def mpremote(port, *arguments):
                    check=True, cwd=ROOT)
 
 
-def backup(port, restart=True):
+def backup(port, restart=True, require_mutable=False):
     from mpremote.transport_serial import SerialTransport
 
     target = ROOT / ".device-backups" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -56,6 +73,15 @@ def backup(port, restart=True):
     try:
         transport.enter_raw_repl(soft_reset=False)
         entered = True
+        if require_mutable:
+            # Only the tiny build marker is imported. Frozen-first boot paths
+            # would silently ignore filesystem app updates; reject before even
+            # reading device configuration or preparing any staged writes.
+            mode = transport.exec(FROZEN_CHECK).strip()
+            if mode == b"frozen":
+                raise RuntimeError(FROZEN_UPLOAD_ERROR)
+            if mode != b"mutable":
+                raise RuntimeError("Could not verify mutable firmware; no files were uploaded")
         transport.exec("import os, ubinascii, uhashlib, gc; gc.collect()")
 
         def copy_directory(remote, local):
@@ -122,7 +148,7 @@ def validate_mpy(path):
         raise RuntimeError("Expected MicroPython v6 pure bytecode with 31-bit small ints")
 
 
-def precompile_firmware(firmware=FIRMWARE, build_root=None):
+def precompile_firmware(firmware=FIRMWARE, build_root=None, mpy_version=DEFAULT_MPY_VERSION):
     """Compile with pinned uv tooling and return {remote_path: local_path}.
 
     No native architecture or optimization flags are passed. Source filenames
@@ -130,14 +156,21 @@ def precompile_firmware(firmware=FIRMWARE, build_root=None):
     boot.py is also compilation-checked but remains a source entrypoint: the
     ESP32 startup sequence opens that filename literally, not boot.mpy.
     """
+    if not isinstance(mpy_version, str) or mpy_version not in MPY_COMPILERS:
+        raise RuntimeError("Unsupported mpy-cross version")
+    target_version, mpy_format = MPY_COMPILERS[mpy_version]
+    package = "mpy-cross==" + mpy_version
+    command = ("uv", "tool", "run", "--from", package, "mpy-cross")
     firmware = Path(firmware).resolve()
     sources = firmware_sources(firmware)
     if not sources:
         raise RuntimeError("No firmware Python sources found")
-    version = subprocess.run([*MPY_CROSS_COMMAND, "--version"], check=True,
+    version = subprocess.run([*command, "--version"], check=True,
                              capture_output=True, text=True, cwd=firmware)
-    if not re.search(r"\bMicroPython v1\.22\.2\b.*\bmpy v6\.2\b", version.stdout):
-        raise RuntimeError("Expected mpy-cross 1.22.2 emitting mpy v6.2")
+    expected = (r"\bMicroPython v" + re.escape(target_version) +
+                r"(?:\s|$)[^\r\n]*\bmpy v" + re.escape(mpy_format) + r"(?:\s|$)")
+    if not re.search(expected, version.stdout):
+        raise RuntimeError("Expected mpy-cross " + mpy_version + " emitting mpy v" + mpy_format)
     cache = Path(build_root) if build_root is not None else ROOT / ".device-backups" / "build-mpy"
     target = cache.resolve() / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     target.mkdir(parents=True)
@@ -147,7 +180,7 @@ def precompile_firmware(firmware=FIRMWARE, build_root=None):
         compiled_relative = str(Path(relative).with_suffix(".mpy")).replace("\\", "/")
         output = target / compiled_relative
         output.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run([*MPY_CROSS_COMMAND, "-o", str(output), "-s", relative, relative],
+        subprocess.run([*command, "-o", str(output), "-s", relative, relative],
                        check=True, capture_output=True, text=True, cwd=firmware)
         validate_mpy(output)
         remote = relative if relative == "boot.py" else compiled_relative
@@ -160,7 +193,8 @@ def precompile_firmware(firmware=FIRMWARE, build_root=None):
                               "artifactSha256": hashlib.sha256(output.read_bytes()).hexdigest(),
                               "uploadPath": remote}
     (target / "build-manifest.json").write_text(json.dumps({
-        "compiler": MPY_CROSS_PACKAGE, "format": "6.2", "header": list(MPY_HEADER),
+        "compiler": package, "micropython": target_version, "format": mpy_format,
+        "header": list(MPY_HEADER),
         "native": False, "sources": manifest,
     }, indent=2) + "\n", encoding="utf-8")
     return mapping
@@ -232,9 +266,9 @@ def _has_source_shadows(backup_directory, firmware=FIRMWARE):
                for path in firmware_sources(firmware) if path.relative_to(firmware).as_posix() != "boot.py")
 
 
-def upload(port, precompile=False):
-    compiled = precompile_firmware() if precompile else None
-    snapshot = backup(port, restart=False)
+def upload(port, precompile=False, mpy_version=DEFAULT_MPY_VERSION):
+    compiled = precompile_firmware(mpy_version=mpy_version) if precompile else None
+    snapshot = backup(port, restart=False, require_mutable=True)
     try:
         if not precompile and _has_source_shadows(snapshot):
             raise RuntimeError("Device has precompiled modules; use upload --precompile to avoid source shadowing")
@@ -249,10 +283,14 @@ def main():
     parser.add_argument("--port", default="COM3")
     parser.add_argument("--bridge", default="http://127.0.0.1:8787")
     parser.add_argument("--precompile", action="store_true",
-                        help="upload bytecode built with pinned mpy-cross 1.22.2; keep boot.py as source")
+                        help="upload bytecode built with an isolated pinned compiler; keep boot.py as source")
+    parser.add_argument("--mpy-version", choices=tuple(MPY_COMPILERS),
+                        help="compiler package version for --precompile (default: " + DEFAULT_MPY_VERSION + ")")
     args = parser.parse_args()
     if args.precompile and args.action != "upload":
         parser.error("--precompile is only available for upload")
+    if args.mpy_version is not None and not (args.action == "upload" and args.precompile):
+        parser.error("--mpy-version requires upload --precompile")
     if args.action == "status":
         with urlopen(args.bridge.rstrip("/") + "/api/state", timeout=3) as response:
             state = json.load(response)
@@ -262,7 +300,8 @@ def main():
     if args.action == "backup":
         backup(args.port)
     else:
-        upload(args.port, precompile=args.precompile)
+        upload(args.port, precompile=args.precompile,
+               mpy_version=args.mpy_version or DEFAULT_MPY_VERSION)
 
 
 if __name__ == "__main__":

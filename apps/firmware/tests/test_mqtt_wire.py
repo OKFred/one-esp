@@ -8,7 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from components.mqtt_wire import (MAX_PACKET_BYTES, MAX_PACKETS_PER_FEED,
                                   PacketReader, connect_packet, disconnect_packet,
-                                  ping_packet, publish_packet)
+                                  ping_packet, publish_packet, subscribe_packet,
+                                  puback_packet, decode_publish)
 
 
 class MqttWireTests(unittest.TestCase):
@@ -78,6 +79,34 @@ class MqttWireTests(unittest.TestCase):
     def test_ping_and_disconnect_have_no_payload(self):
         self.assertEqual(ping_packet(), b'\xc0\x00')
         self.assertEqual(disconnect_packet(), b'\xe0\x00')
+
+    def test_exact_subscription_and_incoming_publish_vectors(self):
+        self.assertEqual(subscribe_packet('a/b', 0x1234),
+                         b'\x82\x08\x12\x34\x00\x03a/b\x01')
+        self.assertEqual(puback_packet(0x1234), b'\x40\x02\x12\x34')
+        packet = publish_packet('a/b', b'{"v":1}', 17)
+        reader = PacketReader(allow_commands=True)
+        result = []
+        for byte in packet + b'\x90\x03\x12\x34\x01':
+            result.extend(reader.feed(bytes((byte,))))
+        self.assertEqual(result[-1], (9, 0, b'\x12\x34\x01'))
+        self.assertEqual(decode_publish(result[0][1], result[0][2]),
+                         ('a/b', b'{"v":1}', 17, 1, False))
+        self.assertEqual(decode_publish(1, b'\x00\x03a/b{}'), ('a/b', b'{}', None, 0, True))
+        for topic in ('a/#', 'a/+', ''):
+            with self.assertRaises(ValueError):
+                subscribe_packet(topic, 1)
+
+    def test_command_parser_is_opt_in_and_rejects_malformed_control_packets(self):
+        packet = publish_packet('a/b', b'{}', 1)
+        with self.assertRaises(ValueError):
+            PacketReader().feed(packet)
+        for malformed in (b'\x90\x02\x00\x01', b'\x90\x03\x00\x00\x01',
+                          b'\x90\x03\x00\x01\x03', b'\x34\x00', b'\x38\x00',
+                          b'\x32\x04\x00\x01a\x00', b'\x30\x03\x00\x00x',
+                          b'\x30\x03\x00\x01\xff'):
+            with self.subTest(packet=malformed), self.assertRaises(ValueError):
+                PacketReader(allow_commands=True).feed(malformed)
 
     def test_reader_handles_fragmentation_and_coalesced_packets(self):
         reader = PacketReader()

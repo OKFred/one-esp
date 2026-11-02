@@ -10,6 +10,8 @@ const serialMock = vi.hoisted(() => ({
   deferClose: false,
   finishClose: undefined as (() => void) | undefined,
   writeSink: undefined as ((chunk: Buffer) => void) | undefined,
+  openOptions: null as unknown,
+  setFlags: null as unknown,
   chunks: [] as Buffer[],
   timeline: [] as string[],
   ports: [] as { emit(name: string): boolean }[],
@@ -20,8 +22,9 @@ vi.mock('serialport', async () => {
   return {
     SerialPort: class extends EventEmitter {
       isOpen = false;
-      constructor() {
+      constructor(options: unknown) {
         super();
+        serialMock.openOptions = options;
         serialMock.ports.push(this);
       }
       open(callback: (error: Error | null) => void) {
@@ -29,11 +32,13 @@ vi.mock('serialport', async () => {
         this.isOpen = !serialMock.openError;
         callback(serialMock.openError);
       }
-      set(_flags: unknown, callback: (error: Error | null) => void) {
+      set(flags: unknown, callback: (error: Error | null) => void) {
+        serialMock.setFlags = flags;
         serialMock.timeline.push(`set:${vi.getTimerCount()}`);
         callback(serialMock.setError);
       }
       write(chunk: Buffer, callback: (error: Error | null) => void) {
+        serialMock.timeline.push(`write:${chunk.toString('hex')}`);
         serialMock.chunks.push(Buffer.from(chunk));
         serialMock.writeSink?.(chunk);
         callback(null);
@@ -60,6 +65,8 @@ beforeEach(() => {
   serialMock.deferClose = false;
   serialMock.finishClose = undefined;
   serialMock.writeSink = undefined;
+  serialMock.openOptions = null;
+  serialMock.setFlags = null;
   serialMock.chunks.length = 0;
   serialMock.timeline.length = 0;
   serialMock.ports.length = 0;
@@ -120,12 +127,14 @@ describe('serial transport compatibility lifecycle', () => {
     );
   });
 
-  it('starts before native open/set and keeps the timer until close settles', async () => {
+  it('opens with DTR disabled before resynchronizing input and keeps the timer until close settles', async () => {
     const transport = createSerialTransport('virtual-port');
+    expect(serialMock.openOptions).toMatchObject({ autoOpen: false, hupcl: false, rtscts: false });
     expect(vi.getTimerCount()).toBe(0);
     await open(transport);
-    expect(serialMock.timeline).toEqual(['open:1', 'set:1']);
-    expect(Buffer.concat(serialMock.chunks).toString()).toBe('\n');
+    expect(serialMock.setFlags).toEqual({ dtr: false, rts: false });
+    expect(serialMock.timeline).toEqual(['open:1', 'set:1', 'write:0a']);
+    expect(Buffer.concat(serialMock.chunks)).toEqual(Buffer.from([0x0a]));
     expect(vi.getTimerCount()).toBe(1);
     serialMock.deferClose = true;
     const closed = transport.close();

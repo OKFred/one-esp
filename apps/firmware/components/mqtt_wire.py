@@ -1,6 +1,6 @@
-"""Small MQTT 3.1.1 publisher codec, usable on MicroPython without dependencies.
+"""Bounded MQTT 3.1.1 codec, usable on MicroPython without dependencies.
 
-Only the server packets needed by a publish-only QoS 1 client are accepted.
+Command subscriptions are explicitly enabled; publisher-only callers stay strict.
 Protocol errors contain fixed descriptions, never field values or payloads.
 """
 
@@ -112,6 +112,44 @@ def ping_packet():
     return b'\xc0\x00'
 
 
+def subscribe_packet(topic, packet_id):
+    """Subscribe to one exact topic at QoS 1, without wildcard authority."""
+    _integer(packet_id, 1, 65535, 'Invalid MQTT packet identifier')
+    name = _text(topic)
+    if '+' in topic or '#' in topic:
+        raise ValueError('MQTT command topic cannot contain wildcards')
+    return _frame(0x82, _u16(packet_id) + _u16(len(name)) + name + b'\x01')
+
+
+def puback_packet(packet_id):
+    _integer(packet_id, 1, 65535, 'Invalid MQTT packet identifier')
+    return b'\x40\x02' + _u16(packet_id)
+
+
+def decode_publish(flags, body):
+    """Validate an incoming QoS 0/1 PUBLISH; keep payload bytes undecoded."""
+    qos = (flags >> 1) & 3
+    if qos not in (0, 1) or (qos == 0 and flags & 8) or len(body) < 2:
+        raise ValueError('Invalid MQTT command PUBLISH')
+    length = (body[0] << 8) | body[1]
+    end = 2 + length
+    if not length or end + (2 if qos else 0) > len(body):
+        raise ValueError('Invalid MQTT command topic')
+    try:
+        topic = str(body[2:end], 'utf-8')
+    except (UnicodeError, ValueError):
+        raise ValueError('Invalid MQTT command topic')
+    _text(topic)
+    if '+' in topic or '#' in topic:
+        raise ValueError('Invalid MQTT command topic')
+    packet_id = None
+    if qos:
+        packet_id = (body[end] << 8) | body[end + 1]
+        _integer(packet_id, 1, 65535, 'Invalid MQTT packet identifier')
+        end += 2
+    return topic, body[end:], packet_id, qos, bool(flags & 1)
+
+
 def disconnect_packet():
     return b'\xe0\x00'
 
@@ -124,8 +162,11 @@ class PacketReader:
     error clears all partial state; callers should close the connection.
     """
 
-    def __init__(self, max_packet_bytes=MAX_PACKET_BYTES):
+    def __init__(self, max_packet_bytes=MAX_PACKET_BYTES, allow_commands=False):
         self._limit = _integer(max_packet_bytes, 2, MAX_PACKET_BYTES, 'Invalid MQTT packet limit')
+        if type(allow_commands) is not bool:
+            raise ValueError('Invalid MQTT command parser flag')
+        self._allow_commands = allow_commands
         self.reset()
 
     def reset(self):
@@ -145,6 +186,11 @@ class PacketReader:
                 raise ValueError('MQTT connection refused')
         elif packet_type == 4 and not (body[0] or body[1]):
             raise ValueError('Invalid MQTT PUBACK identifier')
+        elif packet_type == 9:
+            if not (body[0] or body[1]) or body[2] not in (0, 1, 2, 128):
+                raise ValueError('Invalid MQTT SUBACK')
+        elif packet_type == 3:
+            decode_publish(self._header & 15, body)
         packet = (packet_type, self._header & 15, body)
         self.reset()
         return packet
@@ -156,7 +202,8 @@ class PacketReader:
                 raise ValueError('MQTT input must be bytes')
             for byte in data:
                 if self._header is None:
-                    if byte not in (0x20, 0x40, 0xD0):
+                    if (byte not in (0x20, 0x40, 0xD0) and
+                            not (self._allow_commands and byte in (0x30, 0x31, 0x32, 0x33, 0x3A, 0x3B, 0x90))):
                         raise ValueError('Unexpected MQTT packet header')
                     self._header = byte
                 elif self._length is None:
@@ -171,8 +218,10 @@ class PacketReader:
                     if self._length_digits > 1 and byte == 0:
                         raise ValueError('Invalid MQTT remaining length')
                     self._length = self._length_value
-                    expected = 0 if self._header == 0xD0 else 2
-                    if self._length != expected:
+                    packet_type = self._header >> 4
+                    expected = 0 if self._header == 0xD0 else (3 if packet_type == 9 else 2)
+                    if ((packet_type != 3 and self._length != expected) or
+                            (packet_type == 3 and self._length < 3)):
                         raise ValueError('Invalid MQTT packet length')
                     if not self._length:
                         packets.append(self._complete())

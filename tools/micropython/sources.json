@@ -1,0 +1,337 @@
+{
+  "profile": "one-esp-wroom32-frozen-static-tls",
+  "micropython": {
+    "url": "https://github.com/micropython/micropython.git",
+    "tag": "v1.29.0",
+    "commit": "0fd6c573ea815774668bbb16b8e197c8822368b2"
+  },
+  "espIdf": {
+    "url": "https://github.com/espressif/esp-idf.git",
+    "tag": "v5.5.2",
+    "commit": "30aaf64524299d3bde422ca9a2848090d1bc5d0f"
+  },
+  "mpyCross": {
+    "package": "mpy-cross==1.29.0.post2",
+    "implementation": "MicroPython v1.29.0",
+    "format": "6.3"
+  },
+  "referenceNativeWindows": {
+    "python": "3.12.12",
+    "idfTools": {
+      "xtensa-esp-elf": "esp-14.2.0_20251107",
+      "esp32ulp-elf": "2.38_20240113",
+      "cmake": "3.30.2",
+      "ninja": "1.12.1"
+    },
+    "applicationBytes": 1821008,
+    "applicationSha256": "da929cd074806908aa33cb306b1187f63f5de726bc2371d0b183f26954b53ae9",
+    "mergedImageBytes": 1882448,
+    "mergedImageSha256": "aed42859a6e61ea6b0fe65dced84b4bdffbcb3d60a0259459fa5b2207af954c6",
+    "exactPrivateManifestSha256": "42f8ac9464d2f6fdc1ae35897640dd074cf8e781d5091a99a355050179e69a12",
+    "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+    "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+    "evidenceSha256": "7c61bc96e04e6a07b28d0f26a30b46438f7c1aa37e819f9928a2e6ebe5674e2c",
+    "elfSha256": "ebf81abfc03c7c9659e57a53f57d082b4252c22e659f4aca6cf7653b27dc6bc3",
+    "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+    "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+    "buildMethod": "incremental UART-turnaround repair build after preserving the previous boundary-validation image and its limited hardware-check record"
+  },
+  "moduleCounts": {
+    "application": 22,
+    "buildMetadata": 1
+  },
+  "factoryPartition": {
+    "offset": 65536,
+    "bytes": 2031616
+  },
+  "parameterizedRecipeValidation": {
+    "fullBuildExecuted": true,
+    "linuxExecuted": false,
+    "upstreamPatchApplyCheck": true,
+    "manifestApplicationModules": 22,
+    "manifestBuildMetadataModules": 1,
+    "manifestDefaultStdlibModules": 28,
+    "manifestTotalModules": 51,
+    "sourceHashesMatchReference": true,
+    "staticProfileSemanticManifestCheck": true,
+    "staticSdkconfigMatchesPreviousBuild": true,
+    "nativeWindowsArgumentFilesUsed": true,
+    "finalSourceRebuiltIncrementally": true,
+    "qstrHeaderByteComparison": "not repeated for this revision; historical dynamic comparison retained in referenceHistory",
+    "relocatedByteIdenticalBuildClaimed": false
+  },
+  "referenceHistory": [
+    {
+      "profile": "one-esp-wroom32-frozen-dynamic-tls",
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1796864,
+        "applicationSha256": "b997b51204a4a1209147a5348c421a6e7a55a85c2e15d8cf0593915bc99e6359",
+        "mergedImageBytes": 1858304,
+        "mergedImageSha256": "e004f63daa8a1c93eec3eac19dbde2dbdaf95ecb3d5c14cd3fa2d82bf8c47e66",
+        "exactPrivateManifestSha256": "9016d9644a72ea61ebda06c736ef0865c43cd5644c46b6e237696f58ff71e416",
+        "exactPrivateHostPatchSha256": "143ded499b3b5b052980a069e8d1271517eed5057bfbf72f1df076a6fca11241",
+        "sdkconfigSha256": "c81a4e8e805f26ada8db38d5d1146e69d8ddae961ac72857f3259d61db804687",
+        "evidenceSha256": "989eaf2e60003abf53f43eb1452666d55c724a756d562ff897f234dfe984af4f"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": false,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 20,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "sourceHashesMatchReference": true,
+        "isolatedCmakeArgumentGeneration": true,
+        "longLiteralArguments": true,
+        "qstrHeaderMatchesReferenceBytes": true,
+        "qstrHeaderSha256": "3ca50d82c1279bfe2241a72685caafd81e7177fb94698813492bd4bd25df2ede"
+      },
+      "runtimeAcceptance": "failed: native watchdog resets and a traced StoreProhibited TLS-read panic",
+      "history": "profile-history.md"
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "initial static TLS control before task OLED layout",
+      "referenceAppSourcesSha256": "46dad830e580cb5b6601351d7bcff71d3dac4490b27c0182a09772dcaaef7d60",
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1794192,
+        "applicationSha256": "e7fbb874d19dafd3377e5195e7e4726c2ea4b12a0c4c339985adfe235c24f930",
+        "mergedImageBytes": 1855632,
+        "mergedImageSha256": "d63b29560d69cead0c4824aab24f61cc2c938045c021fd7dabed1994b1f3f371",
+        "exactPrivateManifestSha256": "57b210cf9a292b107129c67752f673d59544e8ac4f43d02bdf01465613c13bc4",
+        "exactPrivateHostPatchSha256": "143ded499b3b5b052980a069e8d1271517eed5057bfbf72f1df076a6fca11241",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "b95e8395a3e5290f11e6ea6d331ba08379697eaa326eaa2e5a5f87c5d3b8315c",
+        "elfSha256": "e30279a2abaec2e98449996bef8f9e63b5748ddc5dfa757dd7a8e5edd5ccff91",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": false,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 20,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "sourceHashesMatchReference": true,
+        "isolatedCmakeArgumentGeneration": true,
+        "longLiteralArguments": true,
+        "qstrHeaderByteComparison": "not repeated for static profile; historical dynamic comparison retained in referenceHistory",
+        "staticProfileSemanticManifestCheck": true
+      }
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "accepted task-oriented OLED before MQTT settings, RS485 RTU and remote configuration",
+      "referenceAppSourcesSha256": "37acc8856f8085f2b06cb91149b611f3cab6d0e9daf6073c37b7cee322aecb04",
+      "moduleCounts": {
+        "application": 20,
+        "buildMetadata": 1
+      },
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1796096,
+        "applicationSha256": "6661e86c92baa695317ffb6f366f95c12ca02cd3a866eaadd4cd5eaad6c5d5ff",
+        "mergedImageBytes": 1857536,
+        "mergedImageSha256": "3a0226134b83d4be71e54318c804979d427c7057de187544c66f47245aaaf092",
+        "exactPrivateManifestSha256": "5c9d942a9cd2fddc5081f92ef31d3f7f354684d01d48d9ffe89124a58b6fd756",
+        "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "69036997537031bbd1f25b8996f4fcf4d581806467cd25e70e7bdcc3b975eb44",
+        "elfSha256": "c73c10ab50f8faf5a1af3be82f27bfe989eab9878e10e87991b18fc0c4b8b6e1",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+        "buildMethod": "incremental final application rebuild after a separately archived full parameterized Windows build"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": true,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 20,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "sourceHashesMatchReference": true,
+        "staticProfileSemanticManifestCheck": true,
+        "staticSdkconfigMatchesInitialControl": true,
+        "nativeWindowsArgumentFilesUsed": true,
+        "finalSourceRebuiltIncrementally": true,
+        "qstrHeaderByteComparison": "not repeated for this source revision; historical dynamic comparison retained in referenceHistory",
+        "relocatedByteIdenticalBuildClaimed": false
+      }
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "offline-built MQTT settings and RS485 RTU feature before daily counters",
+      "hardwareAccepted": false,
+      "referenceAppSourcesSha256": "b792cd3ef3d590b306f52a778640b8748c4c9652d23ed9449a538ec1dfc08132",
+      "moduleCounts": {
+        "application": 22,
+        "buildMetadata": 1
+      },
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1819296,
+        "applicationSha256": "865e05f27d73210306de5eaef4f9569dfb3ddb53b1252097c7b872c5e65ff739",
+        "mergedImageBytes": 1880736,
+        "mergedImageSha256": "6dc13597e05d80d8f63fa27712dff608d793fae85dc02f1ba785a68b1245241e",
+        "exactPrivateManifestSha256": "42f8ac9464d2f6fdc1ae35897640dd074cf8e781d5091a99a355050179e69a12",
+        "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "e032edfe542485aa40ffce4d47d214316dd32da514a5838837828982e90ad893",
+        "elfSha256": "9cc3a3c8a5beabde0fa4dff69c2c31f2ad64044431239d95d5ff965ad42c94bb",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+        "buildMethod": "incremental 22-module feature build after canonical preservation of the accepted OLED build and earlier full parameterized Windows build"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": true,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 22,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "manifestTotalModules": 51,
+        "sourceHashesMatchReference": true,
+        "staticProfileSemanticManifestCheck": true,
+        "staticSdkconfigMatchesAcceptedOled": true,
+        "nativeWindowsArgumentFilesUsed": true,
+        "finalSourceRebuiltIncrementally": true,
+        "qstrHeaderByteComparison": "not repeated for this feature revision; historical dynamic comparison retained in referenceHistory",
+        "relocatedByteIdenticalBuildClaimed": false
+      }
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "offline-built daily MQTT counters and compact OLED numbers before MQTT settings boundary validation",
+      "hardwareAccepted": false,
+      "referenceAppSourcesSha256": "890e64cd00c60ce11ded5de2f9fd25b3acadfe2759d6f0b773a1f173f396bd12",
+      "moduleCounts": {
+        "application": 22,
+        "buildMetadata": 1
+      },
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1820240,
+        "applicationSha256": "eeb71eed6fc42f262392435e3063ac98aa4b5eb21880b959e377130924bf44bc",
+        "mergedImageBytes": 1881680,
+        "mergedImageSha256": "bc47273d3b94ec45d56d3deabe0be4e00a192df8eed9dcd82501ef8f378a40c5",
+        "exactPrivateManifestSha256": "42f8ac9464d2f6fdc1ae35897640dd074cf8e781d5091a99a355050179e69a12",
+        "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "3fc8488c43c4956c7256866d6e8fc3cf2be0a9aff0e3bca6d850d7b8395088c7",
+        "elfSha256": "779188c7eff7eb2d63232bc1f71ef581428f4cbef94fabe30fcf14fd935d7b90",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+        "buildMethod": "incremental daily MQTT counter and compact OLED build after preserving the previous offline-built settings image and earlier canonical artifacts"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": true,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 22,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "manifestTotalModules": 51,
+        "sourceHashesMatchReference": true,
+        "staticProfileSemanticManifestCheck": true,
+        "staticSdkconfigMatchesPreviousBuild": true,
+        "nativeWindowsArgumentFilesUsed": true,
+        "finalSourceRebuiltIncrementally": true,
+        "qstrHeaderByteComparison": "not repeated for this revision; historical dynamic comparison retained in referenceHistory",
+        "relocatedByteIdenticalBuildClaimed": false
+      }
+    },
+    {
+      "profile": "one-esp-wroom32-frozen-static-tls",
+      "revision": "MQTT settings boundary validation before UART turnaround fix",
+      "flashed": true,
+      "hardwareAccepted": false,
+      "runtimeAcceptance": "limited application digest, boot/private-file and MQTT setup/subscription checks; first RTU business trial timed out and rolled back, UART0 ACK corruption remained; separate RAM adapter experiments excluded",
+      "referenceAppSourcesSha256": "b12d6fc078d8f49d7abdef35fe112a5b80c7db0e441519fa00fa9b7df91ba2e7",
+      "moduleCounts": {
+        "application": 22,
+        "buildMetadata": 1
+      },
+      "referenceNativeWindows": {
+        "python": "3.12.12",
+        "idfTools": {
+          "xtensa-esp-elf": "esp-14.2.0_20251107",
+          "esp32ulp-elf": "2.38_20240113",
+          "cmake": "3.30.2",
+          "ninja": "1.12.1"
+        },
+        "applicationBytes": 1820464,
+        "applicationSha256": "946ce4301bbc953b8b75a4dbf9c6ad4ee4b1d9ddce4af892a3015711ce50fed4",
+        "mergedImageBytes": 1881904,
+        "mergedImageSha256": "6557a4e98a064e91dd03cff1e71ca5f02b22e2b1966b8c1dbec2cc94bdbb4609",
+        "exactPrivateManifestSha256": "42f8ac9464d2f6fdc1ae35897640dd074cf8e781d5091a99a355050179e69a12",
+        "exactPrivateHostPatchSha256": "62947b0c7af2323ced9ac3ae72fb787befc02605765196ee0084f17a22f80140",
+        "sdkconfigSha256": "6853c590eb22f68b38ab8019006f517fab370eba2f6ab8a13976ad7faa46ae4a",
+        "evidenceSha256": "a5bbbc0e50f8fa909f93413259191bc9b3d31bc96c2f220b7cead189a024cb5f",
+        "elfSha256": "b847ece46ec5019207831725aa2468d84894b64584098f240675f2ccb15eb7f4",
+        "partitionTableSha256": "520c18ca0bda73aed288d427d260ab051d71219f605707350e6c42401f4836fc",
+        "qstrHeaderSha256": "17f87f93c61d0846b44bd99c8d3b661e7addec779c1ac9b4befb45c00837f851",
+        "buildMethod": "incremental MQTT settings boundary-validation build after preserving the previous offline-built daily-counter image and earlier canonical artifacts"
+      },
+      "parameterizedRecipeValidation": {
+        "fullBuildExecuted": true,
+        "linuxExecuted": false,
+        "upstreamPatchApplyCheck": true,
+        "manifestApplicationModules": 22,
+        "manifestBuildMetadataModules": 1,
+        "manifestDefaultStdlibModules": 28,
+        "manifestTotalModules": 51,
+        "sourceHashesMatchReference": true,
+        "staticProfileSemanticManifestCheck": true,
+        "staticSdkconfigMatchesPreviousBuild": true,
+        "nativeWindowsArgumentFilesUsed": true,
+        "finalSourceRebuiltIncrementally": true,
+        "qstrHeaderByteComparison": "not repeated for this revision; historical dynamic comparison retained in referenceHistory",
+        "relocatedByteIdenticalBuildClaimed": false
+      }
+    }
+  ],
+  "tlsConfiguration": {
+    "dtls": false,
+    "dynamicBuffers": false,
+    "rxContentBytes": 16384,
+    "txContentBytes": 4096,
+    "certificateVerificationRequired": true,
+    "certificateTimeChecks": true
+  },
+  "referenceAppSourcesSha256": "9a1a2a4244ecf4f9cefedc61142c8f8ddb145b0c0b070013f70cd052157d53a7",
+  "hardwareAccepted": false,
+  "runtimeAcceptance": "application-only flashed and digest verified; frozen startup and 16 current private files verified; short normal USB RTU/CRC/PUBACK and wrong-address rollback passed; one invalid UTF-8 line rejected; long-term, server-kick recovery and complete remote-command acceptance pending"
+}

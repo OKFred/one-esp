@@ -18,11 +18,14 @@ MAX_LOG_BYTES = 4096
 MAX_LOGS = 32
 LOG_OVERHEAD_BYTES = 64
 MAX_ACKS = 16
+MAX_ACK_BYTES = 12288
+ACK_OVERHEAD_BYTES = 256
 NORMAL_BYTES_PER_SECOND = 7000
 PRIORITY_BYTES_PER_SECOND = 2048
 SNAPSHOT_PIN_CHUNK = 6
 SNAPSHOT_INTERVAL_MS = 2000
 PROFILES = {'full': (2, 10), 'lite': (1, 1)}
+OLED_ENCODING_BYTES = 48  # Multiple of three: only the final chunk has padding.
 
 
 def _utf8_size(value):
@@ -37,7 +40,8 @@ def _utf8_size(value):
 class DebugService:
     def __init__(self, writer, device_id, boot_id, status_provider, pins,
                  config_store, config_apply=None, restart=None, clock=None,
-                 metrics_provider=None, writer_counts_bytes=None):
+                 metrics_provider=None, writer_counts_bytes=None,
+                 settings_handler=None, secret_provider=None):
         self.writer = writer
         # MicroPython stream.write reports UTF-8 bytes; CPython TextIO reports
         # characters. None-returning writers mean the complete part was written.
@@ -52,6 +56,8 @@ class DebugService:
         self.config = config_store
         self.config_apply = config_apply
         self.restart = restart
+        self.settings_handler = settings_handler
+        self.secret_provider = secret_provider
         self.clock = clock or time
         self._raw_tick = self.clock.ticks_ms()
         self._uptime = 0
@@ -76,6 +82,8 @@ class DebugService:
         self._oled_revision = 0
         self._sent_oled_revision = -1
         self._acks = {}
+        self._ack_sizes = {}
+        self._ack_bytes = 0
         self._ack_order = []
         self._pending_acks = []
         self._line = ''
@@ -99,12 +107,24 @@ class DebugService:
     def _redact(self, message):
         message = str(message)
         candidates = [self.config.values]
+        secrets = []
         if self.config.pending:
             candidates.append(self.config.pending)
         for values in candidates:
             secret = values.get('PASSWORD')
             if secret:
-                message = message.replace(secret, '[redacted]')
+                secrets.append(secret)
+        if self.secret_provider:
+            try:
+                for secret in self.secret_provider():
+                    if isinstance(secret, str) and secret:
+                        secrets.append(secret)
+            except Exception:
+                return 'Secret state unavailable; message suppressed'
+        # A previous credential may be a prefix of its replacement.
+        secrets.sort(key=len, reverse=True)
+        for secret in secrets:
+            message = message.replace(secret, '[redacted]')
         return message
 
     def _write_part(self, part, byte_size=None):
@@ -116,11 +136,17 @@ class DebugService:
             raise OSError('Incomplete debug frame write')
 
     def _oled_wire_data(self, data):
-        # Only encoded while actually sending. The permanent cache is the same
-        # immutable successful raw buffer owned by screen_display, not base64.
-        encoded = binascii.b2a_base64(data['buffer'], newline=False).decode('utf-8') if data['available'] else ''
+        # Keep buffer last so its empty JSON value can be filled by a small
+        # base64 stream. No complete encoded framebuffer or large JSON exists.
         return {'width': 128, 'height': 64, 'format': 'MONO_VLSB',
-                'buffer': encoded, 'available': data['available'], 'text': data['text']}
+                'available': data['available'], 'text': data['text'], 'buffer': ''}
+
+    def _write_slice(self, value, start, end):
+        # Also bound metadata writes when text contains multi-byte characters.
+        while start < end:
+            stop = min(start + 64, end)
+            self._write_part(value[start:stop])
+            start = stop
 
     def emit(self, event_type, data, priority=False):
         now = self.now()
@@ -128,12 +154,29 @@ class DebugService:
             self._budget_started, self._budget_bytes = now, 0
             self._priority_bytes = 0
         try:
-            wire_data = self._oled_wire_data(data) if event_type == 'oled' else data
+            raw = None
+            if event_type == 'oled':
+                available = data.get('available')
+                raw = data.get('buffer') if available is True else b''
+                if (type(available) is not bool or not isinstance(data.get('text'), str) or
+                        not isinstance(raw, bytes) or (available and len(raw) != 1024)):
+                    self.dropped_events += 1
+                    return False
+                wire_data = self._oled_wire_data(data)
+            else:
+                wire_data = data
             event = {'v': 1, 'deviceId': self.device_id, 'bootId': self.boot_id,
                      'seq': self.seq + 1, 'ts': now, 'type': event_type, 'data': wire_data}
             encoded = json.dumps(event)
             del event, wire_data
             body_size = _utf8_size(encoded)
+            marker = None
+            if raw is not None:
+                marker = encoded.rfind('""')
+                if marker < 0:
+                    self.dropped_events += 1
+                    return False
+                body_size += 4 * ((len(raw) + 2) // 3)
             size = len(WIRE_PREFIX) + body_size + 1
             used = self._priority_bytes if priority else self._budget_bytes
             limit = PRIORITY_BYTES_PER_SECOND if priority else NORMAL_BYTES_PER_SECOND
@@ -152,10 +195,17 @@ class DebugService:
                 self._output_dirty = False
             self._output_dirty = True
             self._write_part(WIRE_PREFIX, len(WIRE_PREFIX))
-            self._write_part(encoded, body_size)
+            if raw is None:
+                self._write_part(encoded, body_size)
+            else:
+                self._write_slice(encoded, 0, marker + 1)
+                for start in range(0, len(raw), OLED_ENCODING_BYTES):
+                    chunk = binascii.b2a_base64(raw[start:start + OLED_ENCODING_BYTES], newline=False).decode('ascii')
+                    self._write_part(chunk, len(chunk))
+                self._write_slice(encoded, marker + 1, len(encoded))
             self._write_part('\n', 1)
             self._output_dirty = False
-        except (OSError, MemoryError):
+        except Exception:
             self.dropped_events += 1
             return False
         self.seq += 1
@@ -166,6 +216,8 @@ class DebugService:
                         'config', 'restart', 'gpio-allowlist', 'debug-renew']
         if self.metrics_provider:
             capabilities.append('metrics')
+        if self.settings_handler:
+            capabilities.extend(('mqtt-config', 'sensor-config'))
         return self.emit('hello', {
             'firmware': 'one-esp-debug/1.0', 'board': 'esp32-oled-096',
             'capabilities': capabilities,
@@ -297,11 +349,18 @@ class DebugService:
             data['result'] = result
         if error is not None:
             data['error'] = self._redact(error)
+        size = _utf8_size(json.dumps(data)) + ACK_OVERHEAD_BYTES
+        if size > MAX_ACK_BYTES:
+            data = {'id': command_id, 'ok': False, 'error': 'Command result exceeds acknowledgement budget'}
+            size = _utf8_size(json.dumps(data)) + ACK_OVERHEAD_BYTES
         if command_id not in self._acks:
             self._ack_order.append(command_id)
+        self._ack_bytes += size - self._ack_sizes.get(command_id, 0)
+        self._ack_sizes[command_id] = size
         self._acks[command_id] = data
-        while len(self._ack_order) > MAX_ACKS:
+        while len(self._ack_order) > MAX_ACKS or self._ack_bytes > MAX_ACK_BYTES:
             evicted = self._ack_order.pop(0)
+            self._ack_bytes -= self._ack_sizes.pop(evicted)
             del self._acks[evicted]
             if evicted in self._pending_acks:
                 self._pending_acks.remove(evicted)
@@ -339,15 +398,24 @@ class DebugService:
             args = command.get('args', {})
             if type(args) is not dict:
                 raise ValueError('Invalid command arguments')
-            if name not in ('debug.set', 'snapshot.get', 'config.get'):
+            business = name in ('mqtt.config.get', 'mqtt.config.set', 'sensor.config.get', 'sensor.config.set')
+            if name not in ('debug.set', 'snapshot.get', 'config.get', 'mqtt.config.get', 'sensor.config.get'):
                 if command.get('bootId') != self.boot_id:
                     raise ValueError('Device rebooted; refresh the snapshot')
-                if not self.enabled or self.now() >= self.expires_at:
+                if not business and (not self.enabled or self.now() >= self.expires_at):
                     self.stop()
                     raise ValueError('Enable a debug session first')
             elif 'bootId' in command and command['bootId'] != self.boot_id:
                 raise ValueError('Device rebooted; refresh the snapshot')
-            if name == 'debug.set':
+            if business:
+                if self.settings_handler is None:
+                    raise ValueError('Business settings unavailable')
+                def finish(response):
+                    self.acknowledge(command_id, response.get('ok') is True,
+                                     response.get('result'), response.get('error'))
+                response = self.settings_handler(name, args, command_id, finish)
+                finish(response)
+            elif name == 'debug.set':
                 if type(args.get('enabled')) is not bool:
                     raise ValueError('enabled must be a boolean')
                 if args['enabled']:
@@ -422,7 +490,7 @@ class DebugService:
                 else:
                     self._line += char
 
-    def tick(self):
+    def tick(self, quiet=False):
         now = self.now()
         # Safety expiry precedes all transmission, including a queued ACK.
         if self.enabled and now >= self.expires_at:
@@ -432,6 +500,10 @@ class DebugService:
         if self._debug_pending and self.emit('debug', self.debug_state()):
             self._debug_pending = False
             self._last_debug = now
+            return
+        if quiet:
+            # TLS construction gets memory priority. Commands/lease expiry and
+            # their small ACKs continue; queued snapshots resume afterwards.
             return
         if self._snapshot_tick(now):
             return

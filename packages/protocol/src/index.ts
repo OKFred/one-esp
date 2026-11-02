@@ -56,6 +56,88 @@ export const MetricsSchema = z.object({
 });
 export type MetricsData = z.infer<typeof MetricsSchema>;
 
+function modbusCrc16(frame: number[]): number {
+  let crc = 0xffff;
+  for (const byte of frame) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc & 1) === 1 ? (crc >>> 1) ^ 0xa001 : crc >>> 1;
+  }
+  return crc;
+}
+
+export const EnvironmentSchema = z
+  .object({
+    enabled: z.boolean(),
+    phase: z.string().min(1).max(40),
+    samples: bytes,
+    failures: bytes,
+    lastError: z.string().max(80).nullable(),
+    readAtMs: bytes.nullable(),
+    ageMs: bytes.nullable(),
+    stale: z.boolean(),
+    intervalMs: z.number().int().positive(),
+    nextReadInMs: bytes,
+    temperatureC: z.number().min(-40).max(125).nullable(),
+    relativeHumidityPercent: z.number().min(0).max(100).nullable(),
+    protocol: z.enum(['ascii_read', 'sht20_rtu']).optional(),
+    integrity: z.enum(['none', 'format_only', 'crc_verified']).optional(),
+    crcFailures: bytes.optional(),
+    lastFrameHex: z
+      .string()
+      .max(256)
+      .regex(/^[0-9a-f]*$/i)
+      .nullable()
+      .optional(),
+  })
+  .strict()
+  .superRefine((environment, ctx) => {
+    if (environment.protocol !== 'sht20_rtu' || environment.integrity !== 'crc_verified') return;
+    const hex = environment.lastFrameHex;
+    if (typeof hex !== 'string' || hex.length !== 18) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['lastFrameHex'],
+        message: 'Verified RTU frame is required',
+      });
+      return;
+    }
+    const frame = Array.from({ length: 9 }, (_, index) =>
+      Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+    );
+    if (
+      frame[0]! < 1 ||
+      frame[0]! > 247 ||
+      frame[1] !== 4 ||
+      frame[2] !== 4 ||
+      modbusCrc16(frame.slice(0, 7)) !== (frame[7]! | (frame[8]! << 8))
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['lastFrameHex'],
+        message: 'Invalid verified RTU frame',
+      });
+      return;
+    }
+    const rawTemperature = (frame[3]! << 8) | frame[4]!;
+    const temperature = (rawTemperature >= 0x8000 ? rawTemperature - 0x10000 : rawTemperature) / 10;
+    const humidity = ((frame[5]! << 8) | frame[6]!) / 10;
+    // ESP32 float32 JSON can differ by a few microdegrees. This is only a
+    // serialization tolerance, not the sensor's accuracy specification.
+    for (const [key, expected] of [
+      ['temperatureC', temperature],
+      ['relativeHumidityPercent', humidity],
+    ] as const) {
+      const value = environment[key];
+      if (value === null || Math.abs(value - expected) > 0.0001)
+        ctx.addIssue({
+          code: 'custom',
+          path: [key],
+          message: 'Reading disagrees with verified RTU frame',
+        });
+    }
+  });
+export type EnvironmentData = z.infer<typeof EnvironmentSchema>;
+
 const eventDataSchemas = {
   hello: z
     .object({ firmware: z.string(), board: z.string(), capabilities: z.array(z.string()) })
@@ -73,7 +155,8 @@ const eventDataSchemas = {
           rssi: z.number().nullable().optional(),
         })
         .passthrough(),
-      sensorEnabled: z.literal(false),
+      sensorEnabled: z.boolean(),
+      environment: EnvironmentSchema.optional(),
     })
     .passthrough(),
   oled: OledFrameSchema,
@@ -124,6 +207,35 @@ export const DeviceEventSchema = z
   });
 export type DeviceEvent = z.infer<typeof DeviceEventSchema>;
 
+export const MqttConfigValuesSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    host: z.string().max(253).optional(),
+    port: z.number().int().min(1).max(65535).optional(),
+    server_hostname: z.string().max(253).optional(),
+    username: z.string().max(256).optional(),
+    password: z.string().max(256).optional(),
+    client_id: z.string().max(128).optional(),
+    site_id: z.string().max(128).optional(),
+    gateway_id: z.string().max(128).optional(),
+    device_id: z.string().max(128).optional(),
+    interval_seconds: z.number().int().min(60).max(86400).optional(),
+    keepalive: z.number().int().min(15).max(300).optional(),
+    commands_enabled: z.boolean().optional(),
+    ca_file: z.string().min(1).max(256).optional(),
+    broker_ip: z.string().max(15).optional(),
+  })
+  .strict();
+export const SensorConfigValuesSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    protocol: z.enum(['ascii_read', 'sht20_rtu']).optional(),
+    interval_seconds: z.number().int().min(5).max(3600).optional(),
+    baudrate: z.union([z.literal(9600), z.literal(14400), z.literal(19200)]).optional(),
+    slave_address: z.number().int().min(1).max(247).optional(),
+    timeout_ms: z.number().int().min(200).max(5000).optional(),
+  })
+  .strict();
 const commandArgs = {
   'debug.renew': z.object({ ttlSeconds: z.number().int().min(1).max(1800) }).strict(),
   'debug.set': z
@@ -138,6 +250,12 @@ const commandArgs = {
   'snapshot.get': z.object({}).strict(),
   'device.restart': z.object({}).strict(),
   'config.get': z.object({}).strict(),
+  'mqtt.config.get': z.object({}).strict(),
+  'sensor.config.get': z.object({}).strict(),
+  'mqtt.config.set': z
+    .object({ revision: bytes, values: MqttConfigValuesSchema.omit({ ca_file: true }) })
+    .strict(),
+  'sensor.config.set': z.object({ revision: bytes, values: SensorConfigValuesSchema }).strict(),
   'config.set': z
     .object({
       revision: z.number().int().nonnegative(),
@@ -169,6 +287,10 @@ export const DeviceCommandSchema = z
       'device.restart',
       'config.get',
       'config.set',
+      'mqtt.config.get',
+      'mqtt.config.set',
+      'sensor.config.get',
+      'sensor.config.set',
       'gpio.write',
     ]),
     bootId: z.string().min(1).max(100).optional(),
@@ -179,7 +301,14 @@ export const DeviceCommandSchema = z
     if (!commandArgs[command.command].safeParse(command.args).success)
       ctx.addIssue({ code: 'custom', path: ['args'], message: 'Invalid command arguments' });
     if (
-      ['debug.renew', 'config.set', 'device.restart', 'gpio.write'].includes(command.command) &&
+      [
+        'debug.renew',
+        'config.set',
+        'mqtt.config.set',
+        'sensor.config.set',
+        'device.restart',
+        'gpio.write',
+      ].includes(command.command) &&
       !command.bootId
     )
       ctx.addIssue({ code: 'custom', path: ['bootId'], message: 'Current bootId is required' });
@@ -202,6 +331,11 @@ export interface BridgeState {
   metrics: DeviceEvent | null;
   logs: DeviceEvent[];
   lastSeen: number | null;
+  serialDiagnostics?: {
+    invalidUtf8Lines: number;
+    invalidProtocolLines: number;
+    oversizedLines: number;
+  };
 }
 export type BridgeMessage =
   | { type: 'snapshot'; data: BridgeState }

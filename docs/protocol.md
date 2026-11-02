@@ -2,6 +2,10 @@
 
 一行 UTF-8 JSON，前缀 `@one-esp `，结尾 LF。普通输出作为日志。最大行长 8192 字节，超长丢弃到下一个 LF 后恢复。完整运行时校验和类型以 `packages/protocol/src/index.ts` 为准。
 
+Bridge 严格解码 UTF-8；任一坏字节或行尾不完整字符会使整行被丢弃，不以 U+FFFD 替换后继续当成合法 JSON。`serialDiagnostics` 在 `/api/state` 和 bridge 快照中提供进程累计的 `invalidUtf8Lines`、`invalidProtocolLines`、`oversizedLines`；日志滚动和设备重连不会清空计数。警告不回传坏行原文。
+
+环境状态声明 `sht20_rtu` / `crc_verified` 时，主机还独立核对 9 字节 FC04 原始回复的地址范围、CRC16 与温湿度数值；仅允许 `1e-4` 的浮点序列化误差，不能用传感器标称精度放宽传输校验。无 CRC 的 ASCII、旧固件及失败时保留旧值的状态保持兼容。此检查不等于整个 USB 消息已有密码学认证或校验和；合法 ASCII 损坏仍有检测边界。
+
 ```json
 {
   "v": 1,

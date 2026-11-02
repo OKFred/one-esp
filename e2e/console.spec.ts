@@ -95,7 +95,7 @@ for (const viewport of [
     await assertNoPageOverflow(page);
     await saveScreenshot(page, viewport.width, 'normal');
 
-    const debugSwitch = page.getByRole('switch', { name: '开启调试采集', exact: true });
+    const debugSwitch = page.getByRole('switch', { name: '实时调试采集', exact: true });
     await expect(debugSwitch).toBeChecked();
     await debugSwitch.click();
     await expect(debugSwitch).not.toBeChecked();
@@ -152,7 +152,7 @@ test('restores a paused LITE session and resumes from the screen action', async 
     .click();
   await page.getByRole('button', { name: '应用参数 / 续期', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('设备已确认操作');
-  const debugSwitch = page.getByRole('switch', { name: '开启调试采集', exact: true });
+  const debugSwitch = page.getByRole('switch', { name: '实时调试采集', exact: true });
   await debugSwitch.click();
   await expect(debugSwitch).not.toBeChecked();
   await page.reload();
@@ -205,7 +205,7 @@ test('renews an active short session by default and respects a manual pause', as
   expect(request.postDataJSON().args).toEqual({ ttlSeconds: 10 });
   expect(request.postDataJSON().bootId).toBeTruthy();
   await expect(page.getByText(/上次成功续期/)).toBeVisible();
-  const debugSwitch = page.getByRole('switch', { name: '开启调试采集', exact: true });
+  const debugSwitch = page.getByRole('switch', { name: '实时调试采集', exact: true });
   await expect(debugSwitch).toBeChecked();
   await debugSwitch.click();
   await expect(debugSwitch).not.toBeChecked();
@@ -270,5 +270,5 @@ test('reconnects a silently stalled websocket and receives a fresh screen', asyn
   blackhole = true;
   await expect.poll(() => connections, { timeout: 25000 }).toBeGreaterThan(1);
   await expect(canvas).not.toHaveAttribute('aria-label', initial!);
-  await expect(page.getByRole('switch', { name: '开启调试采集', exact: true })).toBeChecked();
+  await expect(page.getByRole('switch', { name: '实时调试采集', exact: true })).toBeChecked();
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DeviceCommandSchema,
   DeviceEventSchema,
+  EnvironmentSchema,
   WIRE_PREFIX,
   applyDeviceEvent,
   createBridgeState,
@@ -33,7 +34,178 @@ const metrics = {
   sampleDurationUs: 400,
 };
 
+const environment = {
+  enabled: true,
+  phase: 'idle',
+  samples: 1,
+  failures: 0,
+  lastError: null,
+  readAtMs: 1000,
+  ageMs: 100,
+  stale: false,
+  intervalMs: 60000,
+  nextReadInMs: 59900,
+  temperatureC: 28.8,
+  relativeHumidityPercent: 48.4,
+};
+
 describe('portable device protocol', () => {
+  it('accepts enabled environment status and remains compatible with older firmware', () => {
+    const status = {
+      ...event,
+      type: 'status' as const,
+      data: {
+        uptimeMs: 1100,
+        memFree: 50000,
+        wifi: { connected: true, status: 1010 },
+        sensorEnabled: true,
+        environment,
+      },
+    };
+    expect(DeviceEventSchema.safeParse(status).success).toBe(true);
+    const { environment: _unused, ...legacy } = status.data;
+    expect(
+      DeviceEventSchema.safeParse({ ...status, data: { ...legacy, sensorEnabled: false } }).success,
+    ).toBe(true);
+    expect(parseDeviceLine(WIRE_PREFIX + JSON.stringify(status))?.data.environment).toEqual(
+      environment,
+    );
+  });
+  it('rejects unknown environment keys and unbounded, invalid or non-finite fields', () => {
+    for (const fields of [
+      { privateEndpoint: 'unit-only' },
+      { temperatureC: -40.1 },
+      { temperatureC: 125.1 },
+      { relativeHumidityPercent: -0.1 },
+      { relativeHumidityPercent: 100.1 },
+      { temperatureC: NaN },
+      { temperatureC: Infinity },
+      { relativeHumidityPercent: '48.4' },
+      { samples: 1.5 },
+      { failures: -1 },
+      { readAtMs: -1 },
+      { ageMs: -1 },
+      { intervalMs: 0 },
+      { nextReadInMs: -1 },
+      { stale: 'false' },
+      { phase: 'x'.repeat(41) },
+      { lastError: 'x'.repeat(81) },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...environment, ...fields }).success).toBe(false);
+  });
+  it('accepts missing readings as null and measured boundary values without inventing zero', () => {
+    const missing = {
+      ...environment,
+      samples: 0,
+      readAtMs: null,
+      ageMs: null,
+      temperatureC: null,
+      relativeHumidityPercent: null,
+      stale: true,
+    };
+    expect(EnvironmentSchema.parse(missing)).toEqual(missing);
+    for (const temperatureC of [-40, 125])
+      for (const relativeHumidityPercent of [0, 100])
+        expect(
+          EnvironmentSchema.safeParse({ ...environment, temperatureC, relativeHumidityPercent })
+            .success,
+        ).toBe(true);
+  });
+  it.each([
+    [30.5, 54.6, '010404013102222ace'],
+    [31.5, 50, '010404013b01f48ba2'],
+    [1.5, 50, '010404000f01f4cb90'],
+    [-40, 0, '010404fe700000cbb7'],
+    [125, 100, '01040404e203e85a3c'],
+    [0, 0, '01040400000000fb84'],
+    [-20.5, 54.6, '010404ff330222bae6'],
+  ] as const)(
+    'independently verifies RTU reading %s C / %s RH against its CRC-valid frame',
+    (temperatureC, relativeHumidityPercent, lastFrameHex) => {
+      expect(
+        EnvironmentSchema.safeParse({
+          ...environment,
+          protocol: 'sht20_rtu',
+          integrity: 'crc_verified',
+          temperatureC,
+          relativeHumidityPercent,
+          lastFrameHex,
+        }).success,
+      ).toBe(true);
+    },
+  );
+  it('rejects a valid-looking USB temperature digit loss while the verified RTU frame still says 31.5 C', () => {
+    const verified = {
+      ...environment,
+      protocol: 'sht20_rtu',
+      integrity: 'crc_verified',
+      temperatureC: 31.5,
+      relativeHumidityPercent: 50,
+      lastFrameHex: '010404013b01f48ba2',
+    };
+    expect(EnvironmentSchema.safeParse(verified).success).toBe(true);
+    for (const changed of [
+      { temperatureC: 1.5 },
+      { relativeHumidityPercent: 5 },
+      { temperatureC: null },
+      { relativeHumidityPercent: null },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...verified, ...changed }).success).toBe(false);
+    expect(
+      EnvironmentSchema.safeParse({
+        ...verified,
+        temperatureC: 31.500003,
+        relativeHumidityPercent: 49.999999,
+      }).success,
+    ).toBe(true);
+    expect(EnvironmentSchema.safeParse({ ...verified, temperatureC: 31.5002 }).success).toBe(false);
+  });
+  it('requires the exact successful FC04 frame and rejects every single-bit corruption', () => {
+    const verified = {
+      ...environment,
+      protocol: 'sht20_rtu',
+      integrity: 'crc_verified',
+      temperatureC: 30.5,
+      relativeHumidityPercent: 54.6,
+      lastFrameHex: '010404013102222ace',
+    };
+    const frame = Uint8Array.from(verified.lastFrameHex.match(/../g)!, (byte) =>
+      Number.parseInt(byte, 16),
+    );
+    for (let bit = 0; bit < frame.length * 8; bit += 1) {
+      const corrupt = frame.slice();
+      corrupt[bit >> 3]! ^= 1 << (bit & 7);
+      const lastFrameHex = Array.from(corrupt, (byte) => byte.toString(16).padStart(2, '0')).join(
+        '',
+      );
+      expect(EnvironmentSchema.safeParse({ ...verified, lastFrameHex }).success, 'bit ' + bit).toBe(
+        false,
+      );
+    }
+    for (const lastFrameHex of [
+      undefined,
+      null,
+      '',
+      verified.lastFrameHex.slice(2),
+      verified.lastFrameHex + '00',
+      '01040401310222ce2a',
+    ])
+      expect(EnvironmentSchema.safeParse({ ...verified, lastFrameHex }).success).toBe(false);
+  });
+  it('preserves legacy, ASCII and failed RTU states with old values instead of checking a failed raw frame as successful', () => {
+    for (const changed of [
+      {},
+      { protocol: 'ascii_read', integrity: 'format_only', lastFrameHex: '312e35' },
+      {
+        protocol: 'sht20_rtu',
+        integrity: 'none',
+        lastError: 'crc_error',
+        lastFrameHex: '010404013102222acf',
+      },
+      { protocol: 'sht20_rtu', integrity: 'none', lastError: 'timeout', lastFrameHex: null },
+    ])
+      expect(EnvironmentSchema.safeParse({ ...environment, ...changed }).success).toBe(true);
+  });
   it('does not interpret ordinary boot logs as protocol', () => {
     expect(parseDeviceLine('ets Jul 29 2019')).toBeNull();
     expect(parseDeviceLine(WIRE_PREFIX + JSON.stringify(event))).toEqual(event);

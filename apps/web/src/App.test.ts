@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createBridgeState, DeviceCommandSchema } from '@one-esp/protocol';
 import type { DebugData } from './types';
 import App from './App.vue';
+import DeviceSettings from './components/DeviceSettings.vue';
 
 vi.mock('./composables/useDevice', () => ({ useDevice: () => session }));
 vi.mock('ant-design-vue', async () => {
@@ -20,6 +21,8 @@ vi.mock('ant-design-vue', async () => {
   return {
     ConfigProvider: container('ConfigProvider'),
     Modal: container('Modal'),
+    Tabs: container('Tabs'),
+    TabPane: container('TabPane'),
     Input: container('Input'),
     InputPassword: container('InputPassword'),
     Select: defineComponent({
@@ -129,6 +132,16 @@ beforeEach(() => {
   });
 });
 afterEach(() => wrapper.unmount());
+
+it.each(['mqtt', 'sensor'])(
+  'refreshes actual status after %s settings apply with debug paused',
+  async (domain) => {
+    expect(session.samplingPaused.value).toBe(true);
+    wrapper.findComponent(DeviceSettings).vm.$emit('applied', domain);
+    await nextTick();
+    expect(session.perform).toHaveBeenCalledWith('snapshot.get');
+  },
+);
 
 it('defaults to automatic renewal while allowing it to be disabled independently of collection', async () => {
   const autoRenew = wrapper

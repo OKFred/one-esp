@@ -1,0 +1,56 @@
+diff --git a/py/mkrules.cmake b/py/mkrules.cmake
+--- a/py/mkrules.cmake
++++ b/py/mkrules.cmake
+@@ -122,10 +122,39 @@ add_custom_target(
+ # If any of the dependencies in this rule change then the C-preprocessor step must be run.
+ # It only needs to be passed the list of MICROPY_SOURCE_QSTR files that have changed since
+ # it was last run, but it looks like it's not possible to specify that with cmake.
++# Native Windows cmd.exe cannot execute the full ESP32 qstr argument list.
++# Keep preprocessing semantics while transporting host arguments in files.
++if(CMAKE_HOST_WIN32)
++    if(NOT DEFINED ENV{ONE_ESP_RECIPES} OR "$ENV{ONE_ESP_RECIPES}" STREQUAL "")
++        message(FATAL_ERROR "Set ONE_ESP_RECIPES to tools/micropython")
++    endif()
++    file(TO_CMAKE_PATH "$ENV{ONE_ESP_RECIPES}" ONE_ESP_RECIPES_ROOT)
++    set(ONE_ESP_HOST_TOOLS "${ONE_ESP_RECIPES_ROOT}/host")
++    if(NOT EXISTS "${ONE_ESP_HOST_TOOLS}/run_python_arguments.py" OR NOT EXISTS "${ONE_ESP_HOST_TOOLS}/run_qstr_pipeline.py")
++        message(FATAL_ERROR "ONE_ESP_RECIPES does not contain the native Windows helpers")
++    endif()
++    set(MICROPY_QSTR_CPP_FLAGFILE ${MICROPY_GENHDR_DIR}/qstr_cppflags.rsp)
++    set(MICROPY_QSTR_PP_ARGFILE ${MICROPY_GENHDR_DIR}/qstr_pp.args)
++    string(REPLACE "\"" "\\\"" MICROPY_QSTR_CPP_RSP_FLAGS "${MICROPY_CPP_FLAGS}")
++    file(GENERATE OUTPUT ${MICROPY_QSTR_CPP_FLAGFILE}
++        CONTENT "$<JOIN:${MICROPY_QSTR_CPP_RSP_FLAGS},\n>\n")
++    file(GENERATE OUTPUT ${MICROPY_QSTR_PP_ARGFILE}
++        CONTENT "pp\n${CMAKE_C_COMPILER}\n-E\noutput\n${MICROPY_GENHDR_DIR}/qstr.i.last\ncflags\n@${MICROPY_QSTR_CPP_FLAGFILE}\n-DNO_QSTR\ncxxflags\n@${MICROPY_QSTR_CPP_FLAGFILE}\n-DNO_QSTR\nsources\n$<JOIN:${MICROPY_SOURCE_QSTR},\n>\n")
++    set(MICROPY_QSTR_PP_COMMAND ${Python3_EXECUTABLE} "${ONE_ESP_HOST_TOOLS}/run_python_arguments.py" ${MICROPY_PY_DIR}/makeqstrdefs.py ${MICROPY_QSTR_PP_ARGFILE})
++    set(MICROPY_QSTR_CPP_COMMAND_FLAGS @${MICROPY_QSTR_CPP_FLAGFILE})
++    set(MICROPY_QSTR_PIPELINE_COMMAND ${Python3_EXECUTABLE} "${ONE_ESP_HOST_TOOLS}/run_qstr_pipeline.py" ${CMAKE_C_COMPILER} ${MICROPY_QSTR_CPP_FLAGFILE} ${MICROPY_QSTRDEFS_PREPROCESSED} ${MICROPY_QSTRDEFS_PY} ${MICROPY_QSTRDEFS_PORT} ${MICROPY_QSTRDEFS_COLLECTED})
++else()
++    set(MICROPY_QSTR_PP_COMMAND ${Python3_EXECUTABLE} ${MICROPY_PY_DIR}/makeqstrdefs.py pp ${CMAKE_C_COMPILER} -E output ${MICROPY_GENHDR_DIR}/qstr.i.last cflags ${MICROPY_CPP_FLAGS} -DNO_QSTR cxxflags ${MICROPY_CPP_FLAGS} -DNO_QSTR sources ${MICROPY_SOURCE_QSTR})
++    set(MICROPY_QSTR_CPP_COMMAND_FLAGS ${MICROPY_CPP_FLAGS})
++    set(MICROPY_QSTR_PIPELINE_COMMAND cat ${MICROPY_QSTRDEFS_PY} ${MICROPY_QSTRDEFS_PORT} ${MICROPY_QSTRDEFS_COLLECTED} | sed "s/^Q(.*)/\"&\"/" | ${CMAKE_C_COMPILER} -E ${MICROPY_QSTR_CPP_COMMAND_FLAGS} - | sed "s/^\\\"\\(Q(.*)\\)\\\"/\\1/" > ${MICROPY_QSTRDEFS_PREPROCESSED})
++endif()
++
+ add_custom_command(
+     OUTPUT ${MICROPY_QSTRDEFS_LAST}
+-    COMMAND ${Python3_EXECUTABLE} ${MICROPY_PY_DIR}/makeqstrdefs.py pp ${CMAKE_C_COMPILER} -E output ${MICROPY_GENHDR_DIR}/qstr.i.last cflags ${MICROPY_CPP_FLAGS} -DNO_QSTR cxxflags ${MICROPY_CPP_FLAGS} -DNO_QSTR sources ${MICROPY_SOURCE_QSTR}
++    COMMAND ${MICROPY_QSTR_PP_COMMAND}
+     DEPENDS ${MICROPY_MPVERSION}
++        ${MICROPY_QSTR_PP_ARGFILE}
++        ${MICROPY_QSTR_CPP_FLAGFILE}
+         ${MICROPY_SOURCE_QSTR}
+     VERBATIM
+     COMMAND_EXPAND_LISTS
+@@ -151,8 +180,9 @@ add_custom_command(
+ 
+ add_custom_command(
+     OUTPUT ${MICROPY_QSTRDEFS_PREPROCESSED}
+-    COMMAND cat ${MICROPY_QSTRDEFS_PY} ${MICROPY_QSTRDEFS_PORT} ${MICROPY_QSTRDEFS_COLLECTED} | sed "s/^Q(.*)/\"&\"/" | ${CMAKE_C_COMPILER} -E ${MICROPY_CPP_FLAGS} - | sed "s/^\\\"\\(Q(.*)\\)\\\"/\\1/" > ${MICROPY_QSTRDEFS_PREPROCESSED}
+-    DEPENDS ${MICROPY_QSTRDEFS_PY}
++    COMMAND ${MICROPY_QSTR_PIPELINE_COMMAND}
++    DEPENDS ${MICROPY_QSTR_CPP_FLAGFILE}
++        ${MICROPY_QSTRDEFS_PY}
+         ${MICROPY_QSTRDEFS_PORT}
+         ${MICROPY_QSTRDEFS_COLLECTED}
+     VERBATIM

@@ -95,6 +95,11 @@ class SystemMetrics:
         except Exception:
             self._temperature = None
 
+    def capture_temperature(self):
+        """Take one fresh MCU read alongside a physical sensor observation."""
+        self._read_temperature(self._now())
+        return self._temperature['celsius'] if self._temperature is not None else None
+
     def _rssi(self):
         try:
             if not self._wlan.isconnected():
