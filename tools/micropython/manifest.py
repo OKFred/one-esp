@@ -20,6 +20,7 @@ freeze(
         'components/env_reader.py',
         'components/modbus_talker.py',
         'components/mqtt_commands.py',
+        'components/mqtt_presence.py',
         'components/mqtt_telemetry.py',
         'components/mqtt_transport.py',
         'components/mqtt_wire.py',

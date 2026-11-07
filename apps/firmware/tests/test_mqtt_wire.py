@@ -28,6 +28,20 @@ class MqttWireTests(unittest.TestCase):
         self.assertEqual(packet[9], 0x82)
         self.assertEqual(connect_packet('id', keepalive=0)[10:12], b'\x00\x00')
 
+    def test_connect_will_is_retained_qos1_and_precedes_authentication(self):
+        packet = connect_packet('id', 'user', 'pass', will_topic='a/status',
+                                will_payload=b'\x00{}', will_retain=True)
+        self.assertEqual(packet[9], 0xEE)
+        self.assertEqual(packet[12:], b'\x00\x02id\x00\x08a/status\x00\x03\x00{}'
+                                      b'\x00\x04user\x00\x04pass')
+        self.assertEqual(connect_packet('id', will_topic='a', will_payload=b'')[9], 0x0E)
+        for changes in (dict(will_topic='a'), dict(will_payload=b'{}'),
+                        dict(will_retain=True), dict(will_retain=1),
+                        dict(will_topic='a/#', will_payload=b'{}'),
+                        dict(will_topic='a', will_payload=b'x' * MAX_PACKET_BYTES)):
+            with self.subTest(fields=list(changes)), self.assertRaises(ValueError):
+                connect_packet('id', **changes)
+
     def test_connect_rejects_invalid_fields_without_values_in_error(self):
         for changes in [dict(client_id=''), dict(client_id='bad\x00id'),
                         dict(client_id='bad\ud800id'), dict(client_id='bad\uffffid'),
@@ -51,6 +65,12 @@ class MqttWireTests(unittest.TestCase):
         self.assertEqual(retry[0], 0x3A)
         self.assertEqual(retry[1:], packet[1:])
         self.assertEqual(publish_packet('a', b'', 65535), b'\x32\x05\x00\x01a\xff\xff')
+        retained = publish_packet('a/b', payload, 0x1234, retain=True)
+        self.assertEqual(retained[0], 0x33)
+        self.assertEqual(retained[1:], packet[1:])
+        self.assertEqual(publish_packet('a/b', payload, 0x1234, duplicate=True, retain=True)[0], 0x3B)
+        with self.assertRaises(ValueError):
+            publish_packet('a/b', payload, 1, retain=1)
 
     def test_publish_rejects_wildcards_bad_utf8_and_packet_identifier_zero(self):
         for topic in ['', 'a/#', 'a/+', 'a\x00b', 'a\udfff']:

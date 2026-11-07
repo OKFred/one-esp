@@ -16,6 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from components.device_config import ConfigStore
 from components.debug_service import WIRE_PREFIX, MAX_LINE_BYTES
+from components.mqtt_presence import MqttPresence
+
+
+def mqtt_identity():
+    return {'enabled': True, 'site_id': 'unit-site', 'gateway_id': 'unit-gateway',
+            'device_id': 'unit-esp32', 'client_id': 'unit-client'}
 
 
 class Clock:
@@ -450,7 +456,7 @@ class RuntimeTests(unittest.TestCase):
         publisher.client = client
         sampler = Mock(return_value=publisher)
         with module_patch, patch.dict(sys.modules, {
-                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: mqtt_identity(),
                                                                   TemperatureTelemetry=sampler),
                 'components.mqtt_transport': types.SimpleNamespace(MqttTransport=Mock(return_value=client))}), \
                 patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
@@ -594,7 +600,7 @@ class RuntimeTests(unittest.TestCase):
         self.wlan.connected = True
         Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
         with patch.dict(sys.modules, {
-                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: mqtt_identity(),
                                                                   TemperatureTelemetry=Mock()),
                 'components.mqtt_transport': types.SimpleNamespace(
                     MqttTransport=Mock(side_effect=MemoryError('private-account-and-host')))}), \
@@ -740,7 +746,7 @@ class RuntimeTests(unittest.TestCase):
         publisher = Mock()
         sampler = Mock(return_value=publisher)
         with patch.dict(sys.modules, {
-                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: {'enabled': True},
+                'components.mqtt_telemetry': types.SimpleNamespace(load_config=lambda _: mqtt_identity(),
                                                                   TemperatureTelemetry=sampler),
                 'components.mqtt_transport': types.SimpleNamespace(MqttTransport=Mock())}), \
                 patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
@@ -782,6 +788,84 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.restart_at = 0
         self.runtime._restart_step()
         self.assertEqual(order, ['sensor-close', 'reset'])
+
+    def test_planned_restart_waits_for_bounded_mqtt_shutdown_without_resetting_early(self):
+        client = types.SimpleNamespace(begin_shutdown=Mock(), shutdown_complete=False)
+        self.runtime.mqtt = types.SimpleNamespace(client=client)
+        self.runtime.restart_at = 0
+        self.runtime._restart_step()
+        client.begin_shutdown.assert_called_once_with()
+        self.machine.reset.assert_not_called()
+        client.shutdown_complete = True
+        self.runtime._restart_step()
+        client.begin_shutdown.assert_called_once_with()
+        self.machine.reset.assert_called_once()
+
+    def test_offline_notice_allocation_failure_cannot_block_planned_restart(self):
+        client = types.SimpleNamespace(begin_shutdown=Mock(side_effect=MemoryError()), close=Mock())
+        self.runtime.mqtt = types.SimpleNamespace(client=client)
+        self.runtime.restart_at = 0
+        self.runtime._restart_step()
+        client.close.assert_called_once_with()
+        self.machine.reset.assert_called_once()
+
+    def test_presence_uses_service_boot_and_sensor_failures_do_not_stop_mqtt_stage(self):
+        presence = self.runtime._mqtt_presence(mqtt_identity())
+        self.assertIsInstance(presence, MqttPresence)
+        presence.begin_session()
+        presence.connected()
+        birth = json.loads(presence.take()[1])
+        self.assertEqual(birth['boot_id'], self.runtime.service.boot_id)
+        client = types.SimpleNamespace(presence=presence)
+        self.runtime.mqtt = types.SimpleNamespace(client=client, tick=Mock())
+        self.runtime._sensor_options = {'protocol': 'sht20_rtu'}
+        self.runtime._sensor_presence(False)
+        with patch.object(self.runtime, 'poll_commands'), \
+                patch.object(self.runtime, 'sensor_tick', side_effect=OSError('private-read-failure')), \
+                patch.object(self.runtime, '_network_step'), \
+                patch.object(self.runtime, 'maintenance_tick'), \
+                patch.object(self.runtime, 'clock_tick'), \
+                patch.object(self.runtime, 'debug_telemetry_tick'), \
+                patch.object(self.runtime, '_mqtt_clock_ready', return_value=True), \
+                patch.object(self.runtime, '_restart_step'):
+            self.runtime.tick_once()
+        self.runtime.mqtt.tick.assert_called_once()
+        self.assertEqual(json.loads(presence.take()[1])['reason'], 'read_failed')
+
+    def test_crc_sensor_success_and_bounded_driver_failure_report_child_observations(self):
+        observation = {'sample': 1, 'readAtMs': 0, 'temperatureC': 25.0,
+                       'relativeHumidityPercent': 45.0}
+        reader = self.sensor_reader(observation)
+        reader.failure_count = 0
+        self.runtime.sensor = reader
+        presence = Mock()
+        self.runtime.mqtt = types.SimpleNamespace(client=types.SimpleNamespace(presence=presence))
+        self.runtime._sensor_options = {'protocol': 'sht20_rtu'}
+        with patch.object(self.runtime, '_mqtt_clock_ready', return_value=False):
+            self.runtime.sensor_tick()
+        presence.observe.assert_called_once_with(True)
+        def failed_read():
+            reader.failure_count += 1
+            return None
+        reader.tick.side_effect = failed_read
+        self.runtime.sensor_tick()
+        self.assertEqual(presence.observe.call_args.args, (False,))
+        self.runtime._sensor_options = {'protocol': 'ascii_read'}
+        presence.observe.reset_mock()
+        self.runtime.sensor_tick()
+        presence.observe.assert_not_called()
+
+    def test_deliberate_close_is_bounded_and_always_releases_mqtt(self):
+        client = types.SimpleNamespace(begin_shutdown=Mock(), shutdown_complete=False, tick=Mock())
+        publisher = types.SimpleNamespace(client=client, close=Mock())
+        self.runtime.mqtt = publisher
+        with patch.object(self.module.time, 'sleep_ms', create=True) as sleep, \
+                patch.object(self.runtime, '_mqtt_clock_ready', return_value=True):
+            self.runtime.close_mqtt()
+        client.begin_shutdown.assert_called_once_with()
+        self.assertEqual(client.tick.call_count, 400)
+        self.assertEqual(sleep.call_count, 400)
+        publisher.close.assert_called_once_with()
 
     def test_wifi_password_failure_keeps_usb_commands_alive(self):
         self.runtime.start_wifi(self.config.values)
@@ -1405,7 +1489,7 @@ class RuntimeTests(unittest.TestCase):
     def test_mqtt_constructs_once_only_after_ready_and_gc_is_not_periodic(self):
         Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
         quality = {'synced': True, 'lastSyncAgeMs': 600001}
-        config = {'enabled': True}
+        config = mqtt_identity()
         client, publisher = Mock(), Mock()
         load, transport = Mock(return_value=config), Mock(return_value=client)
         sampler = Mock(return_value=publisher)
@@ -1426,9 +1510,11 @@ class RuntimeTests(unittest.TestCase):
                 self.runtime.mqtt_tick()
             self.assertEqual([call.args for call in threshold.call_args_list], [(), (8192,)])
         load.assert_called_once_with(self.runtime._mqtt_config_path)
+        presence = transport.call_args.kwargs['presence']
+        self.assertIsInstance(presence, MqttPresence)
         transport.assert_called_once_with(config, self.runtime.service.now,
                                           command_handler=self.runtime.handle_sensor_command,
-                                          command_clock=self.runtime._command_clock)
+                                          command_clock=self.runtime._command_clock, presence=presence)
         sampler.assert_called_once_with(config, client, self.runtime.service.now,
                                         logger=self.runtime.service.log, local_day=self.runtime._mqtt_local_day)
         self.assertIs(self.runtime.mqtt, publisher)
@@ -1549,7 +1635,7 @@ class RuntimeTests(unittest.TestCase):
         Path(self.runtime._mqtt_config_path).write_text('{"enabled":true}', encoding='utf-8')
         self.wlan.connected = True
         failed_client, good_client, publisher = Mock(), Mock(), Mock()
-        load = Mock(return_value={'enabled': True})
+        load = Mock(return_value=mqtt_identity())
         transport = Mock(side_effect=[failed_client, good_client])
         sampler = Mock(side_effect=[MemoryError('private-config'), publisher])
         with patch.dict(sys.modules, {

@@ -2,7 +2,8 @@
 
 The application supplies a non-wrapping millisecond clock. DNS is the only
 background operation: ESP32 getaddrinfo releases the GIL while lwIP waits.
-There is at most one resolver worker, one connection and one pending message.
+There is one resolver worker, one connection and one pending telemetry message.
+Presence adds only two replaceable latest events and one in-flight event.
 No exception text, broker identity, credentials, topic or payload enters status.
 """
 
@@ -19,7 +20,7 @@ except ImportError:
     import errno
 
 from components.mqtt_wire import (connect_packet, publish_packet, ping_packet, PacketReader,
-                                  subscribe_packet, puback_packet, decode_publish)
+                                  subscribe_packet, puback_packet, decode_publish, disconnect_packet)
 
 
 DNS_TIMEOUT_MS = 15000
@@ -197,7 +198,7 @@ class ThreadResolver:
 class MqttTransport:
     def __init__(self, config, now_ms, socket_module=None, ssl_module=None,
                  resolver=None, poll_factory=None, collect=None,
-                 command_handler=None, command_clock=None, command_active=True):
+                 command_handler=None, command_clock=None, command_active=True, presence=None):
         self._config = config
         self._now = now_ms
         self._sockets = socket_module if socket_module is not None else socket
@@ -231,6 +232,12 @@ class MqttTransport:
         # Validate/encode once. Never log or expose this credential-bearing frame.
         self._connect_frame = connect_packet(config['client_id'], config['username'],
                                              config['password'], self._keepalive, clean_session=True)
+        self.presence = presence
+        self._presence_inflight = None
+        self._presence_deadline = 0
+        self._presence_acks = 0
+        self._shutdown_deadline = 0
+        self._shutdown_done = False
         self._resolver = resolver if resolver is not None else ThreadResolver(self._sockets)
         self._poll_factory = poll_factory if poll_factory is not None else select.poll
         self._commands_enabled = config.get('commands_enabled', False) is True
@@ -316,8 +323,9 @@ class MqttTransport:
     def _packet_id(self):
         reserved = (self._pending[2] if self._pending else None,
                     self._reply_inflight[2] if self._reply_inflight else None,
+                    self._presence_inflight[2] if self._presence_inflight else None,
                     self._subscribe_id)
-        for _ in range(4):
+        for _ in range(5):
             self._next_packet_id = self._next_packet_id % 65535 + 1
             if self._next_packet_id not in reserved:
                 return self._next_packet_id
@@ -415,6 +423,7 @@ class MqttTransport:
                 'connections': self._connections, 'lastError': self._last_error,
                 'lastFailure': dict(self._last_failure) if self._last_failure else None,
                 'nextRetryInMs': max(0, self._retry_at - self._now()),
+                'presenceAcknowledged': self._presence_acks,
                 'commands': dict({'configured': self._commands_enabled,
                                   'active': self._commands_active and self._commands_enabled and self._commands is not None,
                                   'state': self._command_state,
@@ -427,6 +436,10 @@ class MqttTransport:
     def _drop_socket(self):
         raw, stream, poller = self._raw, self._stream, self._poll
         self._raw = self._stream = self._poll = None
+        self._presence_inflight = None
+        self._presence_deadline = 0
+        if self.presence is not None:
+            self.presence.disconnected()
         self._state = 'waiting_network'
         self._tx = None
         self._tx_offset = 0
@@ -466,6 +479,27 @@ class MqttTransport:
         self._collect_once()
         self._state = 'waiting_network'
         self._retry_at = 0
+
+    def begin_shutdown(self, timeout_ms=2000):
+        """Let the main loop confirm fresh offline state before DISCONNECT."""
+        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 2000:
+            raise ValueError('Invalid MQTT shutdown deadline')
+        if self._shutdown_deadline or self._shutdown_done:
+            return
+        if not self.connected or self.presence is None:
+            self.close()
+            self._shutdown_done = True
+            return
+        self._shutdown_deadline = self._now() + timeout_ms
+        # A fully sent old presence packet need not delay the fresh shutdown.
+        if self._tx_kind != 'presence':
+            self._presence_inflight = None
+            self._presence_deadline = 0
+        self.presence.shutdown()
+
+    @property
+    def shutdown_complete(self):
+        return self._shutdown_done
 
     def _collect_once(self):
         # Collection can return entirely unused split-heap areas to ESP-IDF.
@@ -516,6 +550,12 @@ class MqttTransport:
         self._stream.setblocking(False)
         self._state = 'mqtt_connect'
         self._deadline = self._now() + SESSION_TIMEOUT_MS
+        if self.presence is not None:
+            topic, payload = self.presence.begin_session()
+            self._connect_frame = connect_packet(
+                self._config['client_id'], self._config['username'], self._config['password'],
+                self._keepalive, clean_session=True, will_topic=topic,
+                will_payload=payload, will_retain=True)
         self._queue(self._connect_frame, 'connect')
 
     def _open(self, info):
@@ -567,6 +607,11 @@ class MqttTransport:
                 self._subscribe_deadline = self._now() + ACK_TIMEOUT_MS
             elif kind == 'command_reply':
                 self._reply_deadline = self._now() + ACK_TIMEOUT_MS
+            elif kind == 'presence':
+                self._presence_deadline = self._now() + ACK_TIMEOUT_MS
+            elif kind == 'disconnect':
+                self._drop_socket()
+                self._shutdown_done = True
 
     def _read_once(self):
         self._operation = 'read'
@@ -589,12 +634,19 @@ class MqttTransport:
                 self._state = 'connected'
                 self._last_error = None
                 self._connections += 1
+                if self.presence is not None:
+                    self.presence.connected()
                 if self._commands_enabled and self._commands:
                     self._subscribe_id = self._packet_id()
                     self._command_state = 'subscribing'
             elif packet_type == 4:
                 packet_id = (body[0] << 8) | body[1]
-                if (self._state == 'connected' and self._reply_inflight is not None and
+                if (self.connected and self._presence_inflight is not None and
+                        self._presence_deadline and packet_id == self._presence_inflight[2]):
+                    self._presence_inflight = None
+                    self._presence_deadline = 0
+                    self._presence_acks += 1
+                elif (self._state == 'connected' and self._reply_inflight is not None and
                         self._reply_deadline and packet_id == self._reply_inflight[2]):
                     self._reply_inflight = None
                     self._reply_deadline = 0
@@ -641,11 +693,19 @@ class MqttTransport:
         if self._handoff_complete:
             return
         now = self._now()
+        if self._shutdown_done:
+            return
+        if self._shutdown_deadline and (now >= self._shutdown_deadline or not self.connected):
+            self.close()
+            self._shutdown_done = True
+            return
         if not connected or not time_ready:
             if self._raw is not None or self._stream is not None or self._tx is not None:
                 self._drop_socket()
             self._state = 'waiting_network' if not connected else 'waiting_time'
             self._retry_at = 0
+            if self._shutdown_deadline:
+                self._shutdown_done = True
             return
         if self._state in ('waiting_network', 'waiting_time', 'backoff'):
             if now < self._retry_at:
@@ -696,30 +756,57 @@ class MqttTransport:
             if self._reply_deadline and now >= self._reply_deadline:
                 self._fail('command_reply_timeout')
                 return
-            if self.connected and self._commands:
+            if self._presence_deadline and now >= self._presence_deadline:
+                self._fail('presence_ack_timeout')
+                return
+            if self._presence_inflight is not None and now >= self._presence_inflight[3]:
+                self._fail('presence_expired')
+                return
+            if self.connected and self.presence is not None:
+                self.presence.tick()
+            if self.connected and self._commands and not self._shutdown_deadline:
                 self._commands.drain(self._enqueue_reply)
             if self._state == 'connected' and self._tx is None:
-                if self._command_pubacks:
+                if (self._shutdown_deadline and self._presence_inflight is None and
+                        not self.presence.pending()):
+                    self._queue(disconnect_packet(), 'disconnect')
+                elif self._command_pubacks:
                     self._queue(puback_packet(self._command_pubacks.pop(0)), 'command_puback')
                 elif self._subscribe_id is not None and not self._subscribe_sent:
                     self._queue(subscribe_packet(self._command_topic, self._subscribe_id), 'subscribe')
-                elif self._subscribe_id is None and self._reply_inflight is not None and not self._reply_deadline:
+                elif (self._subscribe_id is None and self.presence is not None and
+                        self._presence_inflight is None and self.presence.pending()):
+                    value = self.presence.take()
+                    if value is not None:
+                        topic, payload, expires = value
+                        packet_id = self._packet_id()
+                        self._presence_inflight = (topic, payload, packet_id, expires)
+                        self._queue(publish_packet(topic, payload, packet_id, retain=True), 'presence')
+                elif (not self._shutdown_deadline and self._subscribe_id is None and
+                        self._reply_inflight is not None and not self._reply_deadline and
+                        (self._presence_inflight is None or
+                         self._presence_inflight[2] != self._reply_inflight[2])):
                     _, payload, packet_id, attempted = self._reply_inflight
                     self._queue(publish_packet(self._reply_topic, payload, packet_id, duplicate=attempted), 'command_reply')
                     self._reply_inflight[3] = True
-                elif self._subscribe_id is None and self._reply_inflight is None and self._reply_queue:
+                elif (not self._shutdown_deadline and self._subscribe_id is None and
+                        self._reply_inflight is None and self._reply_queue):
                     identifier, payload = self._reply_queue.pop(0)
                     packet_id = self._packet_id()
                     self._reply_inflight = [identifier, payload, packet_id, True]
                     self._queue(publish_packet(self._reply_topic, payload, packet_id), 'command_reply')
-                elif self._subscribe_id is None and self._pending is not None and not self._ack_deadline:
+                elif (not self._shutdown_deadline and self._subscribe_id is None and
+                        self._pending is not None and not self._ack_deadline and
+                        (self._presence_inflight is None or
+                         self._presence_inflight[2] != self._pending[2])):
                     topic, payload, packet_id, attempted = self._pending
                     self._queue(publish_packet(topic, payload, packet_id, duplicate=attempted), 'publish')
                     self._pending[3] = True
                 elif not self._ping_deadline and now - self._last_tx_at >= self._keepalive * 500:
                     self._queue(ping_packet(), 'ping')
             self._write_once()
-            self._read_once()
+            if self._stream is not None:
+                self._read_once()
         except ValueError as error:
             self._fail('tls_or_protocol_failed', error)
         except Exception as error:

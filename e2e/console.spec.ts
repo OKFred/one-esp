@@ -3,6 +3,10 @@ import path from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 
 const screenshotDirectory = path.resolve('test-results/screenshots');
+const normalReplayScreen =
+  /^USB diagnostics\nSensor disabled\nTCP: 42ms\n\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+const offlineReplayScreen =
+  /^USB diagnostics\nLast known frame\nDevice offline\nRTC \d{2}:\d{2}:\d{2}$/;
 
 async function assertNoPageOverflow(page: Page) {
   const dimensions = await page.evaluate(() => ({
@@ -60,7 +64,7 @@ for (const viewport of [
     const canvas = page.locator('.oled-glass canvas');
     await expect(canvas).toHaveAttribute('width', '128');
     await expect(canvas).toHaveAttribute('height', '64');
-    await expect(canvas).toHaveAttribute('aria-label', /WiFi Connected!/);
+    await expect(canvas).toHaveAttribute('aria-label', normalReplayScreen);
     await expect
       .poll(() =>
         canvas.evaluate((element) => {
@@ -106,7 +110,7 @@ for (const viewport of [
     await page.getByRole('button', { name: '获取快照', exact: true }).click();
     await expect(page.getByRole('status')).toContainText('设备已确认操作');
 
-    await page.getByRole('button', { name: '设备配置', exact: true }).click();
+    await page.getByRole('button', { name: 'Wi-Fi / 时钟', exact: true }).click();
     const configDialog = page.getByRole('dialog', { name: '设备配置', exact: true });
     await expect(configDialog).toBeVisible();
     await expect(configDialog.getByLabel('Wi-Fi 名称', { exact: true })).toHaveValue(
@@ -130,7 +134,7 @@ for (const viewport of [
     await saveScreenshot(page, viewport.width, 'wifi-error');
 
     await selectScenario(page, '设备离线');
-    await expect(canvas).toHaveAttribute('aria-label', /DEVICE OFFLINE/);
+    await expect(canvas).toHaveAttribute('aria-label', offlineReplayScreen);
     await expect(page.getByText('最后一帧 · 当前数据已过期', { exact: true })).toBeVisible();
     await expect(debugSwitch).toBeDisabled();
     await assertNoPageOverflow(page);
@@ -228,7 +232,7 @@ test('detects OLED-only silence and recovers without restarting sampling', async
   await page.goto('/');
   await selectScenario(page, '正常启动');
   const canvas = page.locator('.oled-glass canvas');
-  await expect(canvas).toHaveAttribute('aria-label', /WiFi Connected!/);
+  await expect(canvas).toHaveAttribute('aria-label', normalReplayScreen);
   dropOled = true;
   const initial = await canvas.getAttribute('aria-label');
   const snapshotRequest = page.waitForRequest(
@@ -265,7 +269,7 @@ test('reconnects a silently stalled websocket and receives a fresh screen', asyn
   await page.goto('/');
   await selectScenario(page, '正常启动');
   const canvas = page.locator('.oled-glass canvas');
-  await expect(canvas).toHaveAttribute('aria-label', /WiFi Connected!/);
+  await expect(canvas).toHaveAttribute('aria-label', normalReplayScreen);
   const initial = await canvas.getAttribute('aria-label');
   blackhole = true;
   await expect.poll(() => connections, { timeout: 25000 }).toBeGreaterThan(1);
