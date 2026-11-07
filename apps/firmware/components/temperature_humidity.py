@@ -422,6 +422,10 @@ class TemperatureHumidityReader:
             return None
         return dict(self._latest)
 
+    @property
+    def failure_count(self):
+        return self._failures
+
     def status(self):
         now = self._now()
         latest = self._latest

@@ -90,6 +90,7 @@ class DiagnosticRuntime:
         self.network_reason = None
         self.trial_id = None
         self.restart_at = None
+        self._mqtt_shutdown_started = False
         self.maintenance_busy = None
         self.tcp_at = 0
         self.ntp_server = self.config.values['NTP_SERVER']
@@ -585,9 +586,39 @@ class DiagnosticRuntime:
 
     def _restart_step(self):
         if self.restart_at is not None and self.service.now() >= self.restart_at and not self.service._pending_acks:
+            client = getattr(self.mqtt, 'client', None)
+            begin = getattr(client, 'begin_shutdown', None)
+            if callable(begin):
+                try:
+                    if not self._mqtt_shutdown_started:
+                        begin()
+                        self._mqtt_shutdown_started = True
+                    if not client.shutdown_complete:
+                        return
+                except Exception:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass  # A failed optional offline notice cannot block restart.
             self.close_sensor()
             self.pins.restore_safe_values()
             machine.reset()
+
+    def close_mqtt(self):
+        if not self.mqtt:
+            return
+        client = getattr(self.mqtt, 'client', None)
+        begin = getattr(client, 'begin_shutdown', None)
+        try:
+            if callable(begin):
+                begin()
+                for _ in range(400):
+                    if client.shutdown_complete:
+                        break
+                    client.tick(self.wlan.isconnected(), self._mqtt_clock_ready())
+                    time.sleep_ms(5)
+        finally:
+            self.mqtt.close()
 
     def _settings(self, kind):
         if kind not in self._settings_stores:
@@ -689,7 +720,8 @@ class DiagnosticRuntime:
                 config = load_config(store.pending_path)
                 client = MqttTransport(config, self.service.now,
                                        command_handler=self.handle_sensor_command,
-                                       command_clock=self._command_clock, command_active=False)
+                                       command_clock=self._command_clock, command_active=False,
+                                       presence=self._mqtt_presence(config))
                 self._mqtt_trial.update(client=client, config=config)
                 self._mqtt_state = 'testing'
         except (ValueError, TypeError, KeyError, OSError, MemoryError):
@@ -902,15 +934,22 @@ class DiagnosticRuntime:
             except ValueError:
                 self._sensor_requested = False
                 self._sensor_state = 'configuration_error'
+                self._sensor_presence(False)
                 raise
             except Exception:
                 self._sensor_retry_at = self.service.now() + 30000
                 self._sensor_state = 'initialization_retry'
+                self._sensor_presence(False)
                 raise
+        previous_failures = getattr(self.sensor, 'failure_count', 0)
         observation = self.sensor.tick()
         self.pins.descriptions[13]['value'] = 1 if self.sensor.phase == 'tx' else 0
         if observation is None:
+            failures = getattr(self.sensor, 'failure_count', 0)
+            if type(failures) is int and type(previous_failures) is int and failures > previous_failures:
+                self._sensor_presence(False)
             return
+        self._sensor_presence(True)
         self._sensor_reader_sample = observation['sample']
         self._sensor_sequence = max(self._sensor_sequence + 1,
                                     self._sensor_sample_offset + observation['sample'])
@@ -948,7 +987,23 @@ class DiagnosticRuntime:
             return None
         return self._sensor_observation
 
+    def _mqtt_presence(self, config):
+        from components.mqtt_presence import MqttPresence
+        return MqttPresence(config, self.service.now, self.service.boot_id,
+                            utc_ready=self._mqtt_clock_ready)
+
+    def _sensor_presence(self, successful):
+        if (self._sensor_options or {}).get('protocol') != 'sht20_rtu':
+            return
+        presence = getattr(getattr(self.mqtt, 'client', None), 'presence', None)
+        if presence is not None:
+            try:
+                presence.observe(successful)
+            except Exception:
+                pass  # Optional status must not disrupt the physical reader.
+
     def close_sensor(self):
+        self._sensor_presence(None)
         sensor, self.sensor = self.sensor, None
         self._sensor_requested = False
         self._sensor_observation = None
@@ -1112,7 +1167,8 @@ class DiagnosticRuntime:
                 self._mqtt_init_stage = 'construct_client'
                 client = MqttTransport(config, self.service.now,
                                        command_handler=self.handle_sensor_command,
-                                       command_clock=self._command_clock)
+                                       command_clock=self._command_clock,
+                                       presence=self._mqtt_presence(config))
                 publisher_args = {'logger': self.service.log, 'local_day': self._mqtt_local_day}
                 if self._sensor_requested or self._environment_mode:
                     publisher_args['sample_provider'] = self._sensor_sample
@@ -1184,7 +1240,7 @@ def run():
         finally:
             try:
                 if runtime.mqtt:
-                    runtime.mqtt.close()
+                    runtime.close_mqtt()
             finally:
                 try:
                     runtime._restore_mqtt_gc_threshold()

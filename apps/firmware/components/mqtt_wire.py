@@ -68,24 +68,38 @@ def _frame(header, body):
     return bytes((header,)) + _remaining_length(len(body)) + body
 
 
-def connect_packet(client_id, username=None, password=None, keepalive=60, clean_session=True):
-    """Build CONNECT without a will; passwords are MQTT binary fields."""
+def connect_packet(client_id, username=None, password=None, keepalive=60, clean_session=True,
+                   will_topic=None, will_payload=None, will_retain=False):
+    """Build CONNECT with an optional retained QoS 1 will."""
     _integer(keepalive, 0, 65535, 'Invalid MQTT keepalive')
     if type(clean_session) is not bool:
         raise ValueError('Invalid MQTT clean-session flag')
     if password is not None and username is None:
         raise ValueError('MQTT password requires a username')
+    if type(will_retain) is not bool or (will_topic is None) != (will_payload is None):
+        raise ValueError('Invalid MQTT will')
+    will_name = _text(will_topic) if will_topic is not None else None
+    will_body = _binary(will_payload) if will_payload is not None else None
+    if ((will_name is None and will_retain) or
+            (will_topic is not None and ('+' in will_topic or '#' in will_topic))):
+        raise ValueError('Invalid MQTT will topic')
     identity = _text(client_id)
     user = _text(username, True) if username is not None else None
     secret = _binary(password) if password is not None else None
     body_length = 12 + len(identity)
+    if will_name is not None:
+        body_length += 4 + len(will_name) + len(will_body)
     if user is not None:
         body_length += 2 + len(user)
     if secret is not None:
         body_length += 2 + len(secret)
     _check_packet_size(body_length)
     flags = (2 if clean_session else 0) | (128 if user is not None else 0) | (64 if secret is not None else 0)
+    if will_name is not None:
+        flags |= 12 | (32 if will_retain else 0)
     body = b'\x00\x04MQTT\x04' + bytes((flags,)) + _u16(keepalive) + _u16(len(identity)) + identity
+    if will_name is not None:
+        body += _u16(len(will_name)) + will_name + _u16(len(will_body)) + will_body
     if user is not None:
         body += _u16(len(user)) + user
     if secret is not None:
@@ -93,10 +107,10 @@ def connect_packet(client_id, username=None, password=None, keepalive=60, clean_
     return _frame(0x10, body)
 
 
-def publish_packet(topic, payload, packet_id, duplicate=False):
-    """Build one non-retained QoS 1 PUBLISH using the caller's exact bytes."""
+def publish_packet(topic, payload, packet_id, duplicate=False, retain=False):
+    """Build one QoS 1 PUBLISH using the caller's exact bytes."""
     _integer(packet_id, 1, 65535, 'Invalid MQTT packet identifier')
-    if type(duplicate) is not bool:
+    if type(duplicate) is not bool or type(retain) is not bool:
         raise ValueError('Invalid MQTT duplicate flag')
     name = _text(topic)
     if '+' in topic or '#' in topic:
@@ -105,7 +119,7 @@ def publish_packet(topic, payload, packet_id, duplicate=False):
         raise ValueError('MQTT payload must be bytes')
     _check_packet_size(4 + len(name) + len(payload))
     body = _u16(len(name)) + name + _u16(packet_id) + bytes(payload)
-    return _frame(0x3A if duplicate else 0x32, body)
+    return _frame((0x3A if duplicate else 0x32) | int(retain), body)
 
 
 def ping_packet():

@@ -58,6 +58,31 @@ With the sensor enabled, one validated physical read supplies `temperature_c` an
 
 The publish-only MQTT 3.1.1 client requires certificate/hostname validation, TLS port 8883, QoS 1 and retain=false. It keeps one original payload in RAM until matching PUBACK, with bounded retries; it does not accumulate offline minute records or persist pending data across reset. Recent successful NTP synchronization gates sampling and connection. DNS runs in one background worker; transport reads/writes are polled and bounded. Real-board checks of TLS latency, publication and OLED continuity are recorded in [validation](../../docs/validation.md); other deployments need their own acceptance. MQTT does not grant remote configuration, GPIO or REPL access.
 
+### Live presence
+
+The runtime also sends retained QoS 1 presence on the same connection, under
+`iot/v1/<site>/<gateway>/devices/<device>/status`. Each actual CONNECT gets a new
+UUID session and a preallocated last will; the birth uses that same session and
+the runtime's existing boot ID. A successful connection sends `online`, and the
+live main loop sends a heartbeat every 60 seconds even when temperature reads
+fail. Certificate verification and the existing recent-NTP gate still apply.
+Presence PUBACKs never acknowledge or increment telemetry delivery counters.
+
+The fixed SHT20 child topic is `devices/sht20/status`. CRC-verified reads report
+`read_ok`; read failures report `read_failed` at most once per minute. New uplinks,
+disabled readers and graceful shutdown report `upstream_unknown`; uplink loss
+does not assert that the child sensor lost power. Observations identify the ESP32
+MQTT client as reporter, not as another independent sensor connection.
+
+Presence keeps at most two unsent latest events and one in-flight event, each
+bounded to 2 KiB and one minute of validity. Disconnect drops them rather than
+replaying an old heartbeat as current. LWT time, uptime and sequence are NULL;
+the consumer must retain its actual broker receipt time. Planned restart and
+deliberate runtime exit allow at most two seconds for fresh shutdown PUBACKs
+before MQTT DISCONNECT. Failure or timeout closes the socket without DISCONNECT
+so that the broker's will remains applicable. These are source/host-tested
+behaviors until the corresponding frozen image is built and accepted on hardware.
+
 ## Environment sensor
 
 Copy the placeholder `.sensor.example.json` into a separately deployed private `.sensor.json`, then set `enabled=true` and normally keep `interval_seconds=60`. The example defaults to disabled. Restart the application after changing this file; the standard source uploader preserves but does not deploy private settings.
